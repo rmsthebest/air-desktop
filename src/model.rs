@@ -51,10 +51,23 @@ pub enum PreviewKind {
 
 /// Longest preview kept, in graphemes; a row shows one line of it anyway.
 const MAX_PREVIEW: usize = 160;
+/// Longest name or title kept, in graphemes.
+const MAX_NAME: usize = 64;
 
-/// One line of peer-controlled text for a preview: invisible and control
-/// characters dropped, whitespace runs collapsed, and bounded in length.
+/// A peer-controlled message preview as one line: see [`one_line`].
 pub fn preview_line(text: &str) -> SharedString {
+    one_line(text, MAX_PREVIEW)
+}
+
+/// A peer-controlled name or chat title as one line: see [`one_line`].
+pub fn name_line(text: &str) -> SharedString {
+    one_line(text, MAX_NAME)
+}
+
+/// Invisible and control characters dropped (no bidi tricks, no
+/// look-alikes built from zero-width characters), whitespace runs
+/// collapsed, and at most `max` graphemes, ending in "…" when cut.
+fn one_line(text: &str, max: usize) -> SharedString {
     let visible: String = text
         .chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
@@ -67,7 +80,7 @@ pub fn preview_line(text: &str) -> SharedString {
         }
         line.push_str(word);
     }
-    match line.grapheme_indices(true).nth(MAX_PREVIEW) {
+    match line.grapheme_indices(true).nth(max) {
         Some((end, _)) => format!("{}…", &line[..end]).into(),
         None => line.into(),
     }
@@ -158,6 +171,22 @@ impl JumpList {
             self.entries.remove(0);
         }
         self.pos = self.entries.len() - 1;
+    }
+
+    /// Drops entries for chats that are gone, so a jump never lands on
+    /// nothing. If the current entry goes, the next newer one is current.
+    pub fn retain(&mut self, mut keep: impl FnMut(&ChatId) -> bool) {
+        let mut pos = 0;
+        let mut ix = 0;
+        self.entries.retain(|id| {
+            let kept = keep(id);
+            if kept && ix < self.pos {
+                pos += 1;
+            }
+            ix += 1;
+            kept
+        });
+        self.pos = pos.min(self.entries.len().saturating_sub(1));
     }
 
     pub fn back(&mut self) -> Option<ChatId> {
@@ -430,6 +459,26 @@ mod tests {
     }
 
     #[test]
+    fn jump_list_skips_chats_that_are_gone() {
+        let id = |s: &str| ChatId(s.to_string().into());
+        let mut jumps = JumpList::default();
+        for chat in ["a", "b", "c", "d"] {
+            jumps.push(id(chat));
+        }
+        jumps.back(); // at c
+        // b was deleted elsewhere: back goes straight to a.
+        jumps.retain(|chat| chat != &id("b"));
+        assert_eq!(jumps.back(), Some(id("a")));
+        assert_eq!(jumps.forward(), Some(id("c")));
+        // The current chat itself went away: the newer one stands in.
+        jumps.retain(|chat| chat != &id("c"));
+        assert_eq!(jumps.back(), Some(id("a")));
+        assert_eq!(jumps.forward(), Some(id("d")));
+        jumps.retain(|_| false);
+        assert_eq!((jumps.back(), jumps.forward()), (None, None));
+    }
+
+    #[test]
     fn jump_list_is_bounded() {
         let mut jumps = JumpList::default();
         for ix in 0..250 {
@@ -474,6 +523,15 @@ mod tests {
             preview_line(&flags).graphemes(true).count(),
             MAX_PREVIEW + 1
         );
+    }
+
+    #[test]
+    fn names_are_one_short_line() {
+        let title = format!("Lab\nnotes\u{202E}{}", "x".repeat(10_000));
+        let name = name_line(&title);
+        assert!(name.starts_with("Lab notesx"));
+        assert_eq!(name.graphemes(true).count(), MAX_NAME + 1);
+        assert_eq!(name_line("  Ada\u{200B} "), "Ada");
     }
 
     #[test]

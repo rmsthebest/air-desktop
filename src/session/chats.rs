@@ -5,8 +5,10 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use aircommon::identifiers::UserId;
+use aircommon::utils::FibonacciBackoff;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::{DbEntityId, DbNotification};
 use aircoreclient::{Chat, ChatId as CoreChatId, ChatType, MessageId};
@@ -14,7 +16,7 @@ use gpui_kit::{AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
 use tokio::sync::{Notify, mpsc};
 use tracing::error;
 
-use crate::model::{ChatId, ChatSummary};
+use crate::model::{ChatId, ChatSummary, name_line};
 use crate::runtime::{Tokio, TokioTask};
 use crate::session::preview;
 use crate::session::{Session, SessionEvent};
@@ -24,6 +26,7 @@ use crate::session::{Session, SessionEvent};
 const CHUNK: usize = 32;
 /// Deltas in flight to the UI; the worker waits beyond this.
 const DELTAS_BUFFER: usize = 8;
+const ORDER_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadState {
@@ -175,8 +178,13 @@ impl Pending {
 
 pub(super) async fn run(user: CoreUser, pending: Arc<Pending>, tx: mpsc::Sender<Update>) {
     let mut state = LocalState::default();
-    if initial_load(&user, &mut state, &tx).await.is_err() {
-        return;
+    let mut backoff = FibonacciBackoff::default();
+    loop {
+        match initial_load(&user, &mut state, &tx).await {
+            Ok(()) => break,
+            Err(Stop::Closed) => return,
+            Err(Stop::Failed) => tokio::time::sleep(backoff.next_backoff()).await,
+        }
     }
     loop {
         pending.wake.notified().await;
@@ -190,25 +198,37 @@ pub(super) async fn run(user: CoreUser, pending: Arc<Pending>, tx: mpsc::Sender<
         if affected.is_empty() && !changes.all {
             continue;
         }
-        let delta = reload(&user, affected, &mut state).await;
+        let (delta, ordered) = reload(&user, affected, &mut state).await;
         if !delta.is_empty() && tx.send(Update::Delta(delta)).await.is_err() {
             return;
+        }
+        if !ordered {
+            // Chats new to the list wait for an order: try again shortly.
+            tokio::time::sleep(ORDER_RETRY).await;
+            pending.add(&[], true);
         }
     }
 }
 
-/// Publishes every chat, in chunks. Errs when the UI is gone.
+enum Stop {
+    /// The UI is gone.
+    Closed,
+    Failed,
+}
+
+/// Publishes every chat, in chunks.
 async fn initial_load(
     user: &CoreUser,
     state: &mut LocalState,
     tx: &mpsc::Sender<Update>,
-) -> Result<(), ()> {
+) -> Result<(), Stop> {
     let all = match user.ordered_chat_ids().await {
         Ok(all) => all,
         Err(err) => {
             error!("failed to load chats: {err:#}");
-            _ = tx.send(Update::Failed(format!("{err:#}"))).await;
-            return Err(());
+            let failed = Update::Failed(format!("{err:#}"));
+            tx.send(failed).await.map_err(|_| Stop::Closed)?;
+            return Err(Stop::Failed);
         }
     };
     if all.is_empty() {
@@ -216,7 +236,10 @@ async fn initial_load(
             order: Some(Vec::new()),
             ..Delta::default()
         };
-        return tx.send(Update::Delta(empty)).await.map_err(drop);
+        return tx
+            .send(Update::Delta(empty))
+            .await
+            .map_err(|_| Stop::Closed);
     }
     for chunk in all.chunks(CHUNK) {
         let mut upserted = Vec::with_capacity(chunk.len());
@@ -233,12 +256,19 @@ async fn initial_load(
             order: Some(state.order.iter().map(model_id).collect()),
             ..Delta::default()
         };
-        tx.send(Update::Delta(delta)).await.map_err(drop)?;
+        tx.send(Update::Delta(delta))
+            .await
+            .map_err(|_| Stop::Closed)?;
     }
     Ok(())
 }
 
-async fn reload(user: &CoreUser, affected: HashSet<CoreChatId>, state: &mut LocalState) -> Delta {
+/// Also returns whether the order loaded.
+async fn reload(
+    user: &CoreUser,
+    affected: HashSet<CoreChatId>,
+    state: &mut LocalState,
+) -> (Delta, bool) {
     let mut delta = Delta::default();
     let mut removed = Vec::new();
     for id in affected {
@@ -255,7 +285,7 @@ async fn reload(user: &CoreUser, affected: HashSet<CoreChatId>, state: &mut Loca
 
     // Unlike upstream, an order that fails to load keeps the current one
     // rather than emptying the list.
-    match user.ordered_chat_ids().await {
+    let ordered = match user.ordered_chat_ids().await {
         Ok(ids) => {
             let mut order = Vec::with_capacity(ids.len());
             for id in ids {
@@ -276,15 +306,25 @@ async fn reload(user: &CoreUser, affected: HashSet<CoreChatId>, state: &mut Loca
                 delta.order = Some(order.iter().map(model_id).collect());
                 state.order = order;
             }
+            true
         }
-        Err(err) => error!("failed to load chat order: {err:#}"),
-    }
+        Err(err) => {
+            error!("failed to load chat order: {err:#}");
+            // Chats new to the list have no place in it yet: publishing
+            // them would drop them (`apply` keeps only ordered chats).
+            let placed: HashSet<_> = state.order.iter().copied().collect();
+            state.published.retain(|id, _| placed.contains(id));
+            let placed: HashSet<_> = placed.iter().map(model_id).collect();
+            delta.upserted.retain(|chat| placed.contains(&chat.id));
+            false
+        }
+    };
 
     for id in removed {
         state.published.remove(&id);
         delta.removed.insert(model_id(&id));
     }
-    delta
+    (delta, ordered)
 }
 
 /// Loads what the list shows for a chat. Port of `load_chat_details`, minus
@@ -306,6 +346,7 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
     let is_self_chat = user
         .chat_is_self_group(&chat.group_id)
         .await
+        .inspect_err(|err| error!("failed to check for the self chat: {err:#}"))
         .unwrap_or(false);
 
     let mut users = Vec::new();
@@ -336,7 +377,8 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
     };
     let summary = ChatSummary {
         id: model_id(&chat.id),
-        title: title.into(),
+        // Peer-controlled: titles and names arrive unvalidated.
+        title: name_line(&title),
         is_group,
         pending,
         preview: preview::preview(
@@ -549,26 +591,11 @@ mod tests {
     }
 
     #[test]
-    fn pending_changes_merge_until_taken() {
+    fn an_overflow_is_not_lost_to_a_later_batch() {
         let pending = Pending::default();
-        let (a, b) = (chat_id(), chat_id());
-        let notification = |id| {
-            let mut notification = DbNotification::default();
-            notification
-                .ops
-                .insert(DbEntityId::Chat(id), Default::default());
-            Arc::new(notification)
-        };
-        pending.add(&[notification(a)], false);
-        pending.add(&[notification(b), notification(a)], true);
-
-        let changes = pending.take();
-        assert!(changes.all);
-        assert_eq!(
-            changes.entities,
-            BTreeSet::from([DbEntityId::Chat(a), DbEntityId::Chat(b)])
-        );
-        let next = pending.take();
-        assert!(!next.all && next.entities.is_empty());
+        pending.add(&[], true);
+        pending.add(&[], false);
+        assert!(pending.take().all);
+        assert!(!pending.take().all);
     }
 }

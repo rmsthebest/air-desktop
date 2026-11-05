@@ -106,27 +106,46 @@ async fn e2e_sign_up_connect_and_reload() {
         .create_chat("Lab notes".into(), None, false)
         .await
         .unwrap();
+    let group_id = group;
     let group = chats::model_id(&group);
-    let shown = tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(update) = deltas.recv().await {
-            let Update::Delta(delta) = update else {
-                continue;
-            };
-            let chat = delta.upserted.iter().find(|chat| chat.id == group);
-            if let (Some(chat), Some(order)) = (chat, &delta.order) {
-                return Some((chat.clone(), order.contains(&group)));
-            }
+    let shown = loop {
+        let delta = next_delta(&mut deltas).await;
+        let chat = delta.upserted.iter().find(|chat| chat.id == group);
+        if let (Some(chat), Some(order)) = (chat, &delta.order) {
+            assert!(order.contains(&group));
+            break chat.clone();
         }
-        None
-    })
-    .await
-    .unwrap()
-    .expect("the new group never showed up");
-    assert_eq!(shown.0.title, "Lab notes");
-    assert!(shown.0.is_group && shown.1);
-    eprintln!("group preview: {:?}", shown.0.preview);
-    worker.abort();
+    };
+    assert_eq!(shown.title, "Lab notes");
+    assert!(shown.is_group);
+
+    // A rename reaches the list, and its notice becomes the preview.
+    user.set_chat_title(group_id, "Field notes".into())
+        .await
+        .unwrap();
+    let renamed = loop {
+        let delta = next_delta(&mut deltas).await;
+        let chat = delta.upserted.into_iter().find(|chat| chat.id == group);
+        if let Some(chat) = chat.filter(|chat| chat.title == "Field notes") {
+            break chat;
+        }
+    };
+    let preview = renamed.preview.expect("the rename has a preview");
+    assert!(preview.text.contains("Field notes"), "{preview:?}");
+
+    // Changes the worker never hears about (dropped notifications) are
+    // caught by a full reload: the deleted group leaves the list.
     forward.abort();
+    user.delete_and_erase_chat(group_id).await.unwrap();
+    pending.add(&[], true);
+    let removed = loop {
+        let delta = next_delta(&mut deltas).await;
+        if delta.removed.contains(&group) {
+            break delta;
+        }
+    };
+    assert!(!removed.upserted.iter().any(|chat| chat.id == group));
+    worker.abort();
     listener.abort();
     drop(user);
 
@@ -135,4 +154,12 @@ async fn e2e_sign_up_connect_and_reload() {
     assert_eq!(reloaded.user_id(), &user_id);
     let profile = reloaded.own_user_profile().await.unwrap();
     assert_eq!(profile.display_name.to_string(), "Ada Lovelace");
+}
+
+async fn next_delta(deltas: &mut mpsc::Receiver<Update>) -> chats::Delta {
+    let update = tokio::time::timeout(Duration::from_secs(10), deltas.recv()).await;
+    match update.expect("no delta within 10s") {
+        Some(Update::Delta(delta)) => delta,
+        _ => panic!("the chat list worker failed"),
+    }
 }

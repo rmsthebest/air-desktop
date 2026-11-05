@@ -224,6 +224,8 @@ impl Workspace {
     }
 
     fn jump(&mut self, back: bool, cx: &mut Context<Self>) {
+        let list = self.chat_list.read(cx);
+        self.jumps.retain(|id| list.chat(id).is_some());
         let target = if back {
             self.jumps.back()
         } else {

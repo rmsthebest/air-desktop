@@ -89,3 +89,41 @@ Deferred:
 - **A resume after the challenge was spent** (AS registration done, QS step
   failed) isn't covered by a test; it needs a server fault injected
   mid-registration.
+
+## Gate 5 — milestone 4 (`98ebf1f..3fc92d1`): BLOCK → fixed
+
+Fixed:
+- **Peer-controlled names and titles (high).** Group titles and display
+  names arrive unvalidated (`DisplayName` TLS deserialization skips the
+  length and newline checks). They now go through `model::name_line`: one
+  line, invisible/bidi characters stripped, at most 64 graphemes. This
+  happens where the session builds the summary, so the list, header and
+  palette all get clean data. The group sender prefix and the conversation
+  header title truncate. Regression test: `names_are_one_short_line`.
+- **Jumplist onto a vanished chat** (gate 3 deferral). `JumpList::retain`
+  drops chats that are gone before each jump. Test:
+  `jump_list_skips_chats_that_are_gone`.
+- **Palette size** (gate 1/2 deferral). gpui-component's `Command` renders
+  through `v_virtual_list`, so the palette is already virtualized. With
+  bounded titles nothing more is needed.
+- **Worker stateful paths.** The e2e test now also renames the group (title
+  update and system-message preview) and deletes it with notifications cut
+  off, so only a full reload (`changes.all`) can notice. That covers removal
+  of chats that left the order without a notification.
+- **Order load failure** no longer publishes chats that have no place in
+  the order, which `apply` would have dropped for good. The worker retries
+  with a full reload a second later.
+- **Initial load failure** retries with Fibonacci backoff instead of ending
+  the worker; `LoadState::Failed` clears with the first delta.
+- `chat_is_self_group` errors are logged. Removed the e2e `eprintln!`.
+- **Tests.** Trimmed the pending-set test to the overflow flag surviving a
+  later batch.
+
+Deferred:
+- **`Session` batching test with an ephemeral `CoreUser`.** Upstream's
+  `test_utils` are `cfg(test)` inside `aircoreclient` and not exported. The
+  batching is covered indirectly by the e2e test and the worker tests.
+  Revisit if a fake core is introduced.
+- The core's broadcast silently drops notifications on lag (it logs, but
+  doesn't tell subscribers). Our overflow flag only covers our own buffer.
+  An upstream issue, noted for the record.

@@ -8,7 +8,7 @@ use mimi_content::MessageStatus;
 use mimi_content::content_container::{Disposition, NestedPart};
 use pulldown_cmark::{Event, Options, Parser, TagEnd};
 
-use crate::model::{Preview, PreviewKind, preview_line};
+use crate::model::{Preview, PreviewKind, name_line, preview_line};
 
 /// What the preview needs to know about a chat's last message.
 #[derive(Debug, PartialEq)]
@@ -46,7 +46,8 @@ pub async fn describe(user: &CoreUser, message: &ChatMessage) -> Option<LastMess
             let sender_name = if sender == user.user_id() {
                 None
             } else {
-                Some(user.user_profile(sender).await.display_name.to_string())
+                let name = user.user_profile(sender).await.display_name;
+                Some(name_line(name.as_ref()).to_string())
             };
             let body = match &content.content().nested_part {
                 NestedPart::SinglePart {

@@ -287,6 +287,8 @@ impl Render for Conversation {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(chat.title.clone()),
                     )

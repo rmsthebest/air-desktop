@@ -137,7 +137,9 @@ impl ChatList {
                 .when_some(preview.prefix.clone(), |line, prefix| {
                     line.child(
                         div()
-                            .flex_none()
+                            .flex_shrink_0()
+                            .max_w(gpui_kit::relative(0.5))
+                            .truncate()
                             .font_weight(FontWeight::MEDIUM)
                             .when(preview.kind == PreviewKind::Draft, |prefix| prefix.italic())
                             .child(format!("{prefix}:\u{a0}")),

@@ -7,7 +7,6 @@
 //! As upstream, the composer's text is the view's; the draft is what was
 //! last stored from it, plus what the message edits or replies to.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use aircommon::identifiers::MimiId;
@@ -20,20 +19,55 @@ use aircoreclient::{
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use gpui::{EventEmitter, SharedString};
-use gpui_kit::{AsyncApp, Context, Entity, Task, WeakEntity};
+use gpui_kit::{App, AsyncApp, Context, Entity, Task, WeakEntity};
 use mimi_content::MimiContent;
+use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 use crate::model::{ChatId, MessageId, Quote};
-use crate::runtime::Tokio;
+use crate::runtime::{Tokio, TokioTask};
 use crate::session::preview::{plain_body, quote_line};
 use crate::session::{Session, display_name};
 
 /// How long typing has to pause before the draft is stored. As upstream.
 const STORE_DEBOUNCE: Duration = Duration::from_secs(1);
-/// Leaving a chat commits its draft after this long, so the chat list
-/// doesn't reorder under the user's next pick. As upstream.
-const COMMIT_DELAY: Duration = Duration::from_millis(300);
+
+type Job = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Runs draft loads, stores and sends one at a time, in the order the UI
+/// queued them, for all of the account's chats. So a chat reopened right
+/// after it was left loads what leaving it stored, and a late store can't
+/// overwrite a newer one.
+#[derive(Clone)]
+pub struct DraftQueue(mpsc::UnboundedSender<Job>);
+
+impl DraftQueue {
+    pub(super) fn start(user: CoreUser, cx: &App) -> (Self, TokioTask<()>) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
+        let task = Tokio::spawn(cx, async move {
+            // Drafts still being typed when the app last quit. As upstream,
+            // at startup.
+            if let Err(err) = user.commit_all_message_drafts().await {
+                error!("failed to commit drafts: {err:#}");
+            }
+            while let Some(job) = rx.recv().await {
+                job.await;
+            }
+        });
+        (Self(tx), task)
+    }
+
+    fn run<R: Send + 'static>(
+        &self,
+        job: impl Future<Output = R> + Send + 'static,
+    ) -> oneshot::Receiver<R> {
+        let (tx, rx) = oneshot::channel();
+        _ = self.0.send(Box::pin(async move {
+            _ = tx.send(job.await);
+        }));
+        rx
+    }
+}
 
 pub enum ComposerEvent {
     /// Put this text in the composer: a stored draft (only into an empty
@@ -54,10 +88,6 @@ pub(super) struct Draft {
     pub(super) committed: bool,
 }
 
-/// What identifies a draft version: a draft that changed since a send
-/// belongs to the next message and must survive the send's cleanup.
-type Version = (DateTime<Utc>, Option<CoreMessageId>, Option<MimiId>);
-
 impl Draft {
     pub(super) fn empty() -> Self {
         Self {
@@ -67,14 +97,6 @@ impl Draft {
             updated_at: Utc::now(),
             committed: false,
         }
-    }
-
-    fn version(&self) -> Version {
-        (
-            self.updated_at,
-            self.editing,
-            self.reply_to.as_ref().map(|(id, _)| *id),
-        )
     }
 
     pub(super) fn to_core(&self) -> MessageDraft {
@@ -99,6 +121,7 @@ impl DraftState {
     /// The composer's text, as typed (`committed: false`) or on leaving.
     fn store_text(&mut self, text: &str, committed: bool) -> bool {
         match &mut self.draft {
+            None if text.is_empty() => false,
             Some(draft) if draft.text != text => {
                 draft.text = text.to_string();
                 draft.updated_at = Utc::now();
@@ -169,23 +192,28 @@ impl DraftState {
         }
     }
 
-    /// An edit the core refused: the text becomes a new message.
-    fn keep_as_new(&mut self, text: String) -> bool {
-        let Some(draft) = &mut self.draft else {
-            return false;
-        };
-        draft.editing = None;
-        draft.text = text;
-        draft.updated_at = Utc::now();
-        true
+    /// Sending: the draft goes with the message, so nothing done while it
+    /// is in flight (another send, leaving the chat) reuses its reply or
+    /// edit.
+    fn take_for_send(&mut self) -> Option<Draft> {
+        self.draft.take()
     }
 
-    /// The draft sent as `sent` was delivered to the core: clears it,
-    /// unless it changed since.
-    fn sent(&mut self, sent: Option<Version>) {
-        if sent.is_some() && self.draft.as_ref().map(Draft::version) == sent {
-            self.draft = None;
+    /// The send of `text` with `sent` failed: the draft comes back, unless
+    /// the user started another one meanwhile. A refused edit comes back as
+    /// a new message. Returns whether the draft changed.
+    fn send_failed(&mut self, sent: Option<Draft>, text: String, edit_refused: bool) -> bool {
+        if self.draft.is_some() {
+            return false;
         }
+        let mut draft = sent.unwrap_or_else(Draft::empty);
+        draft.text = text;
+        if edit_refused {
+            draft.editing = None;
+        }
+        draft.updated_at = Utc::now();
+        self.draft = Some(draft);
+        true
     }
 }
 
@@ -213,10 +241,7 @@ pub struct Composer {
 struct Live {
     user: CoreUser,
     chat: CoreChatId,
-    /// Stores and sends one at a time, in order, so an older draft can't
-    /// overwrite a newer one.
-    lock: Arc<tokio::sync::Mutex<()>>,
-    tokio: tokio::runtime::Handle,
+    queue: DraftQueue,
     /// The debounced store of what is being typed.
     store_task: Option<Task<()>>,
     /// The latest edit or reply lookup; a newer one replaces it.
@@ -238,10 +263,12 @@ impl Composer {
     /// The composer of `chat`, starting from its stored draft.
     pub fn open(session: &Entity<Session>, chat: &ChatId, cx: &mut Context<Self>) -> Self {
         let user = session.read(cx).user().clone();
+        let queue = session.read(cx).drafts().clone();
         let chat = super::messages::core_chat_id(chat);
-        let load = Tokio::spawn(cx, load_draft(user.clone(), chat));
+        let load = queue.run(load_draft(user.clone(), chat));
         let task = cx.spawn(async move |this, cx| {
-            let draft = match load.await.and_then(|draft| draft) {
+            let loaded = load.await.context("the draft queue stopped");
+            let draft = match loaded.and_then(|draft| draft) {
                 Ok(draft) => draft,
                 Err(err) => return error!("failed to load the draft: {err:#}"),
             };
@@ -267,8 +294,7 @@ impl Composer {
             live: Some(Live {
                 user,
                 chat,
-                lock: Arc::default(),
-                tokio: Tokio::handle(cx),
+                queue,
                 store_task: None,
                 lookup: None,
                 _load: task,
@@ -302,7 +328,7 @@ impl Composer {
             cx.background_executor().timer(STORE_DEBOUNCE).await;
             _ = this.update(cx, |this, _| {
                 if this.state.store_text(&text, false) {
-                    this.persist(Duration::ZERO);
+                    this.persist();
                 }
             });
         }));
@@ -315,23 +341,21 @@ impl Composer {
             live.store_task = None;
         }
         if self.state.store_text(text, true) {
-            self.persist(COMMIT_DELAY);
+            self.persist();
         }
     }
 
-    /// Stores the draft on tokio, detached: it completes even if the chat
+    /// Stores the draft through the queue: it completes even if the chat
     /// closes meanwhile.
-    fn persist(&self, delay: Duration) {
+    fn persist(&self) {
         let Some(live) = &self.live else { return };
         let draft = self.state.draft.as_ref().map(Draft::to_core);
-        let (user, chat, lock) = (live.user.clone(), live.chat, live.lock.clone());
-        live.tokio.spawn(async move {
-            tokio::time::sleep(delay).await;
-            let _guard = lock.lock().await;
+        let (user, chat) = (live.user.clone(), live.chat);
+        drop(live.queue.run(async move {
             if let Err(err) = user.store_message_draft(chat, draft.as_ref()).await {
                 error!("failed to store the draft: {err:#}");
             }
-        });
+        }));
     }
 
     /// Sends `text` as a new message, or as the edit or reply the draft is.
@@ -340,28 +364,26 @@ impl Composer {
     pub fn send(&mut self, text: String, cx: &mut Context<Self>) {
         let Some(live) = &mut self.live else { return };
         live.store_task = None;
-        let draft = self.state.draft.clone();
-        let (user, chat, lock) = (live.user.clone(), live.chat, live.lock.clone());
-        let task = Tokio::spawn(cx, {
-            let text = text.clone();
-            async move {
-                let _guard = lock.lock().await;
-                send(&user, chat, text, draft.as_ref()).await
-            }
+        let draft = self.state.take_for_send();
+        let (user, chat) = (live.user.clone(), live.chat);
+        let task = live.queue.run({
+            let (text, draft) = (text.clone(), draft.clone());
+            async move { send(&user, chat, text, draft.as_ref()).await }
         });
-        let sent_version = self.state.draft.as_ref().map(Draft::version);
         // Not tied to the entity: a send completes even if the chat closes.
         cx.spawn(async move |this, cx| {
             let sent = task
                 .await
-                .unwrap_or_else(|err| Sent::Failed(err.context("the send was cancelled")));
+                .unwrap_or_else(|_| Sent::Failed(anyhow::anyhow!("the draft queue stopped")));
             _ = this.update(cx, |this, cx| {
+                let refused = matches!(sent, Sent::EditRefused(_));
+                if !matches!(sent, Sent::Ok) && this.state.send_failed(draft, text.clone(), refused)
+                {
+                    this.persist();
+                }
                 match sent {
-                    Sent::Ok => this.state.sent(sent_version),
+                    Sent::Ok => {}
                     Sent::EditRefused(refused) => {
-                        if this.state.keep_as_new(text.clone()) {
-                            this.persist(Duration::ZERO);
-                        }
                         let error = match refused {
                             MessageEditError::WindowPassed => {
                                 "This message can't be edited anymore. Your text is kept as a new message."
@@ -418,7 +440,7 @@ impl Composer {
             };
             this.update(cx, |this, cx| {
                 if this.state.start_edit(id, body.clone()) {
-                    this.persist(Duration::ZERO);
+                    this.persist();
                     cx.emit(ComposerEvent::SetText {
                         text: body,
                         replace: true,
@@ -461,7 +483,7 @@ impl Composer {
             };
             this.update(cx, |this, cx| {
                 if this.state.start_reply(mimi_id, quote) {
-                    this.persist(Duration::ZERO);
+                    this.persist();
                     cx.notify();
                 }
             })
@@ -479,7 +501,7 @@ impl Composer {
                 replace: true,
             }),
         }
-        self.persist(Duration::ZERO);
+        self.persist();
         cx.notify();
         true
     }
@@ -641,29 +663,32 @@ mod tests {
     }
 
     #[test]
-    fn a_send_clears_only_the_draft_it_sent() {
+    fn a_send_takes_the_draft_and_a_failure_gives_it_back() {
         let mut state = DraftState::default();
         state.start_reply(mimi(1), quote("q"));
-        let sent = state.draft.as_ref().map(Draft::version);
-        state.sent(sent);
-        assert_eq!(state.draft, None);
+        let sent = state.take_for_send();
+        // In flight: leaving the chat stores nothing of the reply.
+        assert!(!state.store_text("", true));
+        assert!(state.send_failed(sent.clone(), "my reply".into(), false));
+        let draft = state.draft.clone().unwrap();
+        assert_eq!(draft.text, "my reply");
+        assert!(draft.reply_to.is_some(), "the reply context comes back");
 
-        // A reply staged while the send was in flight belongs to the next
-        // message.
-        state.start_reply(mimi(1), quote("q"));
-        let sent = state.draft.as_ref().map(Draft::version);
-        state.start_reply(mimi(2), quote("next"));
-        state.sent(sent);
-        assert!(state.draft.is_some());
-    }
-
-    #[test]
-    fn a_refused_edit_becomes_a_new_message() {
+        // A refused edit comes back as a new message.
         let mut state = DraftState::default();
         let id = CoreMessageId::new(uuid::Uuid::from_u128(7));
         state.start_edit(id, "old".into());
-        assert!(state.keep_as_new("new text".into()));
+        let sent = state.take_for_send();
+        assert!(state.send_failed(sent, "new text".into(), true));
         let draft = state.draft.as_ref().unwrap();
         assert_eq!((draft.editing, draft.text.as_str()), (None, "new text"));
+
+        // Not over a draft started meanwhile.
+        let mut state = DraftState::default();
+        state.start_reply(mimi(1), quote("q"));
+        let sent = state.take_for_send();
+        state.start_reply(mimi(2), quote("next"));
+        assert!(!state.send_failed(sent, "my reply".into(), false));
+        assert_eq!(state.draft.unwrap().reply_to.unwrap().0, mimi(2));
     }
 }

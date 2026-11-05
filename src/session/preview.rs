@@ -93,6 +93,10 @@ pub fn plain_body(content: &MimiContent) -> Option<&str> {
 
 /// One line of a replied-to message, or what stands in for it.
 pub fn quote_line(content: Option<&MimiContent>) -> SharedString {
+    // A deletion replaces the content with a null part.
+    if content.is_some_and(|content| matches!(content.nested_part, NestedPart::NullPart { .. })) {
+        return "Deleted message".into();
+    }
     match content.map(body_of) {
         Some(Body::Markdown(source)) => preview_line(&plain_text(&source)),
         Some(Body::Attachment) => "Attachment".into(),

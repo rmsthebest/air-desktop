@@ -67,7 +67,9 @@ pub struct Session {
     /// The latest profile load; a newer one replaces (cancels) it, so an
     /// older result can't overwrite a newer one.
     profile_task: Option<Task<()>>,
+    drafts: composer::DraftQueue,
     _queue: TokioTask<()>,
+    _drafts: TokioTask<()>,
     _forward: TokioTask<()>,
     _receive: [Task<()>; 2],
 }
@@ -117,7 +119,10 @@ impl Session {
                 }),
                 cx.spawn(async move |this, cx| receive_queue_state(this, state_rx, cx).await),
             ];
+            let (drafts, drafts_task) = composer::DraftQueue::start(user.clone(), cx);
             let mut session = Self {
+                drafts,
+                _drafts: drafts_task,
                 display_name: SharedString::default(),
                 queue_state: initial,
                 profile_task: None,
@@ -133,6 +138,10 @@ impl Session {
 
     pub(crate) fn user(&self) -> &CoreUser {
         &self.user
+    }
+
+    pub(crate) fn drafts(&self) -> &composer::DraftQueue {
+        &self.drafts
     }
 
     pub fn display_name(&self) -> &SharedString {

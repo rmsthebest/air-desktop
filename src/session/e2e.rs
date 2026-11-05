@@ -216,14 +216,30 @@ async fn e2e_sign_up_connect_and_reload() {
     user.store_message_draft(group_id, Some(&draft.to_core()))
         .await
         .unwrap();
-    let loaded = composer::load_draft(user.clone(), group_id)
+    let loaded_draft = composer::load_draft(user.clone(), group_id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        (loaded.text.as_str(), loaded.reply_to.map(|(_, q)| q)),
+        (
+            loaded_draft.text.as_str(),
+            loaded_draft.reply_to.clone().map(|(_, q)| q)
+        ),
         ("unsent", Some(quote))
     );
+    // Sending it clears the stored draft (by the version stored).
+    let sent = composer::send(&user, group_id, "sent at last".into(), Some(&loaded_draft)).await;
+    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+    assert!(user.message_draft(group_id).await.unwrap().is_none());
+
+    // A reply quotes the version it answered, but not one deleted since.
+    sent_mimi_id(&user, mine_id).await;
+    user.delete_message_for_everyone(group_id, mine_id)
+        .await
+        .unwrap();
+    let requoted = next_message(&mut updates, |m| m.id == replied.id).await;
+    let quote = requoted.reply_to.expect("still a reply");
+    assert_eq!(quote.text, "Deleted message");
     messages_worker.abort();
 
     // Changes the worker never hears about (dropped notifications) are

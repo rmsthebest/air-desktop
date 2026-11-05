@@ -397,6 +397,15 @@ impl Conversation {
         else {
             return;
         };
+        // An edit starts from the message's text: don't drop what's typed.
+        if !self.composer.read(cx).value().trim().is_empty() {
+            crate::ui::show_error(
+                "Send or clear the message you're writing before editing another.".into(),
+                window,
+                cx,
+            );
+            return;
+        }
         if let Some(compose) = self.compose.clone() {
             compose.update(cx, |compose, cx| compose.edit(Some(&id), cx));
             self.composer_focus(cx).focus(window, cx);

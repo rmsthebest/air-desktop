@@ -231,3 +231,46 @@ Deferred (with milestone 6, needs an ephemeral `CoreUser`):
 - A view test that a paged append pins what's shown.
 - Worker tests: the Add|Update reload, initial-load backoff, the flush on
   drop, and the in-flight flags.
+
+## Gate 7 — milestone 6a, composer (`e922f26..2c45bba`): PASS
+
+Fixed anyway:
+- **Draft lost on quick back-and-forth (medium).** Each composer had its own
+  lock, and leaving a chat stored its draft 300 ms late. Reopening the chat
+  in between could load nothing, then store an empty draft over the real
+  one. Now one `DraftQueue` per session runs every draft load, store and
+  send in the order the UI queued them, and leaving stores right away (the
+  delay is gone). Reopening a chat therefore always reads what leaving it
+  stored. An empty composer with no draft stores nothing.
+- **Drafts never committed after quitting (medium).** The queue first runs
+  `commit_all_message_drafts`, as upstream does at startup. Accepted: text
+  typed less than a second before quitting isn't stored (as upstream on a
+  kill).
+- **Reply/edit reused while a send was in flight (low).** A send now takes
+  the draft out of memory. A failure gives it back (a refused edit as a new
+  message) unless a newer draft was started. Test:
+  `a_send_takes_the_draft_and_a_failure_gives_it_back` (replaces the
+  setter-only refused-edit test, as suggested).
+- **`e` dropped typed text (low).** It refuses with a notice while the
+  composer holds text.
+- **Quotes from other chats (low).** The core resolves a reply's original by
+  MIMI id alone. A quote now shows only if the original is in the same
+  chat; otherwise it reads "Message unavailable". Worth raising upstream.
+- **Stale quotes (low).** Replies reload when their original changes. The
+  core quotes the version replied to, so edits don't change a quote, but
+  deletion does ("Deleted message"). The e2e test covers it, plus clearing a
+  draft that came from the database on send.
+
+Corrected:
+- The core's `test_utils` feature doesn't provide an offline `CoreUser`
+  (only a server URL override), so the gate 6/6b worker tests can't run
+  without a server. Covered by e2e so far: Add|Update (own send then status
+  and edit patches), the divider-clearing own send, and reply refresh.
+  Still open, for the two-user e2e in 6b: a sender rename re-patching
+  messages, the in-flight paging flags, flush on drop, initial-load
+  backoff, the `Session` batching test, and the paged-append view test.
+
+Deferred:
+- View tests that a loaded draft only fills an empty composer and that a
+  failed send restores text only into a blank one. Both need a live
+  composer; they go with the two-user e2e harness.

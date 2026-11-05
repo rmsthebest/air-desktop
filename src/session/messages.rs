@@ -444,6 +444,8 @@ struct Key {
     sender: Option<CoreUserId>,
     /// Whose message it quotes, likewise.
     quoted: Option<CoreUserId>,
+    /// The message it quotes, to refresh the quote when that changes.
+    quotes: Option<CoreMessageId>,
 }
 
 /// The loaded window's bookkeeping: what the view shows, as keys. Each
@@ -753,6 +755,17 @@ impl Worker {
         for user in renamed {
             edits.extend(self.reload_from(&user).await);
         }
+        // Replies show their original: refresh them when it changes.
+        let changed: Vec<_> = changes
+            .merged
+            .ops
+            .keys()
+            .filter_map(|entity| match entity {
+                DbEntityId::Message(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        edits.extend(self.reload_replies_to(&changed).await);
         let divider = own_new_message.then_some(None);
         if !edits.is_empty() || divider.is_some() {
             self.send(edits, divider, false).await?;
@@ -764,6 +777,25 @@ impl Worker {
             self.load_newer().await?;
         }
         Ok(())
+    }
+
+    /// Reloads the loaded replies to any of `originals`.
+    async fn reload_replies_to(&mut self, originals: &[CoreMessageId]) -> Vec<Change<Message>> {
+        let ids: Vec<_> = self
+            .window
+            .keys
+            .iter()
+            .filter(|key| key.quotes.is_some_and(|id| originals.contains(&id)))
+            .map(|key| key.id)
+            .collect();
+        let mut edits = Vec::new();
+        for id in ids {
+            if let Ok(Some(message)) = self.user.message(id).await {
+                let (key, item) = self.convert(message).await;
+                edits.extend(self.window.patch(key, item));
+            }
+        }
+        edits
     }
 
     /// Reloads the messages of a sender whose name changed.
@@ -870,23 +902,38 @@ impl Worker {
                 }
             }
         };
-        let (quoted, reply_to) = match message.in_reply_to() {
-            Some((_, Some(original))) => (
+        let original = match message.in_reply_to() {
+            Some((_, Some(original))) => Some(original),
+            _ => None,
+        };
+        // The core finds the original by its id alone: a reply must not
+        // pull in a message from another chat.
+        let in_chat = match original {
+            Some(original) => matches!(
+                self.user.message(original.message_id).await,
+                Ok(Some(found)) if found.chat_id() == self.chat
+            ),
+            None => false,
+        };
+        let (quoted, quotes, reply_to) = match original {
+            Some(original) if in_chat => (
                 Some(original.sender.clone()),
+                Some(original.message_id),
                 Some(Quote {
                     sender: self.name(&original.sender).await,
                     text: quote_line(original.mimi_content.as_ref()),
                 }),
             ),
-            // The original is gone, or not here (yet).
-            Some((_, None)) => (
+            // Gone, not here (yet), or from elsewhere.
+            _ if message.in_reply_to().is_some() => (
                 None,
+                original.map(|original| original.message_id),
                 Some(Quote {
                     sender: SharedString::default(),
                     text: quote_line(None),
                 }),
             ),
-            None => (None, None),
+            _ => (None, None, None),
         };
         let edited = match message.message() {
             CoreMessage::Content(content) => content.edited_at().is_some(),
@@ -897,6 +944,7 @@ impl Worker {
             at: message.timestamp(),
             sender: sender.clone(),
             quoted,
+            quotes,
         };
         let item = Message {
             id: model_message_id(message.id()),
@@ -923,6 +971,7 @@ mod tests {
             at: DateTime::from_timestamp(n as i64, 0).unwrap(),
             sender: None,
             quoted: None,
+            quotes: None,
         }
     }
 

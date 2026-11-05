@@ -50,7 +50,16 @@
       "pagedown": "air::HalfPageDown",
       "pageup": "air::HalfPageUp",
       "secondary-c": "air::YankMessage",
-      "enter": "air::OpenLinks"
+      "enter": "air::OpenLinks",
+      "e": "air::EditMessage",
+      "r": "air::ReplyToMessage"
+    }
+  },
+  {
+    "context": "Composer > Input",
+    "bindings": {
+      "up": "air::EditLastMessage",
+      "escape": "air::CancelCompose"
     }
   },
   {

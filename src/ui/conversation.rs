@@ -28,14 +28,15 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    ClearCursor, CursorDown, CursorFirst, CursorLast, CursorUp, HalfPageDown, HalfPageUp,
-    OpenLinks, ToggleDetails, YankMessage,
+    CancelCompose, ClearCursor, CursorDown, CursorFirst, CursorLast, CursorUp, EditLastMessage,
+    EditMessage, HalfPageDown, HalfPageUp, OpenLinks, ReplyToMessage, ToggleDetails, YankMessage,
 };
 use crate::markdown::Block;
 use crate::model::{
-    ChatSummary, Message, MessageBody, MessageStatus, format_day, format_message_time, move_cursor,
-    starts_day, starts_group,
+    ChatSummary, Message, MessageBody, MessageStatus, Quote, format_day, format_message_time,
+    move_cursor, starts_day, starts_group,
 };
+use crate::session::composer::{Composer, ComposerEvent};
 use crate::session::messages::{Messages, MessagesEvent};
 use crate::ui::key_context;
 use crate::ui::markdown_view;
@@ -65,7 +66,10 @@ pub struct Conversation {
     /// Focus of the message list (normal mode).
     focus_handle: FocusHandle,
     composer: Entity<TextareaState>,
+    /// The open chat's draft, sending, edits and replies.
+    compose: Option<Entity<Composer>>,
     _messages_subscription: Option<Subscription>,
+    _compose_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -142,10 +146,15 @@ impl Conversation {
             cx.subscribe_in(
                 &composer,
                 window,
-                |this, _, event: &InputEvent, window, cx| {
-                    if let InputEvent::PressEnter { shift: false, .. } = event {
-                        this.submit(window, cx);
+                |this, composer, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
+                    InputEvent::Change => {
+                        let text = composer.read(cx).value().to_string();
+                        if let Some(compose) = &this.compose {
+                            compose.update(cx, |compose, cx| compose.typed(text, cx));
+                        }
                     }
+                    _ => {}
                 },
             ),
             // Coming back to the window is seeing what it shows.
@@ -163,7 +172,9 @@ impl Conversation {
             cursor: None,
             focus_handle: cx.focus_handle(),
             composer,
+            compose: None,
             _messages_subscription: None,
+            _compose_subscription: None,
             _subscriptions: subscriptions,
         }
     }
@@ -176,9 +187,29 @@ impl Conversation {
         &mut self,
         chat: ChatSummary,
         messages: Entity<Messages>,
+        compose: Entity<Composer>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.leave_chat(window, cx);
+        self._compose_subscription =
+            Some(
+                cx.subscribe_in(&compose, window, |this, _, event, window, cx| match event {
+                    ComposerEvent::SetText { text, replace } => {
+                        if *replace || this.composer.read(cx).value().is_empty() {
+                            this.set_composer_text(text, window, cx);
+                        }
+                    }
+                    ComposerEvent::SendFailed { text, error } => {
+                        // Unless the user started a new message meanwhile.
+                        if this.composer.read(cx).value().trim().is_empty() {
+                            this.set_composer_text(text, window, cx);
+                        }
+                        crate::ui::show_error(error.to_string(), window, cx);
+                    }
+                }),
+            );
+        self.compose = Some(compose);
         self.list.reset(messages.read(cx).messages().len());
         self._messages_subscription =
             Some(cx.subscribe_in(&messages, window, |this, _, event, _, cx| {
@@ -240,7 +271,10 @@ impl Conversation {
         cx.notify();
     }
 
-    pub fn close(&mut self, cx: &mut Context<Self>) {
+    pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_chat(window, cx);
+        self.compose = None;
+        self._compose_subscription = None;
         self.chat = None;
         self.messages = None;
         self.shown = None;
@@ -248,6 +282,17 @@ impl Conversation {
         self.list.reset(0);
         self.cursor = None;
         cx.notify();
+    }
+
+    /// Hands what is in the composer to the chat being left, as its draft,
+    /// and empties it for the next chat.
+    fn leave_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(compose) = self.compose.take() else {
+            return;
+        };
+        let text = self.composer.read(cx).value().to_string();
+        compose.update(cx, |compose, _| compose.leave(&text));
+        self.set_composer_text("", window, cx);
     }
 
     pub fn set_composer_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -309,7 +354,67 @@ impl Conversation {
         }
         self.composer
             .update(cx, |composer, cx| composer.set_value("", window, cx));
-        cx.emit(ConversationEvent::Send(text));
+        match self.compose.clone().filter(|c| c.read(cx).is_live()) {
+            Some(compose) => {
+                compose.update(cx, |compose, cx| compose.send(text, cx));
+                // Your own message is the one to see.
+                if let Some(messages) = self.messages.clone() {
+                    messages.update(cx, |messages, cx| messages.jump_to_bottom(cx));
+                }
+            }
+            None => cx.emit(ConversationEvent::Send(text)),
+        }
+    }
+
+    /// Up in an empty composer edits the last message; otherwise the key
+    /// moves the cursor as usual.
+    fn edit_last(&mut self, _: &EditLastMessage, _: &mut Window, cx: &mut Context<Self>) {
+        let empty = self.composer.read(cx).value().trim().is_empty();
+        match &self.compose {
+            Some(compose) if empty && !compose.read(cx).is_editing() => {
+                compose.update(cx, |compose, cx| compose.edit(None, cx))
+            }
+            _ => cx.propagate(),
+        }
+    }
+
+    /// Escape drops a reply or edit; otherwise it does what it would.
+    fn cancel_compose(&mut self, _: &CancelCompose, _: &mut Window, cx: &mut Context<Self>) {
+        let cancelled = self
+            .compose
+            .clone()
+            .is_some_and(|compose| compose.update(cx, |compose, cx| compose.cancel(cx)));
+        if !cancelled {
+            cx.propagate();
+        }
+    }
+
+    fn edit_message(&mut self, _: &EditMessage, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .cursor_message(cx)
+            .filter(|m| m.own)
+            .map(|m| m.id.clone())
+        else {
+            return;
+        };
+        if let Some(compose) = self.compose.clone() {
+            compose.update(cx, |compose, cx| compose.edit(Some(&id), cx));
+            self.composer_focus(cx).focus(window, cx);
+        }
+    }
+
+    fn reply(&mut self, _: &ReplyToMessage, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .cursor_message(cx)
+            .filter(|m| !m.is_event())
+            .map(|m| m.id.clone())
+        else {
+            return;
+        };
+        if let Some(compose) = self.compose.clone() {
+            compose.update(cx, |compose, cx| compose.reply(&id, cx));
+            self.composer_focus(cx).focus(window, cx);
+        }
     }
 
     /// What is in view changed (or the window was activated): pages in
@@ -556,6 +661,12 @@ impl Conversation {
                     .border_color(cursor_color(list_focused, cx))
             })
             .shadow_xs()
+            .children(
+                message
+                    .reply_to
+                    .as_ref()
+                    .map(|quote| render_quote(quote, cx)),
+            )
             .child(body)
             .child(div().text_xs().opacity(0.7).text_right().child(footer));
 
@@ -582,6 +693,40 @@ impl Conversation {
             })
             .child(bubble)
             .into_any_element()
+    }
+
+    /// What the composer's message will be, when it isn't a plain new one.
+    fn render_compose_bar(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let compose = self.compose.as_ref()?.read(cx);
+        let theme = cx.theme();
+        let (label, quote) = if compose.is_editing() {
+            ("Editing message", None)
+        } else {
+            ("Replying", Some(compose.reply_to()?))
+        };
+        Some(
+            h_flex()
+                .px_3()
+                .pt_2()
+                .gap_2()
+                .items_start()
+                .text_xs()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(div().italic().text_color(theme.primary).child(label))
+                        .children(quote.map(|quote| render_quote(quote, cx))),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.muted_foreground)
+                        .child("esc to cancel"),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_status(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -648,6 +793,28 @@ fn links(message: &Message) -> Vec<SharedString> {
     out
 }
 
+/// The replied-to message, above a reply or the composer.
+fn render_quote(quote: &Quote, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .pl_2()
+        .border_l_2()
+        .border_color(theme.border)
+        .opacity(0.85)
+        .text_xs()
+        .min_w_0()
+        .when(!quote.sender.is_empty(), |quote_box| {
+            quote_box.child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .truncate()
+                    .child(quote.sender.clone()),
+            )
+        })
+        .child(div().truncate().child(quote.text.clone()))
+        .into_any_element()
+}
+
 fn cursor_color(list_focused: bool, cx: &App) -> gpui::Hsla {
     let theme = cx.theme();
     if list_focused {
@@ -665,6 +832,7 @@ impl Render for Conversation {
         let message_list_context: KeyContext = key_context("MessageList", cx);
         let composer_context: KeyContext = key_context("Composer", cx);
         let status = self.render_status(cx);
+        let compose_bar = self.render_compose_bar(cx);
         let theme = cx.theme();
         let root = v_flex().key_context("Conversation").size_full();
         let Some(chat) = &self.chat else {
@@ -740,6 +908,8 @@ impl Render for Conversation {
                     )
                     .on_action(cx.listener(Self::yank))
                     .on_action(cx.listener(Self::open_links))
+                    .on_action(cx.listener(Self::edit_message))
+                    .on_action(cx.listener(Self::reply))
                     .flex_1()
                     .min_h_0()
                     .children(status)
@@ -749,11 +919,13 @@ impl Render for Conversation {
             .child(
                 div()
                     .key_context(composer_context)
+                    .on_action(cx.listener(Self::edit_last))
+                    .on_action(cx.listener(Self::cancel_compose))
                     .flex_none()
                     .px_6()
                     .pb_4()
                     .child(
-                        div()
+                        v_flex()
                             .mx_auto()
                             .w_full()
                             .max_w(px(MAX_CONTENT_WIDTH))
@@ -766,6 +938,7 @@ impl Render for Conversation {
                                 theme.border
                             })
                             .shadow_sm()
+                            .children(compose_bar)
                             .child(Textarea::new(&self.composer).appearance(false)),
                     ),
             )
@@ -805,7 +978,13 @@ mod tests {
             cx.new(|_| Messages::fixed(history).with_first_unread(MessageId("m120".into())));
         let chat = crate::model::mock::chats().remove(0);
         conversation.update_in(cx, |conversation, window, cx| {
-            conversation.show(chat, messages.clone(), window, cx)
+            conversation.show(
+                chat,
+                messages.clone(),
+                cx.new(|_| Composer::fixed()),
+                window,
+                cx,
+            )
         });
         cx.run_until_parked();
 

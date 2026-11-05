@@ -15,9 +15,10 @@ use tokio::sync::mpsc;
 
 use super::account::{self, SignUp, SignUpError};
 use super::chats::{self, Update};
-use super::messages;
 use super::pending::Pending;
 use super::queue::{self, ConnectionStatus, QueueEvent};
+use super::{composer, messages};
+use crate::model::{Message, Quote};
 use aircoreclient::clients::store::{ClientRecord, ClientRecordState};
 
 fn sign_up(code: Option<&str>) -> SignUp {
@@ -167,6 +168,62 @@ async fn e2e_sign_up_connect_and_reload() {
             break;
         }
     }
+
+    // Sending: the message lands in the history as our own.
+    let sent = composer::send(&user, group_id, "hello **lab**".into(), None).await;
+    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+    let mine = next_message(&mut updates, |m| m.plain_text() == "hello **lab**").await;
+    assert!(mine.own && mine.reply_to.is_none());
+    let mine_id = messages::core_message_id(&mine.id).unwrap();
+
+    // Sent messages can be edited and replied to, once the outbound
+    // service has sent it.
+    sent_mimi_id(&user, mine_id).await;
+    // Editing patches it in place.
+    let edit = composer::Draft {
+        editing: Some(mine_id),
+        ..composer::Draft::empty()
+    };
+    let sent = composer::send(&user, group_id, "hello again".into(), Some(&edit)).await;
+    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+    let edited = next_message(&mut updates, |m| m.edited).await;
+    assert_eq!(
+        (edited.id.clone(), edited.plain_text()),
+        (mine.id.clone(), "hello again".into())
+    );
+
+    // A reply quotes it as edited.
+    let mimi_id = sent_mimi_id(&user, mine_id).await;
+    let quote = Quote {
+        sender: "You".into(),
+        text: "hello again".into(),
+    };
+    let reply = composer::Draft {
+        reply_to: Some((mimi_id, quote.clone())),
+        ..composer::Draft::empty()
+    };
+    let sent = composer::send(&user, group_id, "a reply".into(), Some(&reply)).await;
+    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+    let replied = next_message(&mut updates, |m| m.plain_text() == "a reply").await;
+    assert_eq!(replied.reply_to, Some(quote.clone()));
+
+    // A stored draft comes back, with what it replies to.
+    let draft = composer::Draft {
+        text: "unsent".into(),
+        committed: true,
+        ..reply
+    };
+    user.store_message_draft(group_id, Some(&draft.to_core()))
+        .await
+        .unwrap();
+    let loaded = composer::load_draft(user.clone(), group_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (loaded.text.as_str(), loaded.reply_to.map(|(_, q)| q)),
+        ("unsent", Some(quote))
+    );
     messages_worker.abort();
 
     // Changes the worker never hears about (dropped notifications) are
@@ -207,4 +264,44 @@ async fn next_window(updates: &mut mpsc::Receiver<messages::Update>) -> messages
         Some(messages::Update::Failed(err)) => panic!("the message worker failed: {err}"),
         None => panic!("the message worker stopped"),
     }
+}
+
+/// Waits for a message matching `wanted` to be inserted or patched.
+async fn next_message(
+    updates: &mut mpsc::Receiver<messages::Update>,
+    wanted: impl Fn(&Message) -> bool,
+) -> Message {
+    loop {
+        for change in next_window(updates).await.changes {
+            let found = match change {
+                messages::Change::Insert { items, .. } => items.into_iter().find(|m| wanted(m)),
+                messages::Change::Patch { item, .. } => Some(item).filter(|m| wanted(m)),
+                _ => None,
+            };
+            if let Some(message) = found {
+                return message;
+            }
+        }
+    }
+}
+
+/// The message's id for replies, once the outbound service has sent it
+/// (messages can only be edited and replied to once sent).
+async fn sent_mimi_id(
+    user: &aircoreclient::clients::CoreUser,
+    id: aircoreclient::MessageId,
+) -> aircommon::identifiers::MimiId {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let message = user.message(id).await.unwrap().unwrap();
+            if message.is_sent()
+                && let Some(id) = message.message().mimi_id()
+            {
+                return *id;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the message was never sent")
 }

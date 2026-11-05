@@ -4,6 +4,7 @@
 
 use aircoreclient::clients::CoreUser;
 use aircoreclient::{ChatMessage, EventMessage, Message};
+use gpui::SharedString;
 use mimi_content::content_container::{Disposition, NestedPart};
 use mimi_content::{MessageStatus, MimiContent};
 use pulldown_cmark::{Event, Options, Parser, TagEnd};
@@ -74,6 +75,29 @@ pub fn body_of(content: &MimiContent) -> Body {
             ..
         } => Body::Attachment,
         _ => Body::Unsupported,
+    }
+}
+
+/// The exact text of a markdown message, as editing it starts from (and
+/// compares against): no lossy decoding.
+pub fn plain_body(content: &MimiContent) -> Option<&str> {
+    match &content.nested_part {
+        NestedPart::SinglePart {
+            content_type,
+            content,
+            ..
+        } if content_type == "text/markdown" => std::str::from_utf8(content).ok(),
+        _ => None,
+    }
+}
+
+/// One line of a replied-to message, or what stands in for it.
+pub fn quote_line(content: Option<&MimiContent>) -> SharedString {
+    match content.map(body_of) {
+        Some(Body::Markdown(source)) => preview_line(&plain_text(&source)),
+        Some(Body::Attachment) => "Attachment".into(),
+        Some(Body::Unsupported) => "Unsupported message".into(),
+        None => "Message unavailable".into(),
     }
 }
 

@@ -25,11 +25,11 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::markdown;
-use crate::model::{ChatId, Message, MessageBody, MessageId, MessageStatus, UserId, name_line};
+use crate::model::{ChatId, Message, MessageBody, MessageId, MessageStatus, Quote, UserId};
 use crate::runtime::{Tokio, TokioTask};
 use crate::session::pending::{Changes, Pending};
-use crate::session::preview::{Body, body_of};
-use crate::session::{Session, SessionEvent};
+use crate::session::preview::{Body, body_of, quote_line};
+use crate::session::{Session, SessionEvent, display_name};
 
 /// Messages loaded per page. As upstream.
 const PAGE: usize = 64;
@@ -363,14 +363,14 @@ async fn mark_as_read(user: CoreUser, chat: CoreChatId, until: CoreMessageId) {
     }
 }
 
-fn core_chat_id(id: &ChatId) -> CoreChatId {
+pub(super) fn core_chat_id(id: &ChatId) -> CoreChatId {
     // Model chat ids from the session are core uuids.
     CoreChatId {
         uuid: Uuid::parse_str(&id.0).unwrap_or_default(),
     }
 }
 
-fn core_message_id(id: &MessageId) -> Option<CoreMessageId> {
+pub(super) fn core_message_id(id: &MessageId) -> Option<CoreMessageId> {
     Uuid::parse_str(&id.0).ok().map(CoreMessageId::new)
 }
 
@@ -442,6 +442,8 @@ struct Key {
     at: DateTime<Utc>,
     /// Whose name the message shows, to refresh it when they rename.
     sender: Option<CoreUserId>,
+    /// Whose message it quotes, likewise.
+    quoted: Option<CoreUserId>,
 }
 
 /// The loaded window's bookkeeping: what the view shows, as keys. Each
@@ -770,7 +772,7 @@ impl Worker {
             .window
             .keys
             .iter()
-            .filter(|key| key.sender.as_ref() == Some(user))
+            .filter(|key| key.sender.as_ref() == Some(user) || key.quoted.as_ref() == Some(user))
             .map(|key| key.id)
             .collect();
         let mut edits = Vec::new();
@@ -812,14 +814,10 @@ impl Worker {
     }
 
     async fn name(&mut self, user: &CoreUserId) -> SharedString {
-        if user == self.user.user_id() {
-            return "You".into();
-        }
         if let Some(name) = self.names.get(user) {
             return name.clone();
         }
-        let profile = self.user.user_profile(user).await;
-        let name = name_line(profile.display_name.as_ref());
+        let name = display_name(&self.user, user).await;
         self.names.insert(user.clone(), name.clone());
         name
     }
@@ -872,6 +870,24 @@ impl Worker {
                 }
             }
         };
+        let (quoted, reply_to) = match message.in_reply_to() {
+            Some((_, Some(original))) => (
+                Some(original.sender.clone()),
+                Some(Quote {
+                    sender: self.name(&original.sender).await,
+                    text: quote_line(original.mimi_content.as_ref()),
+                }),
+            ),
+            // The original is gone, or not here (yet).
+            Some((_, None)) => (
+                None,
+                Some(Quote {
+                    sender: SharedString::default(),
+                    text: quote_line(None),
+                }),
+            ),
+            None => (None, None),
+        };
         let edited = match message.message() {
             CoreMessage::Content(content) => content.edited_at().is_some(),
             CoreMessage::Event(_) => false,
@@ -880,6 +896,7 @@ impl Worker {
             id: message.id(),
             at: message.timestamp(),
             sender: sender.clone(),
+            quoted,
         };
         let item = Message {
             id: model_message_id(message.id()),
@@ -890,6 +907,7 @@ impl Worker {
             sent_at: message.timestamp(),
             status,
             edited,
+            reply_to,
         };
         (key, item)
     }
@@ -904,6 +922,7 @@ mod tests {
             id: CoreMessageId::new(Uuid::from_u128(n)),
             at: DateTime::from_timestamp(n as i64, 0).unwrap(),
             sender: None,
+            quoted: None,
         }
     }
 

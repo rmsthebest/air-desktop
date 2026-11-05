@@ -42,6 +42,12 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     re-emits as list splices. Opens at the first unread message. Marking as
     read is debounced, only for messages shown while the window is active,
     and sends receipts as upstream (self chat only when receipts are off).
+  - `composer.rs`: port of `ChatDetailsCubit`'s draft/send parts. The
+    composer's text is the view's; the draft is what was last stored from
+    it (debounced 1 s, committed on leaving the chat) plus the edit or
+    reply. Pure `DraftState` transitions; stores and sends run serialized
+    on tokio, detached so they finish after the chat closes. A send clears
+    only the draft version it sent; a refused edit becomes a new message.
   - `pending.rs`: the merged change set both workers wake on.
 - `src/markdown.rs` — bounded message markdown parse (size/depth caps; only
   http/https/mailto become links; images and HTML stay inert text).
@@ -61,6 +67,10 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   switching modes needs no rebinding. Mode is derived from focus: composer
   focused = INS, otherwise NOR. `:` commands are parsed in
   `src/command_line.rs` (pure); which-key uses `possible_bindings_for_input`.
+- Keys that act only sometimes (up = edit last message in an empty
+  composer, escape = drop a reply/edit) bind in `Composer > Input` and call
+  `cx.propagate()` otherwise: dispatch then tries the next matching binding
+  (the input's own).
 - Normal-mode letter bindings must never live in a context that contains a
   text input (they'd steal typing): use `ChatList`/`MessageList`, or
   `Workspace && helix && !Input`.

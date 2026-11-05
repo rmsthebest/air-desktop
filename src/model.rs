@@ -142,6 +142,16 @@ pub struct Message {
     pub sent_at: DateTime<Utc>,
     pub status: MessageStatus,
     pub edited: bool,
+    /// The message this one replies to.
+    pub reply_to: Option<Quote>,
+}
+
+/// A replied-to message as shown above a reply: who wrote it and one
+/// bounded line of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Quote {
+    pub sender: SharedString,
+    pub text: SharedString,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,6 +196,7 @@ impl Message {
             sent_at,
             status: MessageStatus::Sent,
             edited: false,
+            reply_to: None,
         }
     }
 

@@ -20,6 +20,7 @@ use crate::command_line::{self, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, UserId, mock};
 use crate::session::Session;
 use crate::session::chats::{Chats, LoadState};
+use crate::session::composer::Composer;
 use crate::session::messages::Messages;
 use crate::settings::{Appearance, KeymapMode, SettingsStore};
 use crate::theme;
@@ -74,12 +75,18 @@ impl Workspace {
                         // After a back/forward step this is the jumplist's current
                         // entry, which `push` ignores.
                         this.jumps.push(id.clone());
-                        let messages = match &this.session {
-                            Some(session) => cx.new(|cx| Messages::open(session, id, cx)),
-                            None => cx.new(|_| Messages::fixed(mock::messages(id))),
+                        let (messages, compose) = match &this.session {
+                            Some(session) => (
+                                cx.new(|cx| Messages::open(session, id, cx)),
+                                cx.new(|cx| Composer::open(session, id, cx)),
+                            ),
+                            None => (
+                                cx.new(|_| Messages::fixed(mock::messages(id))),
+                                cx.new(|_| Composer::fixed()),
+                            ),
                         };
                         this.conversation.update(cx, |conversation, cx| {
-                            conversation.show(chat, messages, window, cx)
+                            conversation.show(chat, messages, compose, window, cx)
                         });
                         cx.notify();
                     }
@@ -91,7 +98,7 @@ impl Workspace {
                     }
                     ChatListEvent::Closed => {
                         this.conversation
-                            .update(cx, |conversation, cx| conversation.close(cx));
+                            .update(cx, |conversation, cx| conversation.close(window, cx));
                         cx.notify();
                     }
                 },
@@ -928,6 +935,27 @@ mod tests {
         cx.simulate_input("   ");
         cx.simulate_keystrokes("enter");
         assert_eq!(message_count(&workspace, cx), before + 1);
+    }
+
+    #[gpui::test]
+    fn composer_keys_fall_through_when_nothing_is_drafted(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let focused = focus_probe(&workspace, cx);
+        cx.simulate_keystrokes("j enter");
+        // Up moves within a message being written, rather than editing.
+        cx.simulate_input("ab");
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("c");
+        cx.simulate_keystrokes("up");
+        cx.simulate_input("X");
+        assert_eq!(composer_text(&workspace, cx), "aXb\nc");
+        // Without a reply or edit to drop, escape leaves the composer.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(focused(cx), Focus::ChatList);
+
+        // Each chat has its own composer text.
+        cx.simulate_keystrokes("j");
+        assert_eq!(composer_text(&workspace, cx), "");
     }
 
     #[gpui::test]

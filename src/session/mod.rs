@@ -4,6 +4,7 @@
 
 pub mod account;
 pub mod chats;
+pub mod composer;
 #[cfg(test)]
 mod e2e;
 pub mod messages;
@@ -14,6 +15,7 @@ pub mod queue;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use aircommon::identifiers::UserId as CoreUserId;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::{DbEntityId, DbNotification};
 use chrono::{DateTime, Utc};
@@ -24,6 +26,16 @@ use tokio_stream::StreamExt as _;
 use tracing::error;
 
 pub use queue::ConnectionStatus;
+
+/// How the views name a user: "You" for the local user, else their display
+/// name as one bounded line (it is peer-chosen).
+pub(crate) async fn display_name(user: &CoreUser, id: &CoreUserId) -> SharedString {
+    if id == user.user_id() {
+        return "You".into();
+    }
+    let profile = user.user_profile(id).await;
+    crate::model::name_line(profile.display_name.as_ref())
+}
 
 use crate::runtime::{Tokio, TokioTask};
 use queue::QueueEvent;

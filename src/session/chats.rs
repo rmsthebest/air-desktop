@@ -365,7 +365,8 @@ fn request(chat_type: &ChatType, status: &ChatStatus) -> Option<Request> {
         ChatType::HandleConnection(_) | ChatType::TargetedMessageConnection(_) => Request::Outgoing,
     };
     Some(match status {
-        ChatStatus::Inactive(_) => Request::Closed,
+        // A blocked peer's request can't be acted on either.
+        ChatStatus::Inactive(_) | ChatStatus::Blocked => Request::Closed,
         _ => open,
     })
 }
@@ -495,6 +496,10 @@ mod tests {
         // Neither side can act on an ended request: no Accept, no waiting.
         assert_eq!(request(&incoming, &ended), Some(Request::Closed));
         assert_eq!(request(&outgoing, &ended), Some(Request::Closed));
+        assert_eq!(
+            request(&incoming, &ChatStatus::Blocked),
+            Some(Request::Closed)
+        );
         assert_eq!(request(&ChatType::Connection(user), &ended), None);
     }
 

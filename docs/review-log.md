@@ -328,3 +328,13 @@ Deferred:
 - **Still open from gate 7:** in-flight paging flags, flush on drop,
   initial-load backoff, `Session` batching, the paged-append view test.
   The two-user e2e now covers read receipts and a sender rename re-patch.
+
+## Gate 8b — gate 8 fixes (`d5a4c21..97b5fd0`): PASS
+
+Fixed anyway (all low):
+- A request from a blocked peer is `Closed`, so it offers no Accept
+  (assert added to `an_ended_contact_request_is_closed_not_open`).
+- The chat list tags an ended request "Ended", not "Request".
+- CLAUDE.md names detached tokio tasks for core operations with cleanup as
+  the exception to `Tokio::spawn`. The comment says such a task survives the
+  view, not an app quit.

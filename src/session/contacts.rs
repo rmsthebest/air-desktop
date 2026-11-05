@@ -181,7 +181,8 @@ where
     F: Future<Output = Result<T, Failure>> + Send + 'static,
 {
     // Not aborted with the caller: stopping an operation midway (say, the
-    // window closing) could skip the core's cleanup of a failed request.
+    // workspace going away) could skip the core's cleanup of a failed
+    // request. Quitting the app still stops it.
     let task = Tokio::handle(cx).spawn(future);
     async move {
         match task.await.map_err(anyhow::Error::from) {

@@ -15,7 +15,9 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   checked-in metadata).
 - Async: Air's core needs tokio. Run it via `runtime::Tokio::spawn`, which
   returns a `TokioTask` (aborts on drop). Never poll tokio futures directly on
-  GPUI executors.
+  GPUI executors. Exception: core operations whose failure path cleans up
+  (contact requests) run detached (`Tokio::handle(cx).spawn`), so closing
+  a view can't stop them midway.
 
 ## Layout
 - `src/model.rs` — plain view-model types the UI renders (+ `mock` data until

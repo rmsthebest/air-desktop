@@ -9,7 +9,9 @@ use gpui_kit::{
 };
 
 use crate::actions::{SelectNext, SelectPrev};
-use crate::model::{ChatId, ChatSummary, PreviewKind, format_activity, next_unread, step_index};
+use crate::model::{
+    ChatId, ChatSummary, PreviewKind, Request, format_activity, next_unread, step_index,
+};
 use crate::session::chats::LoadState;
 use crate::ui::key_context;
 use crate::ui::widgets::{avatar, badge};
@@ -216,8 +218,12 @@ impl ChatList {
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(chat.title.clone()),
                             )
-                            .when(chat.request.is_some(), |line| {
-                                line.child(tag("Request", cx))
+                            .when_some(chat.request, |line, request| {
+                                let label = match request {
+                                    Request::Closed => "Ended",
+                                    Request::Incoming | Request::Outgoing => "Request",
+                                };
+                                line.child(tag(label, cx))
                             })
                             .when(chat.is_self_chat, |line| line.child(tag("Self", cx)))
                             .child(

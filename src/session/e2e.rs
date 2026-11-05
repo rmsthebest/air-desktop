@@ -15,11 +15,15 @@ use tokio::sync::mpsc;
 
 use super::account::{self, SignUp, SignUpError};
 use super::chats::{self, Update};
+use super::contacts::{self, Failure};
 use super::pending::Pending;
 use super::queue::{self, ConnectionStatus, QueueEvent};
 use super::{composer, messages};
-use crate::model::{Message, Quote};
+use crate::model::{Message, MessageStatus, Quote};
+use aircoreclient::ChatType;
+use aircoreclient::clients::CoreUser;
 use aircoreclient::clients::store::{ClientRecord, ClientRecordState};
+use gpui::SharedString;
 
 fn sign_up(code: Option<&str>) -> SignUp {
     SignUp {
@@ -347,4 +351,192 @@ async fn sent_mimi_id(
     })
     .await
     .expect("the message was never sent")
+}
+
+/// Two accounts on the local server connect through a username and talk.
+/// Needs two unused invitation codes:
+/// `AIR_E2E_CODES=XXXXXXXX,YYYYYYYY cargo test e2e_two -- --ignored`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Air server and AIR_E2E_CODES"]
+async fn e2e_two_users_connect_by_username_and_talk() {
+    let codes = std::env::var("AIR_E2E_CODES").expect("set AIR_E2E_CODES to two codes");
+    let [ada_code, bob_code] = codes.split(',').collect::<Vec<_>>()[..] else {
+        panic!("AIR_E2E_CODES takes two comma-separated codes");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ada = new_account(dir.path(), "Ada Lovelace", ada_code).await;
+    let bob = new_account(dir.path(), "Bob", bob_code).await;
+    let _queues = [listen_queue(&ada).await, listen_queue(&bob).await];
+
+    // Ada's username listener reports her usernames as they change.
+    let (names_tx, mut names) = mpsc::unbounded_channel();
+    let _ada_usernames = Aborting(tokio::spawn(contacts::run(ada.clone(), move |usernames| {
+        let _ = names_tx.send(usernames);
+    })));
+    assert!(next(&mut names).await.is_empty());
+    let name = format!("ada-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    // A new account's privacy pass tokens arrive in the background; until
+    // then the server is asked again, as the user would.
+    let typed = format!(" @{} ", name.to_uppercase());
+    let added = eventually("Ada gets her username", async || {
+        contacts::add_username(ada.clone(), typed.clone())
+            .await
+            .ok()
+    })
+    .await;
+    assert_eq!(added, name, "stored as typed, normalized");
+    while next(&mut names).await != [SharedString::from(name.clone())] {}
+
+    // Refusals are explained, not internal errors.
+    fn refused<T>(result: Result<T, Failure>) -> bool {
+        matches!(result, Err(Failure::Shown(_)))
+    }
+    assert!(refused(
+        contacts::add_username(ada.clone(), name.clone()).await
+    ));
+    assert!(refused(
+        contacts::add_contact(ada.clone(), name.clone()).await
+    ));
+    assert!(refused(
+        contacts::add_contact(bob.clone(), "nobody-e2e-0".into()).await
+    ));
+
+    // Bob asks; asking twice is refused.
+    let bob_chat = eventually("Bob sends a request", async || {
+        contacts::add_contact(bob.clone(), name.clone()).await.ok()
+    })
+    .await;
+    assert!(refused(
+        contacts::add_contact(bob.clone(), name.clone()).await
+    ));
+    let bob_chat = messages::core_chat_id(&bob_chat);
+
+    // Ada's listener stores the request as a pending chat, which she
+    // accepts; Bob's chat then becomes a connection.
+    let request = eventually("Ada gets the request", async || {
+        for id in ada.ordered_chat_ids().await.unwrap() {
+            if let Some(chat) = ada.chat(&id).await
+                && matches!(chat.chat_type, ChatType::PendingConnection(_))
+            {
+                return Some(id);
+            }
+        }
+        None
+    })
+    .await;
+    let ada_chat = contacts::accept_request(ada.clone(), request)
+        .await
+        .unwrap();
+    let ada_chat = messages::core_chat_id(&ada_chat);
+    eventually("Bob's request is accepted", async || {
+        let chat = bob.chat(&bob_chat).await?;
+        matches!(chat.chat_type, ChatType::Connection(_)).then_some(())
+    })
+    .await;
+
+    // Messages go both ways, named by their sender.
+    let (_ada_worker, mut ada_updates) = open_messages(&ada, ada_chat);
+    let (_bob_worker, mut bob_updates) = open_messages(&bob, bob_chat);
+    let sent = composer::send(&bob, bob_chat, "hi ada".into(), None).await;
+    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+    let got = next_message(&mut ada_updates, |m| m.plain_text() == "hi ada").await;
+    assert_eq!((got.own, got.sender_name.as_ref()), (false, "Bob"));
+
+    // Ada reading it shows as read on Bob's side.
+    let read_id = messages::core_message_id(&got.id).unwrap();
+    messages::mark_as_read(ada.clone(), ada_chat, read_id).await;
+    next_message(&mut bob_updates, |m| {
+        m.own && m.plain_text() == "hi ada" && m.status == MessageStatus::Read
+    })
+    .await;
+
+    let sent = composer::send(&ada, ada_chat, "hi bob".into(), None).await;
+    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+    let got = next_message(&mut bob_updates, |m| m.plain_text() == "hi bob").await;
+    assert_eq!(got.sender_name, "Ada Lovelace");
+
+    // Bob's rename reaches the messages Ada already has from him.
+    let mut profile = bob.own_user_profile().await.unwrap();
+    profile.display_name = "Robert".parse().unwrap();
+    bob.set_own_user_profile(profile).await.unwrap();
+    next_message(&mut ada_updates, |m| {
+        m.plain_text() == "hi ada" && m.sender_name == "Robert"
+    })
+    .await;
+
+    // A removed username is no longer listened to or reported.
+    contacts::remove_username(ada.clone(), name.clone())
+        .await
+        .unwrap();
+    while !next(&mut names).await.is_empty() {}
+}
+
+async fn new_account(dir: &std::path::Path, name: &str, code: &str) -> CoreUser {
+    let data = dir.join(name);
+    crate::paths::ensure_private_dir(&data).unwrap();
+    let sign_up = SignUp {
+        display_name: name.into(),
+        ..sign_up(Some(code))
+    };
+    account::sign_up(data.to_str().unwrap().into(), sign_up)
+        .await
+        .unwrap()
+}
+
+/// Runs the queue listener until dropped, once it is connected.
+async fn listen_queue(user: &CoreUser) -> Aborting {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let listener = Aborting(tokio::spawn(queue::run(user.clone(), move |event| {
+        let _ = tx.send(event);
+    })));
+    while next(&mut rx).await != QueueEvent::Status(ConnectionStatus::Connected) {}
+    listener
+}
+
+/// A message window on `chat` that follows the user's changes.
+fn open_messages(
+    user: &CoreUser,
+    chat: aircoreclient::ChatId,
+) -> ([Aborting; 2], mpsc::Receiver<messages::Update>) {
+    let pending = Arc::new(Pending::default());
+    let mut notifications = user.db_notifications();
+    let forward = tokio::spawn({
+        let pending = pending.clone();
+        async move {
+            use tokio_stream::StreamExt as _;
+            while let Some(notification) = notifications.next().await {
+                pending.add(&[notification], false);
+            }
+        }
+    });
+    let (worker, updates) = messages::start(user.clone(), chat, pending);
+    ([Aborting(forward), Aborting(worker)], updates)
+}
+
+struct Aborting(tokio::task::JoinHandle<()>);
+
+impl Drop for Aborting {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn next<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
+    let next = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await;
+    next.expect("nothing within 20s")
+        .expect("the sender stopped")
+}
+
+/// Polls `check` until it yields a value.
+async fn eventually<T>(what: &str, check: impl AsyncFn() -> Option<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if let Some(value) = check().await {
+                return value;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out: {what}"))
 }

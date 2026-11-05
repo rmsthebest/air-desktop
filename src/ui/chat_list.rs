@@ -28,6 +28,8 @@ pub struct ChatList {
     /// The open chat. Selecting a chat opens it; there is no separate
     /// highlight, so keyboard and mouse always agree on what is shown.
     selected: Option<ChatId>,
+    /// A chat to open as soon as it is listed (one just created).
+    awaited: Option<ChatId>,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
 }
@@ -46,6 +48,7 @@ impl ChatList {
             chats,
             state,
             selected: None,
+            awaited: None,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
         }
@@ -66,7 +69,20 @@ impl ChatList {
         }
         self.chats = chats;
         self.state = state;
+        if let Some(id) = self.awaited.take() {
+            self.open_when_listed(id, cx);
+        }
         cx.notify();
+    }
+
+    /// Opens `id` now if it is listed, else when it first is. Only the
+    /// latest such chat is awaited; opening another chat cancels it.
+    pub fn open_when_listed(&mut self, id: ChatId, cx: &mut Context<Self>) {
+        if self.chat(&id).is_some() {
+            self.open(id, cx);
+        } else {
+            self.awaited = Some(id);
+        }
     }
 
     pub fn chats(&self) -> &[ChatSummary] {
@@ -85,6 +101,7 @@ impl ChatList {
     /// Opens `id`. Emits [`ChatListEvent::Opened`] only when the open chat
     /// actually changes.
     pub fn open(&mut self, id: ChatId, cx: &mut Context<Self>) {
+        self.awaited = None;
         if self.selected.as_ref() == Some(&id) {
             return;
         }
@@ -199,7 +216,9 @@ impl ChatList {
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(chat.title.clone()),
                             )
-                            .when(chat.pending, |line| line.child(tag("Request", cx)))
+                            .when(chat.request.is_some(), |line| {
+                                line.child(tag("Request", cx))
+                            })
                             .when(chat.is_self_chat, |line| line.child(tag("Self", cx)))
                             .child(
                                 div()

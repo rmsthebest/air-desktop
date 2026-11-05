@@ -5,6 +5,7 @@
 pub mod account;
 pub mod chats;
 pub mod composer;
+mod contacts;
 #[cfg(test)]
 mod e2e;
 pub mod messages;
@@ -68,10 +69,12 @@ pub struct Session {
     /// older result can't overwrite a newer one.
     profile_task: Option<Task<()>>,
     drafts: composer::DraftQueue,
+    usernames: Vec<SharedString>,
     _queue: TokioTask<()>,
+    _usernames: TokioTask<()>,
     _drafts: TokioTask<()>,
     _forward: TokioTask<()>,
-    _receive: [Task<()>; 2],
+    _receive: [Task<()>; 3],
 }
 
 impl EventEmitter<SessionEvent> for Session {}
@@ -113,16 +116,42 @@ impl Session {
                 }
             });
 
+            let (usernames_tx, mut usernames_rx) = watch::channel(Vec::new());
+            let usernames = Tokio::spawn(
+                cx,
+                contacts::run(user.clone(), move |usernames| {
+                    usernames_tx.send_if_modified(|old| {
+                        let changed = *old != usernames;
+                        *old = usernames;
+                        changed
+                    });
+                }),
+            );
+
             let receive = [
                 cx.spawn(async move |this, cx| {
                     receive_changes(this, changes_rx, overflowed, cx).await
                 }),
                 cx.spawn(async move |this, cx| receive_queue_state(this, state_rx, cx).await),
+                cx.spawn(async move |this, cx| {
+                    while usernames_rx.changed().await.is_ok() {
+                        let usernames = usernames_rx.borrow_and_update().clone();
+                        let updated = this.update(cx, |this, cx| {
+                            this.usernames = usernames;
+                            cx.notify();
+                        });
+                        if updated.is_err() {
+                            return;
+                        }
+                    }
+                }),
             ];
             let (drafts, drafts_task) = composer::DraftQueue::start(user.clone(), cx);
             let mut session = Self {
                 drafts,
                 _drafts: drafts_task,
+                usernames: Vec::new(),
+                _usernames: usernames,
                 display_name: SharedString::default(),
                 queue_state: initial,
                 profile_task: None,

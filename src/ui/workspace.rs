@@ -7,17 +7,17 @@ use gpui_kit::component::{ActiveTheme as _, h_flex, h_resizable, resizable_panel
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, FontWeight, IntoElement, Render,
-    Window, div, px,
+    Task, Window, div, px,
 };
 
 use crate::actions::{
-    self, FindChat, FocusChatList, FocusComposer, FocusConversation, FocusMessages, FocusNextPane,
-    JumpBack, JumpForward, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette,
-    PickTheme, PrevChat, PrevUnreadChat, SelectFirst, SelectLast, ShowShortcuts, ToggleAppearance,
-    ToggleDetails, ToggleHelixMode,
+    self, AcceptRequest, AddContact, DeclineRequest, FindChat, FocusChatList, FocusComposer,
+    FocusConversation, FocusMessages, FocusNextPane, JumpBack, JumpForward, NextChat,
+    NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette, PickTheme, PrevChat, PrevUnreadChat,
+    SelectFirst, SelectLast, ShowShortcuts, ToggleAppearance, ToggleDetails, ToggleHelixMode,
 };
 use crate::command_line::{self, Command, NameMatch, matches_name};
-use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, UserId, mock};
+use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, Request, UserId, mock};
 use crate::session::Session;
 use crate::session::chats::{Chats, LoadState};
 use crate::session::composer::Composer;
@@ -30,7 +30,7 @@ use crate::ui::conversation::{Conversation, ConversationEvent};
 use crate::ui::details_pane::details_pane;
 use crate::ui::nav_rail::{Account, nav_rail};
 use crate::ui::palette::{self, Scope};
-use crate::ui::{key_context, show_error, update_settings};
+use crate::ui::{key_context, show_error, show_info, show_refusal, update_settings};
 
 const CHAT_LIST_MIN: f32 = 240.;
 const CHAT_LIST_MAX: f32 = 480.;
@@ -45,6 +45,9 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     jumps: JumpList,
     command_line: Option<(Entity<CommandLine>, Subscription)>,
+    /// A contact operation in flight; another waits for it to finish, so a
+    /// repeated key press doesn't send a request twice.
+    contact_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -137,6 +140,7 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             jumps: JumpList::default(),
             command_line: None,
+            contact_task: None,
             _subscriptions: subscriptions,
         }
     }
@@ -208,7 +212,14 @@ impl Workspace {
     }
 
     fn focus_composer(&mut self, _: &FocusComposer, window: &mut Window, cx: &mut Context<Self>) {
-        if self.has_open_chat(cx) {
+        let list = self.chat_list.read(cx);
+        let Some(ix) = list.selected_index() else {
+            return;
+        };
+        // A contact request's chat has no composer until it is accepted.
+        if list.chats()[ix].request.is_some() {
+            self.conversation.focus_handle(cx).focus(window, cx);
+        } else {
             self.conversation
                 .read(cx)
                 .composer_focus(cx)
@@ -302,6 +313,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.prompt("", window, cx);
+    }
+
+    /// Asks for a username to send a contact request to, on the command
+    /// line, prefilled with the command.
+    fn add_contact(&mut self, _: &AddContact, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt("contact ", window, cx);
+    }
+
+    /// Opens the command line with `initial` typed.
+    fn prompt(&mut self, initial: &str, window: &mut Window, cx: &mut Context<Self>) {
         let themes = theme::available(cx);
         let chats = self
             .chats(cx)
@@ -309,7 +331,7 @@ impl Workspace {
             .map(|c| c.title.to_string())
             .collect();
         let previous_focus = window.focused(cx);
-        let view = cx.new(|cx| CommandLine::new(themes, chats, window, cx));
+        let view = cx.new(|cx| CommandLine::new(themes, chats, initial, window, cx));
         let subscription = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
             this.command_line = None;
             if let Some(focus) = &previous_focus {
@@ -369,7 +391,109 @@ impl Workspace {
             Command::ToggleDetails => self.toggle_details(&ToggleDetails, window, cx),
             Command::Keymap(mode) => self.set_keymap_mode(mode, window, cx),
             Command::Shortcuts => palette::show_shortcuts(window, cx),
+            Command::AddContact(username) => self.send_contact_request(username, window, cx),
+            Command::Accept => self.accept_request(&AcceptRequest, window, cx),
+            Command::Decline => self.decline_request(&DeclineRequest, window, cx),
+            Command::AddUsername(username) => self.contact_op(
+                window,
+                cx,
+                |session, cx| session.add_username(&username, cx),
+                |username, _, window, cx| {
+                    show_info(format!("Others can now add you as {username}"), window, cx)
+                },
+            ),
+            Command::RemoveUsername(username) => self.contact_op(
+                window,
+                cx,
+                |session, cx| session.remove_username(&username, cx),
+                |(), _, _, _| {},
+            ),
         }
+    }
+
+    fn send_contact_request(
+        &mut self,
+        username: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.contact_op(
+            window,
+            cx,
+            |session, cx| session.add_contact(&username, cx),
+            |chat, this, window, cx| this.open_when_listed(chat, window, cx),
+        );
+    }
+
+    /// The open chat, if it shows an incoming contact request.
+    fn open_request(&self, cx: &App) -> Option<ChatId> {
+        let list = self.chat_list.read(cx);
+        let chat = &list.chats()[list.selected_index()?];
+        (chat.request == Some(Request::Incoming)).then(|| chat.id.clone())
+    }
+
+    fn accept_request(&mut self, _: &AcceptRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.open_request(cx) else {
+            cx.propagate();
+            return;
+        };
+        self.contact_op(
+            window,
+            cx,
+            |session, cx| session.accept_request(&chat, cx),
+            // The contact's chat can be another than the request's.
+            |chat, this, window, cx| this.open_when_listed(chat, window, cx),
+        );
+    }
+
+    fn decline_request(&mut self, _: &DeclineRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.open_request(cx) else {
+            cx.propagate();
+            return;
+        };
+        self.contact_op(
+            window,
+            cx,
+            |session, cx| session.decline_request(&chat, cx),
+            |(), _, _, _| {},
+        );
+    }
+
+    /// Runs one contact operation at a time, telling the user why it failed.
+    fn contact_op<T: 'static, F>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        start: impl FnOnce(&Session, &App) -> F,
+        done: impl FnOnce(T, &mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) where
+        F: Future<Output = Result<T, String>> + 'static,
+    {
+        let Some(session) = &self.session else {
+            show_refusal("Contacts need an account".into(), window, cx);
+            return;
+        };
+        if self.contact_task.is_some() {
+            return;
+        }
+        let operation = start(session.read(cx), cx);
+        self.contact_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = operation.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                this.contact_task = None;
+                match result {
+                    Ok(value) => done(value, this, window, cx),
+                    Err(message) => show_refusal(message, window, cx),
+                }
+            });
+        }));
+    }
+
+    /// Opens `chat` now, or once the chat list has loaded it.
+    fn open_when_listed(&mut self, chat: ChatId, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat_list
+            .update(cx, |list, cx| list.open_when_listed(chat, cx));
+        self.focus_conversation(&FocusConversation, window, cx);
     }
 
     fn render_status_line(&self, window: &Window, cx: &App) -> AnyElement {
@@ -518,6 +642,7 @@ impl Render for Workspace {
                 name: session.display_name().clone(),
                 status: session.status(),
                 version_expires: session.version_expires(),
+                usernames: session.usernames().to_vec(),
             }
         });
         let theme = cx.theme();
@@ -562,6 +687,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_appearance))
             .on_action(cx.listener(Self::toggle_helix_mode))
             .on_action(cx.listener(Self::open_command_line))
+            .on_action(cx.listener(Self::add_contact))
+            .on_action(cx.listener(Self::accept_request))
+            .on_action(cx.listener(Self::decline_request))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 this.open_palette_scoped(Scope::All, window, cx)
             }))
@@ -956,6 +1084,74 @@ mod tests {
         // Each chat has its own composer text.
         cx.simulate_keystrokes("j");
         assert_eq!(composer_text(&workspace, cx), "");
+    }
+
+    #[gpui::test]
+    fn a_contact_request_takes_no_typing_until_accepted(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let focused = focus_probe(&workspace, cx);
+        let chat_list = workspace.read_with(cx, |workspace, _| workspace.chat_list.clone());
+        chat_list.update(cx, |list, cx| {
+            let mut chats = list.chats().to_vec();
+            chats[0].request = Some(Request::Incoming);
+            list.set_chats(chats, LoadState::Loaded, cx);
+        });
+        cx.simulate_keystrokes("j enter");
+        // Nothing can be sent to a stranger: the conversation keeps focus
+        // and typing goes nowhere.
+        assert_eq!(focused(cx), Focus::Messages);
+        cx.simulate_input("hi");
+        assert_eq!(composer_text(&workspace, cx), "");
+
+        // Once accepted, the composer is back.
+        chat_list.update(cx, |list, cx| {
+            let mut chats = list.chats().to_vec();
+            chats[0].request = None;
+            list.set_chats(chats, LoadState::Loaded, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape enter");
+        cx.simulate_input("hi");
+        assert_eq!(composer_text(&workspace, cx), "hi");
+    }
+
+    #[gpui::test]
+    fn a_new_contact_chat_opens_once_it_is_listed(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let chat_list = workspace.read_with(cx, |workspace, _| workspace.chat_list.clone());
+        let mut chats = chat_list.read_with(cx, |list, _| list.chats().to_vec());
+        let mut new = chats[0].clone();
+        new.id = ChatId("new".into());
+        new.title = "New contact".into();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_when_listed(new.id.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        assert_ne!(open_title(&workspace, cx).as_deref(), Some("New contact"));
+
+        // The list loads it later, with other changes in between.
+        chat_list.update(cx, |list, cx| {
+            list.set_chats(chats.clone(), LoadState::Loaded, cx)
+        });
+        chats.insert(0, new.clone());
+        chat_list.update(cx, |list, cx| {
+            list.set_chats(chats.clone(), LoadState::Loaded, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(open_title(&workspace, cx).as_deref(), Some("New contact"));
+
+        // Moving on before it is listed means it no longer takes over.
+        let mut later = new;
+        later.id = ChatId("later".into());
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_when_listed(later.id.clone(), window, cx)
+        });
+        cx.simulate_keystrokes("alt-down");
+        let moved_to = open_title(&workspace, cx);
+        chats.push(later);
+        chat_list.update(cx, |list, cx| list.set_chats(chats, LoadState::Loaded, cx));
+        cx.run_until_parked();
+        assert_eq!(open_title(&workspace, cx), moved_to);
     }
 
     #[gpui::test]

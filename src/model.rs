@@ -28,8 +28,8 @@ pub struct ChatSummary {
     pub id: ChatId,
     pub title: SharedString,
     pub is_group: bool,
-    /// A contact request that neither side has accepted yet.
-    pub pending: bool,
+    /// A contact request not accepted yet, or `None` for an established chat.
+    pub request: Option<Request>,
     /// The chat with the user's own devices. Marked in the UI, so a peer
     /// can't pass off a chat titled "Notes to self" as it.
     pub is_self_chat: bool,
@@ -37,6 +37,14 @@ pub struct ChatSummary {
     /// `None` for a chat without messages.
     pub last_activity: Option<DateTime<Utc>>,
     pub unread: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// Someone asked to connect; the user can accept or decline.
+    Incoming,
+    /// The user asked; waiting for the other side.
+    Outgoing,
 }
 
 /// The line under a chat's title: its draft or its last message.
@@ -423,7 +431,7 @@ pub mod mock {
                 id: ChatId(id.into()),
                 title: title.into(),
                 is_group: group,
-                pending: false,
+                request: None,
                 is_self_chat: false,
                 preview: Some(Preview {
                     prefix: None,
@@ -576,7 +584,7 @@ mod tests {
                 id: ChatId(ix.to_string().into()),
                 title: "chat".into(),
                 is_group: false,
-                pending: false,
+                request: None,
                 is_self_chat: false,
                 preview: None,
                 last_activity: None,

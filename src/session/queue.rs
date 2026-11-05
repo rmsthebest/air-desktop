@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 
 /// A stream that stayed up this long was healthy: reconnect at once and
 /// reset the backoff. Same as upstream.
-const HEALTHY_UPTIME: Duration = Duration::from_secs(60);
+pub(super) const HEALTHY_UPTIME: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {

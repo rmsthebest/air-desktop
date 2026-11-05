@@ -48,6 +48,14 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     reply. Pure `DraftState` transitions; stores and sends run serialized
     on tokio, detached so they finish after the chat closes. A send clears
     only the draft version it sent; a refused edit becomes a new message.
+  - `contacts.rs`: port of upstream `UsernameContext` (one listener per
+    own username, reconciled on `DbEntityId::Username` changes; failed
+    requests acked unless `keep_failed_username_message`) plus add
+    contact / accept / decline / add & remove username. Refusals are
+    `Failure::Shown` (told to the user, not logged: they name contacts);
+    internal errors are logged and reported generically. A new account's
+    privacy-pass tokens arrive in the background, so the first username
+    or contact request can fail and succeed on retry.
   - `pending.rs`: the merged change set both workers wake on.
 - `src/markdown.rs` — bounded message markdown parse (size/depth caps; only
   http/https/mailto become links; images and HTML stay inert text).
@@ -71,6 +79,11 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   composer, escape = drop a reply/edit) bind in `Composer > Input` and call
   `cx.propagate()` otherwise: dispatch then tries the next matching binding
   (the input's own).
+- A chat with an open contact request has no composer (`render_request`
+  takes its place); focusing the composer there focuses the messages.
+- Contacts are added from the command line (`:contact <username>`, which
+  `AddContact` prefills); a new chat opens once the list has it
+  (`ChatList::open_when_listed`).
 - Normal-mode letter bindings must never live in a context that contains a
   text input (they'd steal typing): use `ChatList`/`MessageList`, or
   `Workspace && helix && !Input`.
@@ -103,8 +116,9 @@ From an Air checkout:
 2. `SKIP_DOCKER_COMPOSE=true just run-server` → `http://localhost:8080`.
 3. `cargo run --bin airserver -- code generate 2` for invitation codes
    (the local server requires them).
-Clients use domain `localhost`. E2E: `AIR_E2E_CODE=<code> cargo test e2e --
---ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
+Clients use domain `localhost`. E2E: `AIR_E2E_CODE=<code> cargo test e2e_sign_up --
+--ignored`, and the two-user test with `AIR_E2E_CODES=<code>,<code> cargo test
+e2e_two -- --ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
 `AIR_DESKTOP_DATA_DIR=<dir> cargo run`. E2E tests use `flavor = "multi_thread"`: the
 core calls `block_in_place`.
 

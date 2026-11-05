@@ -3,6 +3,7 @@
     "context": "Workspace && helix && !Input",
     "bindings": {
       "space f": "air::FindChat",
+      "space n": "air::AddContact",
       "space ?": "air::OpenPalette",
       "space t": "air::PickTheme",
       "space d": "air::ToggleDetails",

@@ -28,13 +28,14 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    CancelCompose, ClearCursor, CursorDown, CursorFirst, CursorLast, CursorUp, EditLastMessage,
-    EditMessage, HalfPageDown, HalfPageUp, OpenLinks, ReplyToMessage, ToggleDetails, YankMessage,
+    AcceptRequest, CancelCompose, ClearCursor, CursorDown, CursorFirst, CursorLast, CursorUp,
+    DeclineRequest, EditLastMessage, EditMessage, HalfPageDown, HalfPageUp, OpenLinks,
+    ReplyToMessage, ToggleDetails, YankMessage,
 };
 use crate::markdown::Block;
 use crate::model::{
-    ChatSummary, Message, MessageBody, MessageStatus, Quote, format_day, format_message_time,
-    move_cursor, starts_day, starts_group,
+    ChatSummary, Message, MessageBody, MessageStatus, Quote, Request, format_day,
+    format_message_time, move_cursor, starts_day, starts_group,
 };
 use crate::session::composer::{Composer, ComposerEvent};
 use crate::session::messages::{Messages, MessagesEvent};
@@ -930,33 +931,101 @@ impl Render for Conversation {
                     .child(history)
                     .child(self.probe_results(cx)),
             )
+            .child(match chat.request {
+                None => self
+                    .render_composer(composer_context, composer_focused, compose_bar, cx)
+                    .into_any_element(),
+                Some(request) => render_request(request, &chat.title, cx),
+            })
+    }
+}
+
+impl Conversation {
+    fn render_composer(
+        &self,
+        composer_context: KeyContext,
+        composer_focused: bool,
+        compose_bar: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .key_context(composer_context)
+            .on_action(cx.listener(Self::edit_last))
+            .on_action(cx.listener(Self::cancel_compose))
+            .flex_none()
+            .px_6()
+            .pb_4()
             .child(
-                div()
-                    .key_context(composer_context)
-                    .on_action(cx.listener(Self::edit_last))
-                    .on_action(cx.listener(Self::cancel_compose))
-                    .flex_none()
-                    .px_6()
-                    .pb_4()
-                    .child(
-                        v_flex()
-                            .mx_auto()
-                            .w_full()
-                            .max_w(px(MAX_CONTENT_WIDTH))
-                            .rounded(theme.radius_lg)
-                            .bg(theme.popover)
-                            .border_1()
-                            .border_color(if composer_focused {
-                                theme.ring
-                            } else {
-                                theme.border
-                            })
-                            .shadow_sm()
-                            .children(compose_bar)
-                            .child(Textarea::new(&self.composer).appearance(false)),
-                    ),
+                v_flex()
+                    .mx_auto()
+                    .w_full()
+                    .max_w(px(MAX_CONTENT_WIDTH))
+                    .rounded(theme.radius_lg)
+                    .bg(theme.popover)
+                    .border_1()
+                    .border_color(if composer_focused {
+                        theme.ring
+                    } else {
+                        theme.border
+                    })
+                    .shadow_sm()
+                    .children(compose_bar)
+                    .child(Textarea::new(&self.composer).appearance(false)),
             )
     }
+}
+
+/// Takes the composer's place in a chat whose contact request is open:
+/// nothing can be sent before both sides are connected.
+fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let card = h_flex()
+        .mx_auto()
+        .w_full()
+        .max_w(px(MAX_CONTENT_WIDTH))
+        .p_3()
+        .gap_3()
+        .rounded(theme.radius_lg)
+        .bg(theme.popover)
+        .border_1()
+        .border_color(theme.border)
+        .shadow_sm();
+    let text = |text: String| div().flex_1().min_w_0().text_sm().child(text);
+    let card = match request {
+        Request::Incoming => card
+            .child(text(format!("{title} wants to connect with you.")))
+            .child(
+                Button::new("decline-request")
+                    .label("Decline")
+                    .ghost()
+                    .tooltip_with_action(
+                        "Decline: nothing is sent to them",
+                        &DeclineRequest,
+                        Some("Workspace"),
+                    )
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(DeclineRequest), cx)),
+            )
+            .child(
+                Button::new("accept-request")
+                    .label("Accept")
+                    .primary()
+                    .tooltip_with_action("Accept", &AcceptRequest, Some("Workspace"))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(AcceptRequest), cx)),
+            ),
+        Request::Outgoing => card.child(
+            text(format!(
+                "Waiting for {title} to accept your contact request."
+            ))
+            .text_color(theme.muted_foreground),
+        ),
+    };
+    div()
+        .flex_none()
+        .px_6()
+        .pb_4()
+        .child(card)
+        .into_any_element()
 }
 
 #[cfg(test)]

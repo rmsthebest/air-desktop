@@ -41,3 +41,14 @@ pub fn show_error(message: String, window: &mut Window, cx: &mut App) {
     tracing::warn!("{message}");
     window.push_notification(Notification::error(message), cx);
 }
+
+/// Tells the user why something they asked for didn't happen, without
+/// logging it: the message may name a contact, and the session logged any
+/// internal cause where it happened.
+pub fn show_refusal(message: String, window: &mut Window, cx: &mut App) {
+    window.push_notification(Notification::error(message), cx);
+}
+
+pub fn show_info(message: String, window: &mut Window, cx: &mut App) {
+    window.push_notification(Notification::info(message), cx);
+}

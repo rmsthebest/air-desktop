@@ -32,10 +32,15 @@ impl CommandLine {
     pub fn new(
         themes: Vec<String>,
         chats: Vec<String>,
+        initial: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx));
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(initial.to_string(), window, cx);
+            input
+        });
         let subscriptions =
             vec![
                 cx.subscribe_in(
@@ -57,7 +62,7 @@ impl CommandLine {
                 ),
             ];
         input.read(cx).focus_handle(cx).focus(window, cx);
-        let completions = complete("", &themes, &chats);
+        let completions = complete(initial, &themes, &chats);
         Self {
             input,
             themes,

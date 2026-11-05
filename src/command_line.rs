@@ -14,6 +14,14 @@ pub enum Command {
     ToggleDetails,
     Keymap(KeymapMode),
     Shortcuts,
+    /// Send a contact request to a username, as typed.
+    AddContact(String),
+    /// Register a username, as typed.
+    AddUsername(String),
+    RemoveUsername(String),
+    /// Accept or decline the open chat's contact request.
+    Accept,
+    Decline,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -23,6 +31,8 @@ enum Arg {
     Chat,
     Appearance,
     Keymap,
+    /// Free text, not completed (e.g. a username).
+    Text,
 }
 
 struct Spec {
@@ -61,6 +71,31 @@ const SPECS: &[Spec] = &[
         names: &["keymap"],
         arg: Arg::Keymap,
         help: "standard or helix",
+    },
+    Spec {
+        names: &["contact", "add"],
+        arg: Arg::Text,
+        help: "Send a contact request to a username",
+    },
+    Spec {
+        names: &["accept"],
+        arg: Arg::None,
+        help: "Accept the open contact request",
+    },
+    Spec {
+        names: &["decline"],
+        arg: Arg::None,
+        help: "Decline the open contact request",
+    },
+    Spec {
+        names: &["username"],
+        arg: Arg::Text,
+        help: "Add a username others can find you by",
+    },
+    Spec {
+        names: &["remove-username"],
+        arg: Arg::Text,
+        help: "Remove one of your usernames",
     },
     Spec {
         names: &["help", "shortcuts"],
@@ -107,6 +142,11 @@ pub fn parse(input: &str) -> Result<Command, String> {
             _ => return Err(":keymap takes standard or helix".into()),
         }),
         "help" => Command::Shortcuts,
+        "contact" => Command::AddContact(need("a username")?),
+        "accept" => Command::Accept,
+        "decline" => Command::Decline,
+        "username" => Command::AddUsername(need("a username")?),
+        "remove-username" => Command::RemoveUsername(need("a username")?),
         other => unreachable!("spec {other} has no parser"),
     })
 }
@@ -127,7 +167,7 @@ pub fn complete(input: &str, themes: &[String], chats: &[String]) -> Vec<(String
         return Vec::new();
     };
     let candidates: Vec<String> = match spec.arg {
-        Arg::None => return Vec::new(),
+        Arg::None | Arg::Text => return Vec::new(),
         Arg::Theme => themes.to_vec(),
         Arg::Chat => chats.to_vec(),
         Arg::Appearance => ["system", "light", "dark"].map(String::from).to_vec(),
@@ -217,6 +257,11 @@ mod tests {
             Ok(Command::Keymap(KeymapMode::Helix))
         );
         assert_eq!(parse(":details"), Ok(Command::ToggleDetails));
+        // Usernames go to the session as typed; it normalizes them.
+        assert_eq!(
+            parse(":add  @Ada-L "),
+            Ok(Command::AddContact("@Ada-L".into()))
+        );
     }
 
     #[test]
@@ -228,6 +273,8 @@ mod tests {
             ":q now",
             ":appearance purple",
             ":keymap emacs",
+            ":contact",
+            ":accept now",
         ] {
             assert!(parse(input).is_err(), "{input:?} should fail");
         }
@@ -258,7 +305,7 @@ mod tests {
                     Arg::None => name.to_string(),
                     Arg::Appearance => format!("{name} dark"),
                     Arg::Keymap => format!("{name} helix"),
-                    Arg::Theme | Arg::Chat => format!("{name} x"),
+                    Arg::Theme | Arg::Chat | Arg::Text => format!("{name} x"),
                 };
                 assert!(parse(&line).is_ok(), "{line:?} should parse");
             }

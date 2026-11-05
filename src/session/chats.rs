@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::error;
 
-use crate::model::{ChatId, ChatSummary, name_line};
+use crate::model::{ChatId, ChatSummary, Request, name_line};
 use crate::runtime::{Tokio, TokioTask};
 use crate::session::pending::Pending;
 use crate::session::preview;
@@ -302,17 +302,25 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         .unwrap_or(false);
 
     let mut users = Vec::new();
-    let (title, pending, is_group) = match &chat.chat_type {
-        ChatType::HandleConnection(username) => (username.plaintext().to_string(), true, false),
+    let (title, request, is_group) = match &chat.chat_type {
+        ChatType::HandleConnection(username) => (
+            username.plaintext().to_string(),
+            Some(Request::Outgoing),
+            false,
+        ),
         ChatType::Connection(peer)
         | ChatType::TargetedMessageConnection(peer)
         | ChatType::PendingConnection(peer) => {
             users.push(peer.clone());
             let name = user.user_profile(peer).await.display_name.to_string();
-            let pending = !matches!(chat.chat_type, ChatType::Connection(_));
-            (name, pending, false)
+            let request = match chat.chat_type {
+                ChatType::Connection(_) => None,
+                ChatType::PendingConnection(_) => Some(Request::Incoming),
+                _ => Some(Request::Outgoing),
+            };
+            (name, request, false)
         }
-        ChatType::Group(attributes) => (attributes.title.clone(), false, true),
+        ChatType::Group(attributes) => (attributes.title.clone(), None, true),
     };
     let title = if is_self_chat {
         "Notes to self".to_string()
@@ -332,7 +340,7 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         // Peer-controlled: titles and names arrive unvalidated.
         title: name_line(&title),
         is_group,
-        pending,
+        request,
         is_self_chat,
         preview: preview::preview(
             draft.as_ref().map(|draft| draft.message.as_str()),
@@ -468,7 +476,7 @@ mod tests {
             id: ChatId(id.to_string().into()),
             title: title.to_string().into(),
             is_group: false,
-            pending: false,
+            request: None,
             is_self_chat: false,
             preview: None,
             last_activity: None,

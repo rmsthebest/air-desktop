@@ -21,6 +21,8 @@ pub struct Account {
     pub status: ConnectionStatus,
     /// When the server stops accepting this client version, if announced.
     pub version_expires: Option<chrono::DateTime<chrono::Utc>>,
+    /// What others can add the user by.
+    pub usernames: Vec<SharedString>,
 }
 
 pub fn nav_rail(appearance: Appearance, account: Option<Account>, cx: &App) -> impl IntoElement {
@@ -88,7 +90,12 @@ fn account_badge(account: Account, cx: &App) -> AnyElement {
         ),
         _ => (color, format!("{} — {status}", account.name)),
     };
-    let tooltip = SharedString::from(tooltip);
+    let usernames = if account.usernames.is_empty() {
+        "no username yet (:username <name> adds one)".to_string()
+    } else {
+        account.usernames.join(", ")
+    };
+    let tooltip = SharedString::from(format!("{tooltip}\n{usernames}"));
     div()
         .id("nav-account")
         .relative()

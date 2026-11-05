@@ -329,7 +329,7 @@ async fn receive(this: WeakEntity<Messages>, mut rx: mpsc::Receiver<Update>, cx:
 /// Marks the chat as read up to `until` and reports it: to the chat if the
 /// user sends read receipts, else only to their own devices (through the
 /// self chat), which follow the same report. As upstream.
-async fn mark_as_read(user: CoreUser, chat: CoreChatId, until: CoreMessageId) {
+pub(super) async fn mark_as_read(user: CoreUser, chat: CoreChatId, until: CoreMessageId) {
     let read = match user.mark_chat_as_read(chat, until).await {
         Ok((_, read)) => read,
         Err(err) => return error!("failed to mark chat as read: {err:#}"),

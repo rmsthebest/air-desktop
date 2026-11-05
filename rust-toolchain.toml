@@ -1,0 +1,4 @@
+[toolchain]
+# Newest stable verified to build gpui-pre 0.3.11 together with the pinned Air core.
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

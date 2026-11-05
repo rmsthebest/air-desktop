@@ -1,0 +1,129 @@
+{
+  "$schema": "https://github.com/longbridge/gpui-kit/raw/refs/heads/main/.theme-schema.json",
+  "name": "Air",
+  "author": "air-desktop",
+  "themes": [
+    {
+      "name": "Air Light",
+      "mode": "light",
+      "radius": 8,
+      "radius.lg": 12,
+      "shadow": true,
+      "colors": {
+        "background": "#f7f6f3",
+        "foreground": "#1d1c1a",
+        "border": "#e3e0d9",
+        "ring": "#5b63d6",
+        "caret": "#5b63d6",
+        "selection.background": "#5b63d633",
+
+        "muted.background": "#efede8",
+        "muted.foreground": "#6f6c64",
+
+        "accent.background": "#ebe9e3",
+        "accent.foreground": "#1d1c1a",
+
+        "primary.background": "#5b63d6",
+        "primary.hover.background": "#4f57c9",
+        "primary.active.background": "#454cb8",
+        "primary.foreground": "#ffffff",
+
+        "secondary.background": "#ffffff",
+        "secondary.hover.background": "#f2f0eb",
+        "secondary.active.background": "#e9e6df",
+        "secondary.foreground": "#1d1c1a",
+
+        "popover.background": "#ffffff",
+        "popover.foreground": "#1d1c1a",
+
+        "sidebar.background": "#efede8",
+        "sidebar.foreground": "#1d1c1a",
+        "sidebar.border": "#e3e0d9",
+        "sidebar.accent.background": "#e4e1da",
+        "sidebar.accent.foreground": "#1d1c1a",
+        "sidebar.primary.background": "#5b63d6",
+        "sidebar.primary.foreground": "#ffffff",
+
+        "list.background": "#efede8",
+        "list.hover.background": "#e8e5df",
+        "list.active.background": "#ffffff",
+        "list.active.border": "#e3e0d9",
+
+        "input.border": "#dcd8d0",
+        "title_bar.background": "#efede8",
+        "title_bar.border": "#e3e0d9",
+        "window.border": "#d6d2c9",
+
+        "danger.background": "#d64545",
+        "danger.foreground": "#ffffff",
+        "success.background": "#2f9e6b",
+        "success.foreground": "#ffffff",
+        "warning.background": "#d99a1e",
+        "warning.foreground": "#1d1c1a",
+        "info.background": "#3d8bd6",
+        "info.foreground": "#ffffff"
+      }
+    },
+    {
+      "name": "Air Dark",
+      "mode": "dark",
+      "radius": 8,
+      "radius.lg": 12,
+      "shadow": true,
+      "colors": {
+        "background": "#18181b",
+        "foreground": "#e9e7e3",
+        "border": "#2c2c31",
+        "ring": "#8b93f2",
+        "caret": "#8b93f2",
+        "selection.background": "#8b93f240",
+
+        "muted.background": "#202024",
+        "muted.foreground": "#9b9890",
+
+        "accent.background": "#26262b",
+        "accent.foreground": "#e9e7e3",
+
+        "primary.background": "#6f78ea",
+        "primary.hover.background": "#7d85ee",
+        "primary.active.background": "#636cdc",
+        "primary.foreground": "#ffffff",
+
+        "secondary.background": "#25252a",
+        "secondary.hover.background": "#2c2c32",
+        "secondary.active.background": "#33333a",
+        "secondary.foreground": "#e9e7e3",
+
+        "popover.background": "#25252a",
+        "popover.foreground": "#e9e7e3",
+
+        "sidebar.background": "#1e1e22",
+        "sidebar.foreground": "#e9e7e3",
+        "sidebar.border": "#2c2c31",
+        "sidebar.accent.background": "#2a2a30",
+        "sidebar.accent.foreground": "#e9e7e3",
+        "sidebar.primary.background": "#6f78ea",
+        "sidebar.primary.foreground": "#ffffff",
+
+        "list.background": "#1e1e22",
+        "list.hover.background": "#25252a",
+        "list.active.background": "#2c2c32",
+        "list.active.border": "#34343b",
+
+        "input.border": "#34343b",
+        "title_bar.background": "#1e1e22",
+        "title_bar.border": "#2c2c31",
+        "window.border": "#34343b",
+
+        "danger.background": "#e05555",
+        "danger.foreground": "#ffffff",
+        "success.background": "#3bb27c",
+        "success.foreground": "#ffffff",
+        "warning.background": "#e0a83a",
+        "warning.foreground": "#18181b",
+        "info.background": "#4d9be6",
+        "info.foreground": "#ffffff"
+      }
+    }
+  ]
+}

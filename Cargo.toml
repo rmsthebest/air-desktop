@@ -1,0 +1,51 @@
+[package]
+name = "air-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Keyboard-first desktop client for the Air messenger, built with GPUI"
+publish = false
+
+[dependencies]
+# UI: gpui-kit pins the matching gpui-pre snapshot; never mix in other gpui lineages.
+gpui-kit = "=0.9.0"
+
+# Air core, pinned to one upstream commit. Bump all three together.
+aircoreclient = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c56fba102d4554ec01c86e79311" }
+aircommon = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c56fba102d4554ec01c86e79311" }
+airapiclient = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c56fba102d4554ec01c86e79311" }
+
+anyhow = "1"
+directories = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# gpui-kit's own `test-support` feature drags in the gpui-fast backend, whose
+# pins conflict; enable test support on the underlying gpui-pre crates instead.
+gpui-pre = { version = "=0.3.11", features = ["test-support"] }
+gpui-pre-platform = { version = "=0.3.11", features = ["test-support"] }
+
+# Mirrors the [patch] sections of the pinned Air workspace (patches do not
+# propagate to dependents). Keep in sync when bumping the Air rev.
+[patch.crates-io]
+ml-dsa = { git = "https://github.com/RustCrypto/signatures", rev = "017ce322cdbdd66a702cc0c4ef676b38022e5cbb" }
+openmls_traits = { git = "https://github.com/openmls/openmls", rev = "7c94cc351ea771771100edca47695055da379a34" }
+
+[patch."https://github.com/openmls/openmls"]
+openmls_sqlite_storage = "=0.3.0"
+
+# Hot crypto/SQLite paths, as in Air's workspace.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.voprf-ng]
+opt-level = 3
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3

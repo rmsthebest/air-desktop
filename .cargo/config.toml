@@ -1,0 +1,4 @@
+[env]
+# Air's crates compile sqlx queries against checked-in `.sqlx` metadata;
+# Air sets this in its own .cargo/config.toml, which dependents don't inherit.
+SQLX_OFFLINE = "true"

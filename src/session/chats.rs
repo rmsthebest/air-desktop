@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use aircommon::identifiers::UserId;
 use aircommon::utils::FibonacciBackoff;
@@ -14,6 +13,7 @@ use aircoreclient::db::notification::{DbEntityId, DbNotification};
 use aircoreclient::{Chat, ChatId as CoreChatId, ChatType, MessageId};
 use gpui_kit::{AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
 use tokio::sync::{Notify, mpsc};
+use tokio::time::Instant;
 use tracing::error;
 
 use crate::model::{ChatId, ChatSummary, name_line};
@@ -26,7 +26,6 @@ use crate::session::{Session, SessionEvent};
 const CHUNK: usize = 32;
 /// Deltas in flight to the UI; the worker waits beyond this.
 const DELTAS_BUFFER: usize = 8;
-const ORDER_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadState {
@@ -186,27 +185,36 @@ pub(super) async fn run(user: CoreUser, pending: Arc<Pending>, tx: mpsc::Sender<
             Err(Stop::Failed) => tokio::time::sleep(backoff.next_backoff()).await,
         }
     }
+    // Set while a chat new to the list waits for an order to place it in.
+    let mut order_backoff = FibonacciBackoff::default();
+    let mut order_retry: Option<Instant> = None;
     loop {
-        pending.wake.notified().await;
+        let retry = tokio::select! {
+            _ = pending.wake.notified() => false,
+            _ = tokio::time::sleep_until(order_retry.unwrap_or_else(Instant::now)),
+                if order_retry.is_some() => true,
+        };
         let changes = pending.take();
         let affected = if changes.all {
             state.published.keys().copied().collect()
         } else {
             state.affected(&changes.entities)
         };
-        // Even with nothing published, a full reload picks up new chats.
-        if affected.is_empty() && !changes.all {
+        // A full reload or an order retry can find chats nothing pointed
+        // to, so they run even with nothing affected.
+        if affected.is_empty() && !changes.all && !retry {
             continue;
         }
-        let (delta, ordered) = reload(&user, affected, &mut state).await;
+        let (delta, held_back) = reload(&user, affected, &mut state).await;
         if !delta.is_empty() && tx.send(Update::Delta(delta)).await.is_err() {
             return;
         }
-        if !ordered {
-            // Chats new to the list wait for an order: try again shortly.
-            tokio::time::sleep(ORDER_RETRY).await;
-            pending.add(&[], true);
-        }
+        order_retry = if held_back {
+            Some(Instant::now() + order_backoff.next_backoff())
+        } else {
+            order_backoff.reset();
+            None
+        };
     }
 }
 
@@ -263,14 +271,15 @@ async fn initial_load(
     Ok(())
 }
 
-/// Also returns whether the order loaded.
+/// Also returns whether a chat new to the list was held back for want of
+/// an order.
 async fn reload(
     user: &CoreUser,
     affected: HashSet<CoreChatId>,
     state: &mut LocalState,
 ) -> (Delta, bool) {
     let mut delta = Delta::default();
-    let mut removed = Vec::new();
+    let mut gone = Vec::new();
     for id in affected {
         match user.chat(&id).await {
             Some(chat) => {
@@ -278,53 +287,27 @@ async fn reload(
                 state.record(id, keys);
                 delta.upserted.push(summary);
             }
-            None if state.contains(&id) => removed.push(id),
+            None if state.contains(&id) => gone.push(id),
             None => {}
         }
     }
-
-    // Unlike upstream, an order that fails to load keeps the current one
-    // rather than emptying the list.
-    let ordered = match user.ordered_chat_ids().await {
-        Ok(ids) => {
-            let mut order = Vec::with_capacity(ids.len());
-            for id in ids {
-                if state.contains(&id) {
-                    order.push(id);
-                } else if let Some(chat) = user.chat(&id).await {
-                    // A chat no notification told us about.
-                    let (summary, keys) = load_chat(user, chat).await;
-                    state.record(id, keys);
-                    delta.upserted.push(summary);
-                    order.push(id);
-                }
-            }
-            // Chats that left the order without a notification.
-            let retained: HashSet<_> = order.iter().copied().collect();
-            removed.extend(state.order.iter().filter(|id| !retained.contains(id)));
-            if state.order != order {
-                delta.order = Some(order.iter().map(model_id).collect());
-                state.order = order;
-            }
-            true
+    let order = user
+        .ordered_chat_ids()
+        .await
+        .inspect_err(|err| error!("failed to load chat order: {err:#}"))
+        .ok();
+    for id in order.iter().flatten() {
+        if !state.contains(id)
+            && let Some(chat) = user.chat(id).await
+        {
+            // A chat no notification told us about.
+            let (summary, keys) = load_chat(user, chat).await;
+            state.record(*id, keys);
+            delta.upserted.push(summary);
         }
-        Err(err) => {
-            error!("failed to load chat order: {err:#}");
-            // Chats new to the list have no place in it yet: publishing
-            // them would drop them (`apply` keeps only ordered chats).
-            let placed: HashSet<_> = state.order.iter().copied().collect();
-            state.published.retain(|id, _| placed.contains(id));
-            let placed: HashSet<_> = placed.iter().map(model_id).collect();
-            delta.upserted.retain(|chat| placed.contains(&chat.id));
-            false
-        }
-    };
-
-    for id in removed {
-        state.published.remove(&id);
-        delta.removed.insert(model_id(&id));
     }
-    (delta, ordered)
+    let held_back = state.reconcile(&mut delta, gone, order);
+    (delta, held_back)
 }
 
 /// Loads what the list shows for a chat. Port of `load_chat_details`, minus
@@ -381,6 +364,7 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         title: name_line(&title),
         is_group,
         pending,
+        is_self_chat,
         preview: preview::preview(
             draft.as_ref().map(|draft| draft.message.as_str()),
             last_message,
@@ -419,6 +403,46 @@ struct ChatKeys {
 }
 
 impl LocalState {
+    /// Settles the order after a reload and completes `delta`. `gone`: chats
+    /// that no longer exist. `order`: `None` if it failed to load, in which
+    /// case the current order is kept (upstream empties the list) and chats
+    /// new to the list are held back, since `apply` drops unordered chats.
+    /// Returns whether any were.
+    fn reconcile(
+        &mut self,
+        delta: &mut Delta,
+        mut gone: Vec<CoreChatId>,
+        order: Option<Vec<CoreChatId>>,
+    ) -> bool {
+        let held_back = match order {
+            Some(ids) => {
+                let order: Vec<_> = ids.into_iter().filter(|id| self.contains(id)).collect();
+                // Chats that left the order without a notification.
+                let retained: HashSet<_> = order.iter().copied().collect();
+                gone.extend(self.order.iter().filter(|id| !retained.contains(id)));
+                if self.order != order {
+                    delta.order = Some(order.iter().map(model_id).collect());
+                    self.order = order;
+                }
+                false
+            }
+            None => {
+                let placed: HashSet<_> = self.order.iter().copied().collect();
+                let published = self.published.len();
+                self.published.retain(|id, _| placed.contains(id));
+                let placed: HashSet<_> = placed.iter().map(model_id).collect();
+                delta.upserted.retain(|chat| placed.contains(&chat.id));
+                self.published.len() < published
+            }
+        };
+        for id in gone {
+            self.published.remove(&id);
+            self.order.retain(|ordered| ordered != &id);
+            delta.removed.insert(model_id(&id));
+        }
+        held_back
+    }
+
     fn contains(&self, id: &CoreChatId) -> bool {
         self.published.contains_key(id)
     }
@@ -476,6 +500,7 @@ mod tests {
             title: title.to_string().into(),
             is_group: false,
             pending: false,
+            is_self_chat: false,
             preview: None,
             last_activity: None,
             unread: 0,
@@ -588,6 +613,73 @@ mod tests {
             ])
             .is_empty()
         );
+    }
+
+    fn keys() -> ChatKeys {
+        ChatKeys {
+            last_message: None,
+            users: Vec::new(),
+        }
+    }
+
+    /// What `reload` does for a chat it loaded.
+    fn load(state: &mut LocalState, delta: &mut Delta, id: CoreChatId) {
+        state.record(id, keys());
+        delta.upserted.push(summary(&id.uuid.to_string(), "chat"));
+    }
+
+    #[test]
+    fn a_failed_order_holds_new_chats_back_until_one_loads() {
+        let (old, new) = (chat_id(), chat_id());
+        let mut chats = Vec::new();
+        let mut state = LocalState::default();
+        let mut delta = Delta::default();
+        load(&mut state, &mut delta, old);
+        assert!(!state.reconcile(&mut delta, Vec::new(), Some(vec![old])));
+        apply(&mut chats, delta);
+
+        // The order fails while a new chat and a change to the old one load:
+        // the change goes out, the new chat is held back, not lost.
+        let mut delta = Delta::default();
+        load(&mut state, &mut delta, old);
+        load(&mut state, &mut delta, new);
+        assert!(state.reconcile(&mut delta, Vec::new(), None));
+        assert_eq!(delta.order, None);
+        assert!(!state.contains(&new));
+        apply(&mut chats, delta);
+        assert_eq!(ids(&chats), [old.uuid.to_string()]);
+
+        // The retry loads it as a chat nothing told us about, and places it.
+        let mut delta = Delta::default();
+        load(&mut state, &mut delta, new);
+        assert!(!state.reconcile(&mut delta, Vec::new(), Some(vec![new, old])));
+        apply(&mut chats, delta);
+        assert_eq!(ids(&chats), [new.uuid.to_string(), old.uuid.to_string()]);
+    }
+
+    #[test]
+    fn chats_leave_when_gone_or_out_of_the_order() {
+        let (deleted, left, kept) = (chat_id(), chat_id(), chat_id());
+        let mut chats = Vec::new();
+        let mut state = LocalState::default();
+        let mut delta = Delta::default();
+        for id in [deleted, left, kept] {
+            load(&mut state, &mut delta, id);
+        }
+        state.reconcile(&mut delta, Vec::new(), Some(vec![deleted, left, kept]));
+        apply(&mut chats, delta);
+
+        // `deleted` no longer loads; `left` still exists but dropped out of
+        // the order without any notification.
+        let mut delta = Delta::default();
+        assert!(!state.reconcile(&mut delta, vec![deleted], Some(vec![kept])));
+        assert_eq!(
+            delta.removed,
+            HashSet::from([model_id(&deleted), model_id(&left)])
+        );
+        assert!(!state.contains(&deleted) && !state.contains(&left));
+        apply(&mut chats, delta);
+        assert_eq!(ids(&chats), [kept.uuid.to_string()]);
     }
 
     #[test]

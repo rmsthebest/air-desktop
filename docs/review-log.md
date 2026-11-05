@@ -96,7 +96,8 @@ Fixed:
 - **Peer-controlled names and titles (high).** Group titles and display
   names arrive unvalidated (`DisplayName` TLS deserialization skips the
   length and newline checks). They now go through `model::name_line`: one
-  line, invisible/bidi characters stripped, at most 64 graphemes. This
+  line, invisible/bidi characters stripped, at most 64 graphemes (see
+  gate 5b for the byte bound). This
   happens where the session builds the summary, so the list, header and
   palette all get clean data. The group sender prefix and the conversation
   header title truncate. Regression test: `names_are_one_short_line`.
@@ -108,8 +109,9 @@ Fixed:
   bounded titles nothing more is needed.
 - **Worker stateful paths.** The e2e test now also renames the group (title
   update and system-message preview) and deletes it with notifications cut
-  off, so only a full reload (`changes.all`) can notice. That covers removal
-  of chats that left the order without a notification.
+  off, so only a full reload (`changes.all`) can notice. It catches the
+  deletion through the "chat no longer loads" path. (Corrected at gate 5b:
+  this first said it covered chats leaving the order, which it doesn't.)
 - **Order load failure** no longer publishes chats that have no place in
   the order, which `apply` would have dropped for good. The worker retries
   with a full reload a second later.
@@ -129,3 +131,30 @@ Deferred:
 - The core's broadcast silently drops notifications on lag (it logs, but
   doesn't tell subscribers). Our overflow flag only covers our own buffer.
   An upstream issue, noted for the record.
+
+## Gate 5b — gate 5 fixes (`3fc92d1..7f11979`): PASS
+
+Fixed anyway:
+- **Size bound (medium).** The grapheme cap didn't bound bytes: one cluster
+  can stack thousands of combining marks. Each grapheme now keeps at most 8
+  chars (room for ZWJ emoji), so names are at most 64×8 chars and previews
+  160×8.
+- **Order retry (medium).** It reloaded every chat once a second, forever,
+  even when nothing was held back. Now it retries only when a chat new to
+  the list was actually held back, as an order-only reload (it finds the
+  chat through "a chat no notification told us about"), with Fibonacci
+  backoff that resets on success. Waiting doesn't block other changes.
+- **Blank names.** Added Hangul fillers, U+061C, U+034F, U+180E and tag
+  characters to the stripped set. A name left empty becomes "Unnamed".
+- **Reserved labels.** Preview prefixes are typed (`Draft`, `You`,
+  `Sender`); the client's labels render italic in the accent colour, so a
+  peer named "You" can't pass for the local user. The self chat gets a
+  "Self" tag, so a peer group titled "Notes to self" can't pass for it.
+- **Jumplist.** Pruning now collapses a chat that ends up next to itself.
+- **Details pane.** The title truncates like everywhere else.
+- **Tests.** The order bookkeeping moved into a pure
+  `LocalState::reconcile`. New tests cover the held-back-then-placed path
+  and removal by order-diff (`a_failed_order_holds_new_chats_back_until_one_loads`,
+  `chats_leave_when_gone_or_out_of_the_order`), plus zalgo, blank-name, a
+  peer named "You" and the duplicate jumplist cases. Corrected the gate 5
+  e2e coverage claim.

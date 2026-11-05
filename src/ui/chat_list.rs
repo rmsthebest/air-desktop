@@ -141,8 +141,12 @@ impl ChatList {
                             .max_w(gpui_kit::relative(0.5))
                             .truncate()
                             .font_weight(FontWeight::MEDIUM)
-                            .when(preview.kind == PreviewKind::Draft, |prefix| prefix.italic())
-                            .child(format!("{prefix}:\u{a0}")),
+                            // The client's labels are styled apart from
+                            // names a peer chose.
+                            .when(prefix.is_label(), |label| {
+                                label.italic().text_color(theme.primary)
+                            })
+                            .child(format!("{}:\u{a0}", prefix.label())),
                     )
                 })
                 .child(
@@ -195,19 +199,8 @@ impl ChatList {
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(chat.title.clone()),
                             )
-                            .when(chat.pending, |line| {
-                                line.child(
-                                    div()
-                                        .flex_none()
-                                        .px_1p5()
-                                        .rounded(theme.radius)
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("Request"),
-                                )
-                            })
+                            .when(chat.pending, |line| line.child(tag("Request", cx)))
+                            .when(chat.is_self_chat, |line| line.child(tag("Self", cx)))
                             .child(
                                 div()
                                     .flex_none()
@@ -247,6 +240,20 @@ impl ChatList {
                 .into_any_element(),
         )
     }
+}
+
+/// A small outlined label next to a chat's title.
+fn tag(label: &'static str, cx: &gpui_kit::App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .flex_none()
+        .px_1p5()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(label)
 }
 
 impl Render for ChatList {

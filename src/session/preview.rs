@@ -8,7 +8,7 @@ use mimi_content::MessageStatus;
 use mimi_content::content_container::{Disposition, NestedPart};
 use pulldown_cmark::{Event, Options, Parser, TagEnd};
 
-use crate::model::{Preview, PreviewKind, name_line, preview_line};
+use crate::model::{Prefix, Preview, PreviewKind, name_line, preview_line};
 
 /// What the preview needs to know about a chat's last message.
 #[derive(Debug, PartialEq)]
@@ -75,15 +75,15 @@ pub async fn describe(user: &CoreUser, message: &ChatMessage) -> Option<LastMess
 /// The preview of a chat: a non-empty draft wins over the last message.
 /// Senders are named in groups only; the local user is always "You".
 pub fn preview(draft: Option<&str>, last: Option<LastMessage>, is_group: bool) -> Option<Preview> {
-    let make = |prefix: Option<String>, text: &str, kind| {
+    let make = |prefix: Option<Prefix>, text: &str, kind| {
         Some(Preview {
-            prefix: prefix.map(Into::into),
+            prefix,
             text: preview_line(text),
             kind,
         })
     };
     if let Some(draft) = draft.map(plain_text).filter(|text| !text.is_empty()) {
-        return make(Some("Draft".into()), &draft, PreviewKind::Draft);
+        return make(Some(Prefix::Draft), &draft, PreviewKind::Draft);
     }
     match last? {
         LastMessage::Hidden => make(None, "Hidden message", PreviewKind::Notice),
@@ -91,8 +91,8 @@ pub fn preview(draft: Option<&str>, last: Option<LastMessage>, is_group: bool) -
         LastMessage::Event(text) => make(None, &text, PreviewKind::Message),
         LastMessage::Content { sender_name, body } => {
             let prefix = match sender_name {
-                None => Some("You".to_string()),
-                Some(name) if is_group => Some(name),
+                None => Some(Prefix::You),
+                Some(name) if is_group => Some(Prefix::Sender(name.into())),
                 Some(_) => None,
             };
             let text = match body {
@@ -138,8 +138,8 @@ fn plain_text(markdown: &str) -> String {
 mod tests {
     use super::*;
 
-    fn text(preview: Option<Preview>) -> Option<(Option<String>, String, PreviewKind)> {
-        preview.map(|p| (p.prefix.map(|s| s.to_string()), p.text.to_string(), p.kind))
+    fn text(preview: Option<Preview>) -> Option<(Option<Prefix>, String, PreviewKind)> {
+        preview.map(|p| (p.prefix, p.text.to_string(), p.kind))
     }
 
     fn content(sender_name: Option<&str>, markdown: &str) -> Option<LastMessage> {
@@ -171,12 +171,11 @@ mod tests {
 
     #[test]
     fn prefixes_follow_who_sent_it_and_where() {
-        let you = Some("You".to_string());
-        let ada = Some("Ada".to_string());
+        let sender = |name: &str| Some(Prefix::Sender(name.to_string().into()));
         let message = PreviewKind::Message;
         assert_eq!(
             text(preview(None, content(None, "hi"), false)),
-            Some((you, "hi".into(), message))
+            Some((Some(Prefix::You), "hi".into(), message))
         );
         assert_eq!(
             text(preview(None, content(Some("Ada"), "hi"), false)),
@@ -184,8 +183,14 @@ mod tests {
         );
         assert_eq!(
             text(preview(None, content(Some("Ada"), "hi"), true)),
-            Some((ada, "hi".into(), message))
+            Some((sender("Ada"), "hi".into(), message))
         );
+        // A peer named "You" stays a peer: only the local user gets the label.
+        let prefix = text(preview(None, content(Some("You"), "hi"), true))
+            .unwrap()
+            .0;
+        assert_eq!(prefix, sender("You"));
+        assert!(!prefix.unwrap().is_label());
     }
 
     #[test]
@@ -193,7 +198,7 @@ mod tests {
         let last = || content(Some("Ada"), "hi");
         assert_eq!(
             text(preview(Some("*soon*"), last(), false)),
-            Some((Some("Draft".into()), "soon".into(), PreviewKind::Draft))
+            Some((Some(Prefix::Draft), "soon".into(), PreviewKind::Draft))
         );
         assert_eq!(text(preview(Some(" \n "), last(), false)).unwrap().1, "hi");
         assert_eq!(preview(Some(""), None, false), None);

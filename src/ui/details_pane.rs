@@ -21,6 +21,8 @@ pub fn details_pane(chat: Option<&ChatSummary>, cx: &App) -> impl IntoElement {
                 .child(
                     div()
                         .pt_2()
+                        .max_w_full()
+                        .truncate()
                         .text_lg()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(chat.title.clone()),

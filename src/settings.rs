@@ -31,9 +31,20 @@ impl Appearance {
     }
 }
 
+/// Which keymap layers are active. Helix adds modal, Helix-style bindings
+/// on top of the standard ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeymapMode {
+    #[default]
+    Standard,
+    Helix,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub keymap_mode: KeymapMode,
     pub appearance: Appearance,
     pub light_theme: String,
     pub dark_theme: String,
@@ -44,6 +55,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            keymap_mode: KeymapMode::Standard,
             appearance: Appearance::System,
             light_theme: theme::DEFAULT_LIGHT.into(),
             dark_theme: theme::DEFAULT_DARK.into(),

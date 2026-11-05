@@ -21,6 +21,27 @@ gpui_kit::actions!(
         ToggleAppearance,
         SelectNext,
         SelectPrev,
+        // Helix-style
+        FindChat,
+        PickTheme,
+        OpenCommandLine,
+        JumpBack,
+        JumpForward,
+        FocusMessages,
+        FocusComposer,
+        FocusNextPane,
+        SelectFirst,
+        SelectLast,
+        CursorDown,
+        CursorUp,
+        CursorFirst,
+        CursorLast,
+        HalfPageDown,
+        HalfPageUp,
+        YankMessage,
+        ClearCursor,
+        CommandComplete,
+        CommandCancel,
     ]
 );
 
@@ -39,6 +60,7 @@ pub struct Command {
     pub context: &'static str,
 }
 
+/// Commands offered in the palette: those that make sense from anywhere.
 pub fn commands() -> Vec<Command> {
     fn cmd(label: &str, action: impl Action, context: &'static str) -> Command {
         Command {
@@ -49,12 +71,17 @@ pub fn commands() -> Vec<Command> {
     }
     vec![
         cmd("Command palette", OpenPalette, "Workspace"),
+        cmd("Find chat", FindChat, "Workspace"),
+        cmd("Pick theme", PickTheme, "Workspace"),
         cmd("Next chat", NextChat, "Workspace"),
         cmd("Previous chat", PrevChat, "Workspace"),
         cmd("Next unread chat", NextUnreadChat, "Workspace"),
         cmd("Previous unread chat", PrevUnreadChat, "Workspace"),
+        cmd("Jump back", JumpBack, "Workspace"),
+        cmd("Jump forward", JumpForward, "Workspace"),
         cmd("Focus chat list", FocusChatList, "Workspace"),
-        cmd("Focus conversation", FocusConversation, "Workspace"),
+        cmd("Focus messages", FocusMessages, "Workspace"),
+        cmd("Write a message", FocusComposer, "Workspace"),
         cmd("Toggle details pane", ToggleDetails, "Workspace"),
         cmd(
             "Cycle appearance (system/light/dark)",
@@ -64,4 +91,44 @@ pub fn commands() -> Vec<Command> {
         cmd("Keyboard shortcuts", ShowShortcuts, "Workspace"),
         cmd("Quit", Quit, "Workspace"),
     ]
+}
+
+/// Short human label for any of our actions, used by the which-key popup
+/// and the shortcuts overview.
+pub fn label(action: &dyn Action) -> String {
+    let name = action.name();
+    let label = match name.strip_prefix("air::").unwrap_or(name) {
+        "Quit" => "quit",
+        "OpenPalette" => "command palette",
+        "ShowShortcuts" => "keyboard shortcuts",
+        "NextChat" => "next chat",
+        "PrevChat" => "previous chat",
+        "NextUnreadChat" => "next unread",
+        "PrevUnreadChat" => "previous unread",
+        "FocusChatList" => "chat list",
+        "FocusConversation" => "conversation",
+        "ToggleDetails" => "toggle details",
+        "ToggleAppearance" => "cycle appearance",
+        "SelectNext" => "next",
+        "SelectPrev" => "previous",
+        "FindChat" => "find chat",
+        "PickTheme" => "pick theme",
+        "OpenCommandLine" => "command line",
+        "JumpBack" => "jump back",
+        "JumpForward" => "jump forward",
+        "FocusMessages" => "messages",
+        "FocusComposer" => "insert mode",
+        "FocusNextPane" => "next pane",
+        "SelectFirst" | "CursorFirst" => "first",
+        "SelectLast" | "CursorLast" => "last",
+        "CursorDown" => "next message",
+        "CursorUp" => "previous message",
+        "HalfPageDown" => "half page down",
+        "HalfPageUp" => "half page up",
+        "YankMessage" => "copy message",
+        "ClearCursor" => "clear selection",
+        "OpenChatAt" => "open chat n",
+        other => other,
+    };
+    label.to_string()
 }

@@ -1,0 +1,59 @@
+[
+  {
+    "context": "Workspace && helix && !Input",
+    "bindings": {
+      "space f": "air::FindChat",
+      "space ?": "air::OpenPalette",
+      "space t": "air::PickTheme",
+      "space d": "air::ToggleDetails",
+      "space a": "air::ToggleAppearance",
+      "space h": "air::ShowShortcuts",
+      ":": "air::OpenCommandLine",
+      "/": "air::FindChat",
+      "] u": "air::NextUnreadChat",
+      "[ u": "air::PrevUnreadChat",
+      "] c": "air::NextChat",
+      "[ c": "air::PrevChat",
+      "ctrl-o": "air::JumpBack",
+      "ctrl-i": "air::JumpForward",
+      "tab": "air::JumpForward",
+      "ctrl-w h": "air::FocusChatList",
+      "ctrl-w l": "air::FocusMessages",
+      "ctrl-w w": "air::FocusNextPane",
+      "ctrl-w ctrl-w": "air::FocusNextPane",
+      "i": "air::FocusComposer",
+      "a": "air::FocusComposer"
+    }
+  },
+  {
+    "context": "ChatList && helix",
+    "bindings": {
+      "l": "air::FocusMessages",
+      "enter": "air::FocusMessages",
+      "g g": "air::SelectFirst",
+      "g e": "air::SelectLast"
+    }
+  },
+  {
+    "context": "MessageList && helix",
+    "bindings": {
+      "h": "air::FocusChatList",
+      "j": "air::CursorDown",
+      "k": "air::CursorUp",
+      "down": "air::CursorDown",
+      "up": "air::CursorUp",
+      "g g": "air::CursorFirst",
+      "g e": "air::CursorLast",
+      "ctrl-d": "air::HalfPageDown",
+      "ctrl-u": "air::HalfPageUp",
+      "y": "air::YankMessage",
+      "escape": "air::ClearCursor"
+    }
+  },
+  {
+    "context": "Composer && helix",
+    "bindings": {
+      "escape": "air::FocusMessages"
+    }
+  }
+]

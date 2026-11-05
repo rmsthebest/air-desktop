@@ -29,6 +29,15 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 - `src/actions.rs`, `assets/keymaps/default.json`, `src/keymap.rs` — every
   command is an `air::` action; defaults and `<config>/keymap.json` share one
   loader (`null` unbinds; bad entries are warnings, never fatal).
+- Helix mode (opt-in, `"keymap_mode": "helix"` or `:keymap helix`):
+  `assets/keymaps/helix.json` is always bound, but its contexts require the
+  `helix` identifier that `ui::key_context` adds only in Helix mode — so
+  switching modes needs no rebinding. Mode is derived from focus: composer
+  focused = INS, otherwise NOR. `:` commands are parsed in
+  `src/command_line.rs` (pure); which-key uses `possible_bindings_for_input`.
+- Normal-mode letter bindings must never live in a context that contains a
+  text input (they'd steal typing): use `ChatList`/`MessageList`, or
+  `Workspace && helix && !Input`.
 - `src/settings.rs` — `<config>/settings.json` (`SettingsStore` global).
 - Config dir: XDG (`~/.config/air-desktop`), override with
   `AIR_DESKTOP_CONFIG_DIR`.

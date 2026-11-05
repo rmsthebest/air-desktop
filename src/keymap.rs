@@ -9,7 +9,10 @@
 //! }}]
 //! ```
 //!
-//! `null` unbinds. User bindings are added after the defaults, so they win.
+//! `assets/keymaps/helix.json` is always loaded on top of the defaults; its
+//! contexts require the `helix` identifier, which views add to their key
+//! context only in Helix mode, so switching modes needs no rebinding.
+//! `null` unbinds. User bindings are added last, so they win.
 //! A bad entry is reported and skipped; it never prevents startup.
 
 use std::path::Path;
@@ -20,6 +23,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const DEFAULT_KEYMAP: &str = include_str!("../assets/keymaps/default.json");
+const HELIX_KEYMAP: &str = include_str!("../assets/keymaps/helix.json");
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,12 +32,18 @@ struct Section {
     bindings: serde_json::Map<String, Value>,
 }
 
-/// Binds the default keymap, then the user keymap at `user_path` if it
-/// exists. Returns human-readable problems found along the way.
+/// Binds the default keymap, the Helix layer, then the user keymap at
+/// `user_path` if it exists. Returns human-readable problems found along
+/// the way.
 pub fn load(user_path: Option<&Path>, cx: &mut App) -> Vec<String> {
     let mut errors = Vec::new();
-    let defaults = parse(DEFAULT_KEYMAP, "default keymap", &mut errors, cx);
-    cx.bind_keys(defaults);
+    for (source, origin) in [
+        (DEFAULT_KEYMAP, "default keymap"),
+        (HELIX_KEYMAP, "helix keymap"),
+    ] {
+        let bindings = parse(source, origin, &mut errors, cx);
+        cx.bind_keys(bindings);
+    }
 
     if let Some(path) = user_path {
         match std::fs::read_to_string(path) {
@@ -115,12 +125,14 @@ mod tests {
     use super::*;
 
     #[gpui::test]
-    fn default_keymap_is_valid(cx: &mut TestAppContext) {
+    fn bundled_keymaps_are_valid(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let mut errors = Vec::new();
-            let bindings = parse(DEFAULT_KEYMAP, "default", &mut errors, cx);
-            assert_eq!(errors, Vec::<String>::new());
-            assert!(bindings.len() > 20);
+            for source in [DEFAULT_KEYMAP, HELIX_KEYMAP] {
+                let mut errors = Vec::new();
+                let bindings = parse(source, "bundled", &mut errors, cx);
+                assert_eq!(errors, Vec::<String>::new());
+                assert!(!bindings.is_empty());
+            }
         });
     }
 

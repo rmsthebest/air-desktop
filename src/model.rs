@@ -80,6 +80,53 @@ pub fn next_unread(chats: &[ChatSummary], current: Option<usize>, forward: bool)
     None
 }
 
+/// Moves a message cursor by `delta`, clamped to the list. With no cursor,
+/// any movement starts at the newest (last) message, which is where the
+/// view is scrolled to.
+pub fn move_cursor(len: usize, cursor: Option<usize>, delta: isize) -> Option<usize> {
+    let last = len.checked_sub(1)?;
+    Some(match cursor {
+        None => last,
+        Some(ix) => ix.saturating_add_signed(delta).min(last),
+    })
+}
+
+/// Back/forward history of opened chats (Helix's jumplist: `ctrl-o`/`ctrl-i`).
+#[derive(Debug, Default)]
+pub struct JumpList {
+    entries: Vec<ChatId>,
+    /// Index of the current entry; meaningless while `entries` is empty.
+    pos: usize,
+}
+
+impl JumpList {
+    const MAX: usize = 100;
+
+    /// Records a newly opened chat, dropping any forward history.
+    pub fn push(&mut self, id: ChatId) {
+        if self.entries.get(self.pos) == Some(&id) {
+            return;
+        }
+        self.entries.truncate(self.pos + 1);
+        self.entries.push(id);
+        if self.entries.len() > Self::MAX {
+            self.entries.remove(0);
+        }
+        self.pos = self.entries.len() - 1;
+    }
+
+    pub fn back(&mut self) -> Option<ChatId> {
+        self.pos = self.pos.checked_sub(1)?;
+        self.entries.get(self.pos).cloned()
+    }
+
+    pub fn forward(&mut self) -> Option<ChatId> {
+        let next = self.entries.get(self.pos + 1)?.clone();
+        self.pos += 1;
+        Some(next)
+    }
+}
+
 /// Chat-list timestamp: time today, "Yesterday", weekday within a week,
 /// otherwise the date.
 pub fn format_activity(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -293,6 +340,50 @@ mod tests {
         // The current chat alone being unread is not a target.
         assert_eq!(next_unread(&chats[..2], Some(1), true), None);
         assert_eq!(next_unread(&[], None, true), None);
+    }
+
+    #[test]
+    fn move_cursor_clamps_and_starts_at_newest() {
+        assert_eq!(move_cursor(0, None, 1), None);
+        assert_eq!(move_cursor(5, None, -1), Some(4));
+        assert_eq!(move_cursor(5, None, 1), Some(4));
+        assert_eq!(move_cursor(5, Some(4), 1), Some(4));
+        assert_eq!(move_cursor(5, Some(1), -10), Some(0));
+        assert_eq!(move_cursor(5, Some(1), 2), Some(3));
+        // A cursor left past the end (list shrank) is pulled back in.
+        assert_eq!(move_cursor(3, Some(7), 0), Some(2));
+    }
+
+    #[test]
+    fn jump_list_back_forward_and_branching() {
+        let id = |s: &str| ChatId(s.to_string().into());
+        let mut jumps = JumpList::default();
+        assert_eq!(jumps.back(), None);
+        jumps.push(id("a"));
+        jumps.push(id("b"));
+        jumps.push(id("b")); // re-opening the current chat is not a jump
+        jumps.push(id("c"));
+        assert_eq!(jumps.back(), Some(id("b")));
+        assert_eq!(jumps.back(), Some(id("a")));
+        assert_eq!(jumps.back(), None);
+        assert_eq!(jumps.forward(), Some(id("b")));
+        // A new jump from the middle discards forward history.
+        jumps.push(id("d"));
+        assert_eq!(jumps.forward(), None);
+        assert_eq!(jumps.back(), Some(id("b")));
+    }
+
+    #[test]
+    fn jump_list_is_bounded() {
+        let mut jumps = JumpList::default();
+        for ix in 0..250 {
+            jumps.push(ChatId(ix.to_string().into()));
+        }
+        let mut steps = 0;
+        while jumps.back().is_some() {
+            steps += 1;
+        }
+        assert_eq!(steps, JumpList::MAX - 1);
     }
 
     #[test]

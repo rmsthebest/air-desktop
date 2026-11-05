@@ -40,6 +40,13 @@
     }
   },
   {
+    "context": "CommandLine",
+    "bindings": {
+      "tab": "air::CommandComplete",
+      "escape": "air::CommandCancel"
+    }
+  },
+  {
     "context": "Conversation",
     "bindings": {
       "escape": "air::FocusChatList"

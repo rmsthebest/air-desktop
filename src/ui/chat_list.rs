@@ -9,6 +9,7 @@ use gpui_kit::{
 
 use crate::actions::{SelectNext, SelectPrev};
 use crate::model::{ChatId, ChatSummary, format_activity, next_unread, step_index};
+use crate::ui::key_context;
 use crate::ui::widgets::{avatar, badge};
 
 pub enum ChatListEvent {
@@ -180,7 +181,7 @@ impl Render for ChatList {
         let theme = cx.theme();
 
         v_flex()
-            .key_context("ChatList")
+            .key_context(key_context("ChatList", cx))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.step(true, cx)))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.step(false, cx)))

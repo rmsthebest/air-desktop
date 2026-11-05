@@ -9,15 +9,18 @@
 
 use std::rc::Rc;
 
-use gpui::{Action, AnyElement, AppContext as _, SharedString, WeakEntity, Window};
+use gpui::{
+    Action, AnyElement, AppContext as _, AsKeystroke as _, SharedString, WeakEntity, Window,
+};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{App, IntoElement, div, px};
 
-use crate::actions::{self, FocusChatList, OpenChatAt, SelectNext, SelectPrev};
+use crate::actions;
 use crate::model::{ChatId, ChatSummary};
+use crate::settings::{KeymapMode, SettingsStore};
 use crate::theme;
 use crate::ui::{Workspace, show_error};
 
@@ -34,13 +37,21 @@ struct Section {
 
 /// Called from the workspace's own action handler, so it receives the chats
 /// instead of reading the workspace (which is mid-update).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    All,
+    Chats,
+    Themes,
+}
+
 pub fn open_palette(
+    scope: Scope,
     chats: Vec<ChatSummary>,
     workspace: WeakEntity<Workspace>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let sections = Rc::new(vec![
+    let mut sections = vec![
         Section {
             label: "Chats",
             entries: chats
@@ -62,7 +73,13 @@ pub fn open_palette(
             label: "Themes",
             entries: theme::available(cx).into_iter().map(Entry::Theme).collect(),
         },
-    ]);
+    ];
+    sections.retain(|section| match scope {
+        Scope::All => true,
+        Scope::Chats => section.label == "Chats",
+        Scope::Themes => section.label == "Themes",
+    });
+    let sections = Rc::new(sections);
 
     let state = cx.new(|cx| CommandState::new(window, cx));
     let palette_state = state.clone();
@@ -138,56 +155,160 @@ fn command_row(
         .into_any_element()
 }
 
-/// Read-only overview of the bindings, grouped by where they apply.
+/// Read-only overview of the active bindings, read from the live keymap so
+/// it always matches (including user overrides), grouped by where they apply.
 pub fn show_shortcuts(window: &mut Window, cx: &mut App) {
-    window.open_dialog(cx, |dialog, window, cx| {
+    let rows = Rc::new(shortcut_rows(cx));
+    window.open_dialog(cx, move |dialog, _, cx| {
         let theme = cx.theme();
-        let mut rows: Vec<(&'static str, SharedString, Box<dyn Action>, &'static str)> =
-            actions::commands()
-                .into_iter()
-                .map(|cmd| ("Anywhere", cmd.label, cmd.action, cmd.context))
-                .collect();
-        rows.push((
-            "Anywhere",
-            "Open chat 1–9".into(),
-            Box::new(OpenChatAt { index: 0 }),
-            "Workspace",
-        ));
-        rows.push((
-            "Chat list",
-            "Next chat".into(),
-            Box::new(SelectNext),
-            "ChatList",
-        ));
-        rows.push((
-            "Chat list",
-            "Previous chat".into(),
-            Box::new(SelectPrev),
-            "ChatList",
-        ));
-        rows.push((
-            "Conversation",
-            "Back to chat list".into(),
-            Box::new(FocusChatList),
-            "Conversation",
-        ));
-
-        let mut list = v_flex().gap_1();
+        let mut list = v_flex().gap_0p5();
         let mut current_group = "";
-        for (group, label, action, context) in rows {
-            if group != current_group {
-                current_group = group;
+        for row in rows.iter() {
+            if row.group != current_group {
+                current_group = row.group;
                 list = list.child(
                     div()
                         .pt_3()
                         .pb_1()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(group),
+                        .child(row.group),
                 );
             }
-            list = list.child(command_row(label, &*action, context, window));
+            list = list.child(
+                h_flex()
+                    .justify_between()
+                    .gap_4()
+                    .child(row.label.clone())
+                    .child(
+                        div()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(row.keys.clone()),
+                    ),
+            );
         }
-        dialog.title("Keyboard shortcuts").w(px(520.)).child(list)
+        dialog.title("Keyboard shortcuts").w(px(520.)).child(
+            div()
+                .id("shortcuts")
+                .max_h(px(560.))
+                .overflow_y_scroll()
+                .child(list),
+        )
     });
+}
+
+struct ShortcutRow {
+    group: &'static str,
+    keys: String,
+    label: String,
+}
+
+const GROUPS: [&str; 7] = [
+    "Anywhere",
+    "Chat list",
+    "Messages",
+    "Composer",
+    "Conversation",
+    "Command line",
+    "Other",
+];
+
+fn shortcut_rows(cx: &App) -> Vec<ShortcutRow> {
+    let helix = SettingsStore::get(cx).keymap_mode == KeymapMode::Helix;
+    let os = cx.platform_info().os;
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    // Later bindings win, so walk backwards and keep the first of each
+    // (keys, context) pair; an unbinding hides what it shadows.
+    for binding in keymap.bindings().rev() {
+        let context = binding
+            .predicate()
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        let keys = binding
+            .keystrokes()
+            .iter()
+            .map(|k| k.as_keystroke().unparse(os))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !seen.insert((keys.clone(), context.clone())) {
+            continue;
+        }
+        let action = binding.action();
+        if gpui::is_no_action(action) || !action.name().starts_with("air::") {
+            continue;
+        }
+        if context.contains("helix") && !helix {
+            continue;
+        }
+        let group = if context.contains("ChatList") {
+            "Chat list"
+        } else if context.contains("MessageList") {
+            "Messages"
+        } else if context.contains("Composer") {
+            "Composer"
+        } else if context.contains("CommandLine") {
+            "Command line"
+        } else if context.contains("Conversation") {
+            "Conversation"
+        } else if context.is_empty() || context.contains("Workspace") {
+            "Anywhere"
+        } else {
+            "Other"
+        };
+        rows.push(ShortcutRow {
+            group,
+            keys,
+            label: actions::label(action),
+        });
+    }
+    rows.reverse();
+    rows.sort_by_key(|row| GROUPS.iter().position(|group| *group == row.group));
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+
+    use super::*;
+    use crate::keymap;
+    use crate::settings::Settings;
+
+    #[gpui::test]
+    fn shortcut_rows_follow_mode_and_user_overrides(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("keymap.json");
+        std::fs::write(
+            &user,
+            r#"[{ "context": "Workspace", "bindings": { "alt-down": null } }]"#,
+        )
+        .unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            SettingsStore::init(None, Settings::default(), cx);
+            assert_eq!(keymap::load(Some(&user), cx), Vec::<String>::new());
+
+            let keys = |cx: &App| -> Vec<String> {
+                shortcut_rows(cx).into_iter().map(|row| row.keys).collect()
+            };
+            let standard = keys(cx);
+            assert!(standard.iter().any(|k| k == "alt-up"));
+            assert!(
+                !standard.iter().any(|k| k == "alt-down"),
+                "unbound key listed"
+            );
+            assert!(
+                !standard.iter().any(|k| k == "space f"),
+                "helix key in standard mode"
+            );
+
+            SettingsStore::update(cx, |s| s.keymap_mode = KeymapMode::Helix).unwrap();
+            assert!(keys(cx).iter().any(|k| k == "space f"));
+        });
+    }
 }

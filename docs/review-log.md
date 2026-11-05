@@ -120,10 +120,12 @@ Fixed:
   later batch.
 
 Deferred:
-- **`Session` batching test with an ephemeral `CoreUser`.** Upstream's
-  `test_utils` are `cfg(test)` inside `aircoreclient` and not exported. The
-  batching is covered indirectly by the e2e test and the worker tests.
-  Revisit if a fake core is introduced.
+- **`Session` batching test with an ephemeral `CoreUser`.** `aircoreclient`
+  has a `test_utils` feature that could enable this as a dev-dependency
+  feature. It changes core internals in test builds, so it gets its own
+  step: milestone 5, where message paging needs a local core anyway. Until
+  then the batching is covered indirectly by the e2e test and the worker
+  tests.
 - The core's broadcast silently drops notifications on lag (it logs, but
   doesn't tell subscribers). Our overflow flag only covers our own buffer.
   An upstream issue, noted for the record.

@@ -1126,4 +1126,40 @@ mod tests {
         });
         assert_eq!(clipboard(cx), Some(expected));
     }
+
+    /// The newest message marked as read, and the open chat's newest.
+    fn read_state(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> (Option<String>, Option<String>) {
+        workspace.read_with(cx, |workspace, cx| {
+            let conversation = workspace.conversation.read(cx);
+            let messages = conversation.messages_entity().unwrap().read(cx);
+            let read = messages.read_until().map(|id| id.0.to_string());
+            let newest = messages.messages().last().map(|m| m.id.0.to_string());
+            (read, newest)
+        })
+    }
+
+    #[gpui::test]
+    fn only_messages_shown_in_an_active_window_are_seen(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.update(|window, _| window.activate_window());
+        cx.simulate_keystrokes("alt-down");
+        cx.run_until_parked();
+        let (read, newest) = read_state(&workspace, cx);
+        assert!(newest.is_some());
+        assert_eq!(read, newest, "a short chat is seen in full on opening");
+
+        // In the background, nothing counts as seen until the window is
+        // back in front.
+        cx.deactivate_window();
+        cx.simulate_keystrokes("alt-down");
+        cx.run_until_parked();
+        let (read, newest) = read_state(&workspace, cx);
+        assert_eq!(read, None);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(read_state(&workspace, cx).0, newest);
+    }
 }

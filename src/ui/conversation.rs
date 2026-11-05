@@ -6,12 +6,16 @@
 //!
 //! The history is virtualized and pages in more as it nears either end. It
 //! marks the chat as read as messages come into view, but only while the
-//! window is active, so read receipts never claim more than was seen.
+//! window is active, so read receipts never claim more than was seen. What
+//! is in view is measured from the drawn items themselves (see `Probes`).
 
+use std::cell::RefCell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
-    ClipboardItem, EventEmitter, FollowMode, KeyContext, ListAlignment, ListState, SharedString,
+    Bounds, ClipboardItem, EventEmitter, FollowMode, KeyContext, ListAlignment, ListOffset,
+    ListState, Pixels, SharedString, canvas,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
@@ -52,6 +56,9 @@ pub struct Conversation {
     chat: Option<ChatSummary>,
     messages: Option<Entity<Messages>>,
     list: ListState,
+    probes: Rc<RefCell<Probes>>,
+    /// The messages in view, as of the last drawn frame.
+    shown: Option<Shown>,
     /// Message under the normal-mode cursor.
     cursor: Option<usize>,
     /// Focus of the message list (normal mode).
@@ -59,6 +66,37 @@ pub struct Conversation {
     composer: Entity<TextareaState>,
     _messages_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The part of the history in view.
+#[derive(Debug, Clone, PartialEq)]
+struct Shown {
+    range: Range<usize>,
+    /// How far the first one starts above the top of the list.
+    first_offset: Pixels,
+}
+
+/// Where each message was drawn this frame, collected while the list draws
+/// and turned into a [`Shown`] right after. The list itself only reports
+/// what it shows on wheel scrolls.
+#[derive(Default)]
+struct Probes {
+    drawn: Vec<(usize, Bounds<Pixels>)>,
+    shown: Option<Shown>,
+}
+
+impl Probes {
+    fn shown(drawn: &[(usize, Bounds<Pixels>)], viewport: Bounds<Pixels>) -> Option<Shown> {
+        let visible = drawn.iter().filter(|(_, bounds)| {
+            bounds.bottom() > viewport.top() && bounds.top() < viewport.bottom()
+        });
+        let (first, first_bounds) = visible.clone().min_by_key(|(ix, _)| *ix)?;
+        let (last, _) = visible.max_by_key(|(ix, _)| *ix)?;
+        Some(Shown {
+            range: *first..last + 1,
+            first_offset: viewport.top() - first_bounds.top(),
+        })
+    }
 }
 
 impl EventEmitter<ConversationEvent> for Conversation {}
@@ -81,11 +119,6 @@ impl Conversation {
         // Stays at the newest message as new ones arrive, unless the user
         // scrolled up.
         list.set_follow_mode(FollowMode::Tail);
-        let this = cx.weak_entity();
-        list.set_scroll_handler(move |event, window, cx| {
-            let range = event.visible_range.clone();
-            _ = this.update(cx, |this, cx| this.scrolled(range, window, cx));
-        });
         let subscriptions = vec![
             cx.subscribe_in(
                 &composer,
@@ -97,12 +130,17 @@ impl Conversation {
                 },
             ),
             // Coming back to the window is seeing what it shows.
-            cx.observe_window_activation(window, |this, window, cx| this.check_seen(window, cx)),
+            cx.observe_window_activation(window, |this, window, cx| {
+                let shown = this.shown.clone();
+                this.shown_changed(shown, window, cx)
+            }),
         ];
         Self {
             chat: None,
             messages: None,
             list,
+            probes: Rc::default(),
+            shown: None,
             cursor: None,
             focus_handle: cx.focus_handle(),
             composer,
@@ -124,26 +162,57 @@ impl Conversation {
     ) {
         self.list.reset(messages.read(cx).messages().len());
         self._messages_subscription =
-            Some(
-                cx.subscribe_in(&messages, window, |this, _, event, window, cx| {
-                    match event {
-                        MessagesEvent::Spliced { old, count } => {
-                            this.list.splice(old.clone(), *count);
-                            this.clamp_cursor(cx);
-                        }
-                        MessagesEvent::ScrolledToBottom => this.list.scroll_to_end(),
+            Some(cx.subscribe_in(&messages, window, |this, _, event, _, cx| {
+                match event {
+                    MessagesEvent::Opened => this.scroll_to_start(cx),
+                    MessagesEvent::Spliced { old, count, paged } => {
+                        this.splice(old.clone(), *count, *paged)
                     }
-                    cx.notify();
-                    // After layout, so the list knows what it shows.
-                    cx.on_next_frame(window, |this, window, cx| this.check_seen(window, cx));
-                }),
-            );
+                    MessagesEvent::ScrolledToBottom => this.list.scroll_to_end(),
+                }
+                cx.notify();
+            }));
+        let loaded = messages.read(cx).is_loaded();
         self.chat = Some(chat);
         self.messages = Some(messages);
         self.cursor = None;
-        self.list.scroll_to_end();
-        cx.on_next_frame(window, |this, window, cx| this.check_seen(window, cx));
+        self.shown = None;
+        self.probes.borrow_mut().shown = None;
+        if loaded {
+            self.scroll_to_start(cx);
+        }
         cx.notify();
+    }
+
+    /// Where a chat opens: at the unread divider, else at the newest.
+    fn scroll_to_start(&mut self, cx: &App) {
+        let first_unread = self
+            .messages
+            .as_ref()
+            .and_then(|messages| messages.read(cx).first_unread());
+        match first_unread {
+            Some(ix) => self.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.),
+            }),
+            None => self.list.scroll_to_end(),
+        }
+    }
+
+    fn splice(&mut self, old: Range<usize>, count: usize, paged: bool) {
+        let append = old.is_empty() && old.start == self.list.item_count();
+        if append && paged && self.list.is_following_tail() {
+            // Paged in below the bottom of the view: stay on what is shown
+            // rather than following the tail to the end of the new page.
+            if let Some(shown) = &self.shown {
+                self.list.scroll_to(ListOffset {
+                    item_ix: shown.range.start,
+                    offset_in_item: shown.first_offset,
+                });
+            }
+        }
+        self.list.splice(old.clone(), count);
+        self.cursor = self.cursor.and_then(|ix| shift(ix, &old, count));
     }
 
     /// The open chat's summary changed; its messages stay as they are.
@@ -155,6 +224,7 @@ impl Conversation {
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.chat = None;
         self.messages = None;
+        self.shown = None;
         self._messages_subscription = None;
         self.list.reset(0);
         self.cursor = None;
@@ -184,6 +254,11 @@ impl Conversation {
             Some(messages) => messages.read(cx).messages(),
             None => &[],
         }
+    }
+
+    #[cfg(test)]
+    pub fn messages_entity(&self) -> Option<&Entity<Messages>> {
+        self.messages.as_ref()
     }
 
     #[cfg(test)]
@@ -218,37 +293,60 @@ impl Conversation {
         cx.emit(ConversationEvent::Send(text));
     }
 
-    /// Pages in more near either end, and marks what is in view as seen.
-    fn scrolled(&mut self, visible: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(messages) = self.messages.clone() else {
+    /// What is in view changed (or the window was activated): pages in
+    /// more near either end, and marks the newest message in view as seen.
+    fn shown_changed(&mut self, shown: Option<Shown>, window: &mut Window, cx: &mut Context<Self>) {
+        self.shown = shown.clone();
+        let (Some(shown), Some(messages)) = (shown, self.messages.clone()) else {
             return;
         };
-        let len = messages.read(cx).messages().len();
-        if visible.start < PAGE_AHEAD {
-            messages.read(cx).load_older();
-        }
-        if visible.end + PAGE_AHEAD >= len {
-            messages.read(cx).load_newer();
-        }
-        if window.is_window_active()
-            && let Some(newest) = visible.end.checked_sub(1)
-        {
-            messages.update(cx, |messages, cx| messages.seen(newest, cx));
-        }
+        let active = window.is_window_active();
+        messages.update(cx, |messages, cx| {
+            if shown.range.start < PAGE_AHEAD {
+                messages.load_older();
+            }
+            if shown.range.end + PAGE_AHEAD >= messages.messages().len() {
+                messages.load_newer();
+            }
+            if active {
+                messages.seen(shown.range.end - 1, cx);
+            }
+        });
     }
 
-    /// Marks the newest message seen when the list shows it.
-    fn check_seen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(messages) = self.messages.clone() else {
-            return;
-        };
-        let len = messages.read(cx).messages().len();
-        if window.is_window_active()
-            && self.list.is_scrolled_to_end() == Some(true)
-            && let Some(newest) = len.checked_sub(1)
-        {
-            messages.update(cx, |messages, cx| messages.seen(newest, cx));
-        }
+    /// Notes where message `ix` is drawn; see [`Probes`].
+    fn probe(&self, ix: usize) -> impl IntoElement {
+        let probes = self.probes.clone();
+        canvas(
+            move |bounds, _, _| probes.borrow_mut().drawn.push((ix, bounds)),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+    }
+
+    /// Runs after the list has drawn: works out what is in view and
+    /// reports a change once the frame is drawn.
+    fn probe_results(&self, cx: &Context<Self>) -> impl IntoElement {
+        let probes = self.probes.clone();
+        let list = self.list.clone();
+        let this = cx.weak_entity();
+        canvas(
+            move |_, window, cx| {
+                let mut probes = probes.borrow_mut();
+                let drawn = std::mem::take(&mut probes.drawn);
+                let shown = Probes::shown(&drawn, list.viewport_bounds());
+                if shown != probes.shown {
+                    probes.shown = shown.clone();
+                    window.defer(cx, move |window, cx| {
+                        _ = this.update(cx, |this, cx| this.shown_changed(shown, window, cx));
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_0()
     }
 
     fn move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -259,25 +357,10 @@ impl Conversation {
     fn set_cursor(&mut self, cursor: Option<usize>, cx: &mut Context<Self>) {
         self.cursor = cursor;
         if let Some(ix) = cursor {
+            // Revealing it pages in more, as scrolling does.
             self.list.scroll_to_reveal_item(ix);
-            if let Some(messages) = &self.messages {
-                // The cursor pages too, as scrolling does.
-                let messages = messages.read(cx);
-                if ix < PAGE_AHEAD {
-                    messages.load_older();
-                }
-                if ix + PAGE_AHEAD >= messages.messages().len() {
-                    messages.load_newer();
-                }
-            }
         }
         cx.notify();
-    }
-
-    /// Keeps the cursor on a message when the window shrinks under it.
-    fn clamp_cursor(&mut self, cx: &App) {
-        let len = self.messages(cx).len();
-        self.cursor = self.cursor.and_then(|ix| move_cursor(len, Some(ix), 0));
     }
 
     fn cursor_message<'a>(&self, cx: &'a App) -> Option<&'a Message> {
@@ -338,8 +421,10 @@ impl Conversation {
                 .child(div().flex_1().h(px(1.)).bg(theme.border))
         };
         v_flex()
+            .relative()
             .w_full()
             .items_center()
+            .child(self.probe(ix))
             .when(starts_day(messages, ix), |item| {
                 item.child(divider(
                     format_day(message.sent_at, chrono::Utc::now()),
@@ -504,6 +589,21 @@ impl Conversation {
     }
 }
 
+/// Where the message at `ix` is after the messages in `old` were replaced
+/// by `count` others; `None` if it was one of them.
+fn shift(ix: usize, old: &Range<usize>, count: usize) -> Option<usize> {
+    if old.end <= ix {
+        Some(ix - old.len() + count)
+    } else if ix < old.start {
+        Some(ix)
+    } else if old.len() == count {
+        // Edited in place.
+        Some(ix)
+    } else {
+        None
+    }
+}
+
 /// Every link in a message, in order of appearance, without repeats.
 fn links(message: &Message) -> Vec<SharedString> {
     fn collect(blocks: &[Block], out: &mut Vec<SharedString>) {
@@ -624,7 +724,8 @@ impl Render for Conversation {
                     .flex_1()
                     .min_h_0()
                     .children(status)
-                    .child(history),
+                    .child(history)
+                    .child(self.probe_results(cx)),
             )
             .child(
                 div()
@@ -659,6 +760,60 @@ mod tests {
     use super::*;
     use crate::model::{MessageId, UserId};
 
+    #[gpui::test]
+    fn a_chat_opens_at_its_unread_divider(cx: &mut gpui::TestAppContext) {
+        let (window, conversation) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::settings::SettingsStore::open(None, cx);
+            crate::theme::init(None, cx).unwrap();
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| Conversation::new(window, cx))
+            })
+            .unwrap()
+        });
+        let cx = gpui::VisualTestContext::from_window(window, cx).into_mut();
+        cx.update(|window, _| window.activate_window());
+        let start = Utc::now() - chrono::Duration::hours(1);
+        let history: Vec<_> = (0..200)
+            .map(|n| {
+                let sender = (UserId("u".into()), "Ada".into(), false);
+                let id = MessageId(format!("m{n}").into());
+                let at = start + chrono::Duration::seconds(n);
+                Message::text(id, sender, &format!("message {n}"), at)
+            })
+            .collect();
+        let messages =
+            cx.new(|_| Messages::fixed(history).with_first_unread(MessageId("m120".into())));
+        let chat = crate::model::mock::chats().remove(0);
+        conversation.update_in(cx, |conversation, window, cx| {
+            conversation.show(chat, messages.clone(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let shown = conversation.read_with(cx, |c, _| c.shown.clone()).unwrap();
+        assert_eq!(shown.range.start, 120, "the divider tops the view");
+        // Only what is in view counts as read, not the rest below it.
+        let read = messages.read_with(cx, |m, _| m.read_until().cloned());
+        let expected = format!("m{}", shown.range.end - 1);
+        assert_eq!(read.map(|id| id.0.to_string()), Some(expected));
+        assert!(shown.range.end < 200);
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_message_across_splices() {
+        // Older messages paged in above it.
+        assert_eq!(shift(5, &(0..0), 64), Some(69));
+        // The oldest dropped from the window.
+        assert_eq!(shift(69, &(0..64), 0), Some(5));
+        // Newer ones appended, or a message below it removed.
+        assert_eq!(shift(5, &(10..10), 64), Some(5));
+        assert_eq!(shift(5, &(7..8), 0), Some(5));
+        // Its own message: patched stays, removed goes.
+        assert_eq!(shift(5, &(5..6), 1), Some(5));
+        assert_eq!(shift(5, &(5..6), 0), None);
+        assert_eq!(shift(5, &(0..10), 3), None);
+    }
+
     #[test]
     fn open_links_offers_every_link_once_including_nested_ones() {
         let source = "[a](https://a.example) and [again](https://a.example)\n\n\
@@ -670,8 +825,8 @@ mod tests {
         assert_eq!(
             links(&message),
             [
-                "https://a.example",
-                "https://b.example",
+                "https://a.example/",
+                "https://b.example/",
                 "mailto:c@example.com"
             ]
         );

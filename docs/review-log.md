@@ -158,3 +158,50 @@ Fixed anyway:
   `chats_leave_when_gone_or_out_of_the_order`), plus zalgo, blank-name, a
   peer named "You" and the duplicate jumplist cases. Corrected the gate 5
   e2e coverage claim.
+
+## Gate 6 — milestone 5, conversation (`834d137..d341300`): BLOCK
+
+Fixed:
+- **Mark as read never fired (high).** It relied on
+  `ListState::is_scrolled_to_end`, which is `None` for short chats and
+  while items are unmeasured, and on the scroll handler, which only fires
+  for wheel scrolls. Now every drawn message records its bounds, and a probe
+  after the list works out what is in view each frame. A change pages in
+  more and marks the newest visible message seen if the window is active,
+  as does window activation. Tests:
+  `only_messages_shown_in_an_active_window_are_seen` and
+  `a_chat_opens_at_its_unread_divider`.
+- **Quadratic highlight flattening (medium).** Styled runs are built
+  disjoint, sorted and merged while parsing, with links folded in as a style,
+  so drawing is linear. Test: `styled_runs_stay_disjoint_and_linear_in_the_input`.
+- **Link confirmation could hide the host (medium).** Targets are parsed and
+  normalized with `url`: punycode hosts, escaped paths, ASCII only. What
+  opens is exactly what the dialog shows. Web links with a user name are
+  refused. The dialog leads with the host, keeping its end, then the whole
+  target, shortened in the middle. Test: `link_labels_show_where_links_really_go`.
+- **Didn't open at the divider (medium).** The view scrolls the divider to
+  the top once the first messages arrive. Pages appended while newer
+  messages are still unloaded pin the view instead of following the tail.
+  Only what is in view is marked.
+- **Cursor drifted across splices (medium).** The cursor shifts with each
+  splice, and drops if its message goes. Test:
+  `the_cursor_stays_on_its_message_across_splices`.
+- **Paging requests piled up (medium).** One request per direction is in
+  flight at a time; the flag clears on the next window update.
+- **Merged Add|Update dropped (medium).** Any change to a message in the
+  window reloads it, Add included.
+- **Lows.**
+  - An empty heading no longer turns the next paragraph into one.
+  - Closing a chat within the debounce still marks what was seen, on drop.
+  - Equal timestamps are told apart by id.
+  - `push` asserts it's only used on fixed messages.
+  - The initial load retries with backoff.
+
+Deferred:
+- **Worker `changed()` paths without a server** (Add|Update on a loaded
+  message, an own message clearing the divider, a sender rename). These need
+  an ephemeral `CoreUser` via the core `test_utils` feature. Milestone 6 adds
+  sending, which drives Add/Update of own messages end to end, so this goes
+  in with it, together with the `Session` batching test from gate 5.
+- **A Replace keeps the index, not the message, in view** (overflow reload
+  in place). Rare (a lagging broadcast). Revisit with the e2e for sending.

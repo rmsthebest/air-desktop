@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aircommon::identifiers::UserId as CoreUserId;
+use aircommon::utils::FibonacciBackoff;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::{DbEntityId, DbOperation};
 use aircoreclient::{
@@ -41,8 +42,16 @@ const COMMANDS_BUFFER: usize = 8;
 const UPDATES_BUFFER: usize = 8;
 
 pub enum MessagesEvent {
-    /// The messages in `old` were replaced by `count` new ones.
-    Spliced { old: Range<usize>, count: usize },
+    /// The first messages arrived: show the unread divider, or the newest.
+    Opened,
+    /// The messages in `old` were replaced by `count` new ones. `paged`:
+    /// they were paged in, not just sent, so the view shouldn't jump to
+    /// them.
+    Spliced {
+        old: Range<usize>,
+        count: usize,
+        paged: bool,
+    },
     /// The user asked for the newest messages: show them.
     ScrolledToBottom,
 }
@@ -54,6 +63,11 @@ pub struct Messages {
     first_unread: Option<MessageId>,
     loaded: bool,
     error: Option<SharedString>,
+    /// A page was asked for and hasn't arrived: don't ask again.
+    loading_older: bool,
+    loading_newer: bool,
+    /// Seen up to here (and marked as read, or about to be, when live).
+    read_until: Option<(DateTime<Utc>, MessageId)>,
     live: Option<Live>,
 }
 
@@ -63,12 +77,31 @@ struct Live {
     chat: CoreChatId,
     commands: mpsc::Sender<Command>,
     pending: Arc<Pending>,
-    /// Marked (or scheduled to be marked) as read up to here.
-    read_until: Option<DateTime<Utc>>,
+    /// Seen, but not yet marked (the debounce is running).
+    unmarked: Option<CoreMessageId>,
     mark_task: Option<Task<()>>,
+    tokio: tokio::runtime::Handle,
     _worker: TokioTask<()>,
     _receive: Task<()>,
     _subscription: Subscription,
+}
+
+impl Live {
+    /// Marks what was seen as read now. Not cancelled once started:
+    /// marking and its receipts belong together.
+    fn flush(&mut self) {
+        if let Some(until) = self.unmarked.take() {
+            self.tokio
+                .spawn(mark_as_read(self.user.clone(), self.chat, until));
+        }
+    }
+}
+
+impl Drop for Live {
+    /// Closing the chat within the debounce still marks what was seen.
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 impl EventEmitter<MessagesEvent> for Messages {}
@@ -83,6 +116,9 @@ impl Messages {
             first_unread: None,
             loaded: true,
             error: None,
+            loading_older: false,
+            loading_newer: false,
+            read_until: None,
             live: None,
         }
     }
@@ -121,8 +157,9 @@ impl Messages {
             chat,
             commands: commands_tx,
             pending,
-            read_until: None,
+            unmarked: None,
             mark_task: None,
+            tokio: Tokio::handle(cx),
             _subscription: subscription,
         };
         Self {
@@ -150,17 +187,31 @@ impl Messages {
         self.messages.iter().position(|message| &message.id == id)
     }
 
+    /// Fixed messages with an unread divider before `first_unread`.
+    #[cfg(test)]
+    pub fn with_first_unread(self, first_unread: MessageId) -> Self {
+        Self {
+            first_unread: Some(first_unread),
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    pub fn read_until(&self) -> Option<&MessageId> {
+        self.read_until.as_ref().map(|(_, id)| id)
+    }
+
     /// Asks for the page before the oldest loaded message, if there is one.
-    pub fn load_older(&self) {
-        if self.has_older {
-            self.command(Command::LoadOlder);
+    pub fn load_older(&mut self) {
+        if self.has_older && !self.loading_older {
+            self.loading_older = self.command(Command::LoadOlder);
         }
     }
 
     /// Asks for the page after the newest loaded message, if there is one.
-    pub fn load_newer(&self) {
-        if self.has_newer {
-            self.command(Command::LoadNewer);
+    pub fn load_newer(&mut self) {
+        if self.has_newer && !self.loading_newer {
+            self.loading_newer = self.command(Command::LoadNewer);
         }
     }
 
@@ -173,47 +224,52 @@ impl Messages {
         }
     }
 
-    fn command(&self, command: Command) {
-        // A full queue already has work that will update the window; the
-        // view asks again on its next scroll.
-        if let Some(live) = &self.live {
-            _ = live.commands.try_send(command);
-        }
+    /// Whether the command was queued. A full queue already has work that
+    /// will update the window; the view asks again when it changes.
+    fn command(&self, command: Command) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.commands.try_send(command).is_ok())
     }
 
     /// The user has seen the message at `ix` (the newest visible one, in an
     /// active window). Marks the chat as read up to it, debounced.
     pub fn seen(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let (Some(live), Some(message)) = (&mut self.live, self.messages.get(ix)) else {
+        let Some(message) = self.messages.get(ix) else {
             return;
         };
-        if live
-            .read_until
-            .is_some_and(|until| until >= message.sent_at)
-        {
+        let covered = self.read_until.as_ref().is_some_and(|(at, id)| {
+            *at > message.sent_at || (*at == message.sent_at && *id == message.id)
+        });
+        if covered {
             return;
         }
-        let Some(until) = core_message_id(&message.id) else {
+        self.read_until = Some((message.sent_at, message.id.clone()));
+        let (Some(live), Some(until)) = (&mut self.live, core_message_id(&message.id)) else {
             return;
         };
-        live.read_until = Some(message.sent_at);
-        let (user, chat) = (live.user.clone(), live.chat);
+        live.unmarked = Some(until);
         // A newer message seen within the debounce replaces this one.
-        live.mark_task = Some(cx.spawn(async move |_, cx| {
+        live.mark_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(MARK_AS_READ_DEBOUNCE).await;
-            // Not cancelled from here on: marking and its receipts belong
-            // together.
-            _ = cx.update(|cx| Tokio::handle(cx).spawn(mark_as_read(user, chat, until)));
+            _ = this.update(cx, |this, _| {
+                if let Some(live) = &mut this.live {
+                    live.flush();
+                }
+            });
         }));
     }
 
     /// Appends a message locally (the mock echo of a send).
     pub fn push(&mut self, message: Message, cx: &mut Context<Self>) {
+        // The worker owns a live window: a local insert would desync it.
+        debug_assert!(self.live.is_none(), "push is for fixed messages");
         let at = self.messages.len();
         self.messages.push(message);
         cx.emit(MessagesEvent::Spliced {
             old: at..at,
             count: 1,
+            paged: false,
         });
         cx.notify();
     }
@@ -221,16 +277,22 @@ impl Messages {
     fn update(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
             Update::Window(window) => {
+                // While newer messages are still unloaded, anything that
+                // arrives already existed.
+                let paged = self.has_newer;
                 for change in window.changes {
                     let (old, count) = change.apply(&mut self.messages);
-                    cx.emit(MessagesEvent::Spliced { old, count });
+                    cx.emit(MessagesEvent::Spliced { old, count, paged });
                 }
                 self.has_older = window.has_older;
                 self.has_newer = window.has_newer;
                 if let Some(first_unread) = window.first_unread {
                     self.first_unread = first_unread;
                 }
-                self.loaded = true;
+                if !self.loaded {
+                    self.loaded = true;
+                    cx.emit(MessagesEvent::Opened);
+                }
                 self.error = None;
                 if window.scroll_to_bottom {
                     cx.emit(MessagesEvent::ScrolledToBottom);
@@ -238,6 +300,9 @@ impl Messages {
             }
             Update::Failed(message) => self.error = Some(message.into()),
         }
+        // Whatever was asked for has been answered.
+        self.loading_older = false;
+        self.loading_newer = false;
         cx.notify();
     }
 }
@@ -385,6 +450,8 @@ struct Window {
     keys: Vec<Key>,
     has_older: bool,
     has_newer: bool,
+    /// Loaded at least once.
+    loaded: bool,
 }
 
 impl Window {
@@ -406,6 +473,7 @@ impl Window {
         self.keys = keys;
         self.has_older = has_older;
         self.has_newer = has_newer;
+        self.loaded = true;
         vec![Change::Replace(items)]
     }
 
@@ -499,8 +567,14 @@ pub(super) fn start(
 
 impl Worker {
     async fn run(mut self, mut commands: mpsc::Receiver<Command>, pending: Arc<Pending>) {
-        if self.initial_load().await.is_err() {
-            return;
+        let mut backoff = FibonacciBackoff::default();
+        while !self.window.loaded {
+            if self.initial_load().await.is_err() {
+                return;
+            }
+            if !self.window.loaded {
+                tokio::time::sleep(backoff.next_backoff()).await;
+            }
         }
         loop {
             let result = tokio::select! {
@@ -643,20 +717,8 @@ impl Worker {
                 DbEntityId::Message(id) if ops.contains(DbOperation::Remove) => {
                     edits.extend(self.window.remove(id));
                 }
-                DbEntityId::Message(id) if ops.contains(DbOperation::Add) => {
-                    if self.window.position(id).is_some() {
-                        continue;
-                    }
-                    match self.user.message(*id).await {
-                        Ok(Some(message)) if message.chat_id() == self.chat => {
-                            new_messages = true;
-                            // Writing in the chat is engaging with it.
-                            own_new_message |= !message.is_sent();
-                        }
-                        Ok(_) => {}
-                        Err(err) => error!("failed to load a new message: {err:#}"),
-                    }
-                }
+                // Loaded already (an Add merged with an Update, or paged in
+                // since): reload it, whatever happened.
                 DbEntityId::Message(id) if self.window.position(id).is_some() => {
                     match self.user.message(*id).await {
                         Ok(Some(message)) => {
@@ -665,6 +727,17 @@ impl Worker {
                         }
                         Ok(None) => edits.extend(self.window.remove(id)),
                         Err(err) => error!("failed to reload a message: {err:#}"),
+                    }
+                }
+                DbEntityId::Message(id) if ops.contains(DbOperation::Add) => {
+                    match self.user.message(*id).await {
+                        Ok(Some(message)) if message.chat_id() == self.chat => {
+                            new_messages = true;
+                            // Writing in the chat is engaging with it.
+                            own_new_message |= !message.is_sent();
+                        }
+                        Ok(_) => {}
+                        Err(err) => error!("failed to load a new message: {err:#}"),
                     }
                 }
                 DbEntityId::User(user) if self.names.remove(user).is_some() => {

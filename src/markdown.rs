@@ -38,6 +38,8 @@ pub enum Block {
 }
 
 /// A run of text with styled ranges and links (byte ranges into `text`).
+/// The styled ranges are sorted, disjoint and merged where adjacent ones
+/// match, so drawing them is linear in their number.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Inline {
     pub text: String,
@@ -51,16 +53,63 @@ pub struct Style {
     pub italic: bool,
     pub strike: bool,
     pub code: bool,
+    /// Part of a link the user may open.
+    pub link: bool,
 }
 
-/// A link destination the user may open, or `None` for anything else
-/// (`javascript:`, `file:`, `data:`, relative paths…).
-pub fn link_target(url: &str) -> Option<SharedString> {
-    let (scheme, rest) = url.trim().split_once(':')?;
-    let allowed = ["http", "https", "mailto"]
-        .iter()
-        .any(|allowed| scheme.eq_ignore_ascii_case(allowed));
-    (allowed && !rest.is_empty()).then(|| url.trim().to_string().into())
+/// A link destination the user may open, normalized (ASCII only: punycode
+/// host, escaped path) so what the confirmation shows is what opens. `None`
+/// for other schemes (`javascript:`, `file:`, `data:`, relative paths…) and
+/// for web links with a user name, which can pose as a host
+/// (`https://bank.example@evil.example`).
+pub fn link_target(raw: &str) -> Option<SharedString> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    let allowed = match url.scheme() {
+        "http" | "https" => {
+            url.host_str().is_some_and(|host| !host.is_empty())
+                && url.username().is_empty()
+                && url.password().is_none()
+        }
+        "mailto" => !url.path().is_empty(),
+        _ => false,
+    };
+    allowed.then(|| url.as_str().to_string().into())
+}
+
+/// How a link target (from [`link_target`]) is shown before it opens:
+/// where it goes (a web link's host, or a mail address), keeping its end,
+/// which names the site; and the whole target, shortened in the middle.
+pub fn link_label(target: &str) -> (String, String) {
+    const DESTINATION: usize = 64;
+    const FULL: usize = 96;
+    let destination = match url::Url::parse(target) {
+        Ok(url) if url.scheme() == "mailto" => url.path().to_string(),
+        Ok(url) => url.host_str().unwrap_or_default().to_string(),
+        Err(_) => String::new(),
+    };
+    (keep_end(&destination, DESTINATION), keep_ends(target, FULL))
+}
+
+/// `text` cut to at most `max` chars, keeping its end.
+fn keep_end(text: &str, max: usize) -> String {
+    let len = text.chars().count();
+    if len <= max {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(len - (max - 1)).collect();
+    format!("…{tail}")
+}
+
+/// `text` cut to at most `max` chars, keeping its start and end.
+fn keep_ends(text: &str, max: usize) -> String {
+    let len = text.chars().count();
+    if len <= max {
+        return text.to_string();
+    }
+    let half = (max - 1) / 2;
+    let head: String = text.chars().take(half).collect();
+    let tail: String = text.chars().skip(len - half).collect();
+    format!("{head}…{tail}")
 }
 
 enum Container {
@@ -108,10 +157,12 @@ impl Builder {
 
     /// Ends the open run of text, if any, as a paragraph or heading.
     fn close_inline(&mut self) {
+        // A heading ends here even when it had no text.
+        let heading = std::mem::take(&mut self.heading);
         if let Some(inline) = self.inline.take()
             && !inline.text.trim().is_empty()
         {
-            let block = if std::mem::take(&mut self.heading) {
+            let block = if heading {
                 Block::Heading(inline)
             } else {
                 Block::Paragraph(inline)
@@ -125,11 +176,21 @@ impl Builder {
             code.push_str(text);
             return;
         }
+        let style = Style {
+            link: matches!(self.link, Some((_, Some(_)))),
+            ..style
+        };
         let inline = self.inline.get_or_insert_with(Inline::default);
         let start = inline.text.len();
         inline.text.push_str(text);
-        if style != Style::default() {
-            inline.styles.push((start..inline.text.len(), style));
+        let end = inline.text.len();
+        if style == Style::default() || start == end {
+            return;
+        }
+        // Text arrives in order, so the ranges stay sorted and disjoint.
+        match inline.styles.last_mut() {
+            Some((last, last_style)) if last.end == start && *last_style == style => last.end = end,
+            _ => inline.styles.push((start..end, style)),
         }
     }
 
@@ -340,11 +401,31 @@ mod tests {
                         ..Style::default()
                     }
                 ),
+                (
+                    "site",
+                    Style {
+                        link: true,
+                        ..Style::default()
+                    }
+                ),
             ]
         );
         assert_eq!(inline.links.len(), 1);
         assert_eq!(text_of(&inline.links[0].0), "site");
-        assert_eq!(inline.links[0].1, "https://air.ms");
+        assert_eq!(inline.links[0].1, "https://air.ms/");
+    }
+
+    #[test]
+    fn styled_runs_stay_disjoint_and_linear_in_the_input() {
+        // Nested and adjacent styles: one run per change of style.
+        let inline = paragraph("**a *b* c**d");
+        let runs: Vec<_> = inline.styles.iter().map(|(r, _)| r.clone()).collect();
+        assert_eq!(runs, [0..2, 2..3, 3..5]);
+        // Hostile input yields at most a run per styled span.
+        let spans = 4_000;
+        let inline = paragraph(&"*a* ".repeat(spans));
+        assert!(inline.styles.len() <= spans);
+        assert!(inline.styles.windows(2).all(|w| w[0].0.end <= w[1].0.start));
     }
 
     #[test]
@@ -357,16 +438,43 @@ mod tests {
             "/relative",
             "air.ms",
             "https:",
+            // A user name can pose as the host.
+            "https://bank.example@evil.example/",
         ] {
             let inline = paragraph(&format!("[click]({url})"));
             assert_eq!(inline.text, "click");
             assert!(inline.links.is_empty(), "{url} became a link");
         }
-        assert!(link_target("HTTPS://air.ms").is_some());
+        assert_eq!(link_target("HTTPS://air.ms").unwrap(), "https://air.ms/");
         assert!(link_target("mailto:ada@air.ms").is_some());
         // Autolinks go through the same check.
         assert_eq!(paragraph("<https://air.ms>").links.len(), 1);
         assert!(paragraph("<javascript:alert(1)>").links.is_empty());
+    }
+
+    #[test]
+    fn link_labels_show_where_links_really_go() {
+        // Look-alike letters show as punycode, in the target that opens too.
+        let target = link_target("https://аpple.example/").unwrap();
+        assert_eq!(link_label(&target).0, "xn--pple-43d.example");
+        // A long host keeps its end, which names the site.
+        let long = format!("https://bank.example.{}.evil.example/x", "a".repeat(300));
+        let (host, full) = link_label(&link_target(&long).unwrap());
+        assert!(host.ends_with(".evil.example"), "{host}");
+        assert!(full.starts_with("https://bank.example.") && full.ends_with("/x"));
+        assert!(full.chars().count() <= 96);
+        // Invisible characters can't hide in what is shown.
+        let target = link_target("https://air.ms/a\u{200B}b").unwrap();
+        assert!(target.is_ascii());
+        assert_eq!(link_label("mailto:ada@air.ms").0, "ada@air.ms");
+    }
+
+    #[test]
+    fn a_heading_without_text_leaves_the_next_paragraph_alone() {
+        assert!(matches!(
+            parse("#\n\nplain").blocks.as_slice(),
+            [Block::Paragraph(_)]
+        ));
     }
 
     #[test]

@@ -10,8 +10,7 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px};
 
-use crate::markdown::{Block, Inline, Markdown};
-use crate::model::preview_line;
+use crate::markdown::{Block, Inline, Markdown, link_label};
 
 /// Renders `markdown`; `id` must be unique among rendered messages.
 pub fn render(markdown: &Markdown, id: SharedString, cx: &App) -> AnyElement {
@@ -86,38 +85,25 @@ fn blocks(blocks: &[Block], id: &SharedString, counter: &mut usize, cx: &App) ->
 
 fn inline(text: &Inline, id: &SharedString, counter: &mut usize, cx: &App) -> AnyElement {
     let theme = cx.theme();
-    let mut highlights: Vec<_> = text
-        .styles
-        .iter()
-        .map(|(range, style)| {
-            let highlight = HighlightStyle {
-                font_weight: style.bold.then_some(FontWeight::BOLD),
-                font_style: style.italic.then_some(FontStyle::Italic),
-                strikethrough: style.strike.then(|| StrikethroughStyle {
-                    thickness: px(1.),
-                    ..Default::default()
-                }),
-                background_color: style.code.then(|| theme.muted.opacity(0.6)),
+    // The runs are already sorted and disjoint (see `Inline`).
+    let highlights = text.styles.iter().map(|(range, style)| {
+        let highlight = HighlightStyle {
+            color: style.link.then_some(theme.link),
+            font_weight: style.bold.then_some(FontWeight::BOLD),
+            font_style: style.italic.then_some(FontStyle::Italic),
+            strikethrough: style.strike.then(|| StrikethroughStyle {
+                thickness: px(1.),
                 ..Default::default()
-            };
-            (range.clone(), highlight)
-        })
-        .collect();
-    let link_style = HighlightStyle {
-        color: Some(theme.link),
-        underline: Some(UnderlineStyle {
-            thickness: px(1.),
+            }),
+            underline: style.link.then(|| UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
+            background_color: style.code.then(|| theme.muted.opacity(0.6)),
             ..Default::default()
-        }),
-        ..Default::default()
-    };
-    highlights.extend(
-        text.links
-            .iter()
-            .map(|(range, _)| (range.clone(), link_style)),
-    );
-    // Highlights must be sorted and not overlap; links win over styles.
-    let highlights = flatten(highlights);
+        };
+        (range.clone(), highlight)
+    });
     let styled = StyledText::new(text.text.clone()).with_highlights(highlights);
     *counter += 1;
     if text.links.is_empty() {
@@ -138,47 +124,30 @@ fn inline(text: &Inline, id: &SharedString, counter: &mut usize, cx: &App) -> An
         .into_any_element()
 }
 
-/// Splits overlapping highlights into sorted, disjoint ranges, merging the
-/// styles that cover each piece (later ones win per field).
-fn flatten(
-    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
-) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
-    let mut bounds: Vec<usize> = highlights
-        .iter()
-        .flat_map(|(range, _)| [range.start, range.end])
-        .collect();
-    bounds.sort_unstable();
-    bounds.dedup();
-    bounds
-        .windows(2)
-        .filter_map(|piece| {
-            let (start, end) = (piece[0], piece[1]);
-            let mut covering = highlights
-                .iter()
-                .filter(|(range, _)| range.start <= start && end <= range.end)
-                .map(|(_, style)| *style)
-                .peekable();
-            covering.peek()?;
-            let merged = covering.fold(HighlightStyle::default(), |merged, style| {
-                merged.highlight(style)
-            });
-            Some((start..end, merged))
-        })
-        .collect()
-}
-
-/// Asks before opening links from a message, showing each destination
-/// (cleaned of invisible characters, so it can't pose as another).
+/// Asks before opening links from a message, showing where each one goes:
+/// its host (or mail address) first, then the whole target. Targets are
+/// normalized ASCII (see [`link_target`]), so what is shown is what opens.
+///
+/// [`link_target`]: crate::markdown::link_target
 pub fn confirm_open(targets: Vec<SharedString>, window: &mut Window, cx: &mut App) {
     if targets.is_empty() {
         return;
     }
-    window.open_dialog(cx, move |dialog, _, _| {
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let muted = cx.theme().muted_foreground;
         let buttons = targets.iter().enumerate().map(|(ix, target)| {
+            let (destination, full) = link_label(target);
             let target = target.clone();
             Button::new(("open-link", ix))
                 .ghost()
-                .label(preview_line(&target))
+                .h_auto()
+                .py_1()
+                .child(
+                    v_flex()
+                        .items_start()
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(destination))
+                        .child(div().text_xs().text_color(muted).child(full)),
+                )
                 .on_click(move |_, window, cx| {
                     window.close_dialog(cx);
                     cx.open_url(&target);
@@ -193,29 +162,4 @@ pub fn confirm_open(targets: Vec<SharedString>, window: &mut Window, cx: &mut Ap
             .w(px(520.))
             .child(v_flex().gap_1().children(buttons))
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn overlapping_highlights_become_disjoint_and_sorted() {
-        let bold = HighlightStyle {
-            font_weight: Some(FontWeight::BOLD),
-            ..Default::default()
-        };
-        let italic = HighlightStyle {
-            font_style: Some(FontStyle::Italic),
-            ..Default::default()
-        };
-        let flat = flatten(vec![(0..10, bold), (4..6, italic)]);
-        let ranges: Vec<_> = flat.iter().map(|(range, _)| range.clone()).collect();
-        assert_eq!(ranges, [0..4, 4..6, 6..10]);
-        assert_eq!(flat[1].1, bold.highlight(italic));
-        // Gaps between highlights stay unstyled.
-        let flat = flatten(vec![(0..2, bold), (5..7, bold)]);
-        let ranges: Vec<_> = flat.iter().map(|(range, _)| range.clone()).collect();
-        assert_eq!(ranges, [0..2, 5..7]);
-    }
 }

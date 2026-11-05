@@ -1,0 +1,48 @@
+[
+  {
+    "bindings": {
+      "secondary-q": "air::Quit"
+    }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "secondary-k": "air::OpenPalette",
+      "secondary-/": "air::ShowShortcuts",
+      "alt-down": "air::NextChat",
+      "alt-up": "air::PrevChat",
+      "ctrl-tab": "air::NextChat",
+      "ctrl-shift-tab": "air::PrevChat",
+      "alt-shift-down": "air::NextUnreadChat",
+      "alt-shift-up": "air::PrevUnreadChat",
+      "secondary-l": "air::FocusConversation",
+      "secondary-i": "air::ToggleDetails",
+      "secondary-shift-t": "air::ToggleAppearance",
+      "secondary-1": ["air::OpenChatAt", { "index": 0 }],
+      "secondary-2": ["air::OpenChatAt", { "index": 1 }],
+      "secondary-3": ["air::OpenChatAt", { "index": 2 }],
+      "secondary-4": ["air::OpenChatAt", { "index": 3 }],
+      "secondary-5": ["air::OpenChatAt", { "index": 4 }],
+      "secondary-6": ["air::OpenChatAt", { "index": 5 }],
+      "secondary-7": ["air::OpenChatAt", { "index": 6 }],
+      "secondary-8": ["air::OpenChatAt", { "index": 7 }],
+      "secondary-9": ["air::OpenChatAt", { "index": 8 }]
+    }
+  },
+  {
+    "context": "ChatList",
+    "bindings": {
+      "j": "air::SelectNext",
+      "k": "air::SelectPrev",
+      "down": "air::SelectNext",
+      "up": "air::SelectPrev",
+      "enter": "air::FocusConversation"
+    }
+  },
+  {
+    "context": "Conversation",
+    "bindings": {
+      "escape": "air::FocusChatList"
+    }
+  }
+]

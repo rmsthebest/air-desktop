@@ -1,9 +1,14 @@
 //! Main pane: header, message history and composer for the open chat.
 
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{ActiveTheme as _, IconName, Selectable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, Context, FontWeight, IntoElement, Render, Window, div, px};
+use gpui_kit::{
+    AnyElement, App, Context, FocusHandle, Focusable, FontWeight, IntoElement, Render,
+    ScrollHandle, Window, div, px,
+};
 
+use crate::actions::ToggleDetails;
 use crate::model::{ChatSummary, Message, format_message_time, starts_group};
 use crate::ui::widgets::avatar;
 
@@ -11,13 +16,29 @@ use crate::ui::widgets::avatar;
 /// monitors.
 const MAX_CONTENT_WIDTH: f32 = 760.;
 
-#[derive(Default)]
 pub struct Conversation {
     chat: Option<ChatSummary>,
     messages: Vec<Message>,
+    focus_handle: FocusHandle,
+    scroll_handle: ScrollHandle,
+}
+
+impl Focusable for Conversation {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl Conversation {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            chat: None,
+            messages: Vec::new(),
+            focus_handle: cx.focus_handle(),
+            scroll_handle: ScrollHandle::new(),
+        }
+    }
+
     pub fn chat(&self) -> Option<&ChatSummary> {
         self.chat.as_ref()
     }
@@ -25,6 +46,7 @@ impl Conversation {
     pub fn show(&mut self, chat: ChatSummary, messages: Vec<Message>, cx: &mut Context<Self>) {
         self.chat = Some(chat);
         self.messages = messages;
+        self.scroll_handle.scroll_to_bottom();
         cx.notify();
     }
 
@@ -99,22 +121,23 @@ impl Conversation {
 }
 
 impl Render for Conversation {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus_handle.is_focused(window);
+        let details_open = crate::settings::SettingsStore::get(cx).details_open;
         let theme = cx.theme();
+        let root = v_flex()
+            .key_context("Conversation")
+            .track_focus(&self.focus_handle)
+            .size_full();
         let Some(chat) = &self.chat else {
-            return v_flex()
-                .size_full()
-                .bg(theme.background)
-                .child(self.render_empty(cx));
+            return root.bg(theme.background).child(self.render_empty(cx));
         };
 
         let messages: Vec<_> = (0..self.messages.len())
             .map(|ix| self.render_message(ix, cx))
             .collect();
 
-        v_flex()
-            .size_full()
-            .bg(theme.background)
+        root.bg(theme.background)
             .child(
                 h_flex()
                     .flex_none()
@@ -126,8 +149,19 @@ impl Render for Conversation {
                     .child(avatar(&chat.title, px(30.), cx))
                     .child(
                         div()
+                            .flex_1()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(chat.title.clone()),
+                    )
+                    .child(
+                        Button::new("toggle-details")
+                            .icon(IconName::PanelRight)
+                            .ghost()
+                            .selected(details_open)
+                            .tooltip_with_action("Details", &ToggleDetails, Some("Workspace"))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(ToggleDetails), cx)
+                            }),
                     ),
             )
             .child(
@@ -135,6 +169,7 @@ impl Render for Conversation {
                     .id("message-scroll")
                     .flex_1()
                     .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
                     .child(
                         v_flex()
                             .mx_auto()
@@ -156,7 +191,7 @@ impl Render for Conversation {
                         .rounded(theme.radius_lg)
                         .bg(theme.popover)
                         .border_1()
-                        .border_color(theme.border)
+                        .border_color(if focused { theme.ring } else { theme.border })
                         .shadow_sm()
                         .text_color(theme.muted_foreground)
                         .child(format!("Message {}", chat.title)),

@@ -17,6 +17,11 @@ airapiclient = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c56
 
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+directories = "6"
+# Must match gpui's schemars major: the Action derive implements its trait.
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -27,6 +32,7 @@ unicode-segmentation = "1"
 # pins conflict; enable test support on the underlying gpui-pre crates instead.
 gpui-pre = { version = "=0.3.11", features = ["test-support"] }
 gpui-pre-platform = { version = "=0.3.11", features = ["test-support"] }
+tempfile = "3"
 
 # Mirrors the [patch] sections of the pinned Air workspace (patches do not
 # propagate to dependents). Keep in sync when bumping the Air rev.

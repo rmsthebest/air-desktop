@@ -3,10 +3,12 @@
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    Context, EventEmitter, FontWeight, IntoElement, Render, SharedString, Window, div, px,
+    Context, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, Render, ScrollHandle,
+    SharedString, Window, div, px,
 };
 
-use crate::model::{ChatId, ChatSummary, format_activity};
+use crate::actions::{SelectNext, SelectPrev};
+use crate::model::{ChatId, ChatSummary, format_activity, next_unread, step_index};
 use crate::ui::widgets::{avatar, badge};
 
 pub enum ChatListEvent {
@@ -15,36 +17,81 @@ pub enum ChatListEvent {
 
 pub struct ChatList {
     chats: Vec<ChatSummary>,
+    /// The open chat. Selecting a chat opens it; there is no separate
+    /// highlight, so keyboard and mouse always agree on what is shown.
     selected: Option<ChatId>,
+    focus_handle: FocusHandle,
+    scroll_handle: ScrollHandle,
 }
 
 impl EventEmitter<ChatListEvent> for ChatList {}
 
+impl Focusable for ChatList {
+    fn focus_handle(&self, _: &gpui_kit::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl ChatList {
-    pub fn new(chats: Vec<ChatSummary>) -> Self {
+    pub fn new(chats: Vec<ChatSummary>, cx: &mut Context<Self>) -> Self {
         Self {
             chats,
             selected: None,
+            focus_handle: cx.focus_handle(),
+            scroll_handle: ScrollHandle::new(),
         }
+    }
+
+    pub fn chats(&self) -> &[ChatSummary] {
+        &self.chats
     }
 
     pub fn chat(&self, id: &ChatId) -> Option<&ChatSummary> {
         self.chats.iter().find(|chat| &chat.id == id)
     }
 
+    pub fn selected_index(&self) -> Option<usize> {
+        let selected = self.selected.as_ref()?;
+        self.chats.iter().position(|chat| &chat.id == selected)
+    }
+
+    /// Opens `id`. Emits [`ChatListEvent::Opened`] only when the open chat
+    /// actually changes.
     pub fn open(&mut self, id: ChatId, cx: &mut Context<Self>) {
         if self.selected.as_ref() == Some(&id) {
             return;
+        }
+        if let Some(ix) = self.chats.iter().position(|chat| chat.id == id) {
+            self.scroll_handle.scroll_to_item(ix);
         }
         self.selected = Some(id.clone());
         cx.emit(ChatListEvent::Opened(id));
         cx.notify();
     }
 
+    pub fn open_at(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chats.get(ix) {
+            self.open(chat.id.clone(), cx);
+        }
+    }
+
+    pub fn step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(ix) = step_index(self.chats.len(), self.selected_index(), forward) {
+            self.open_at(ix, cx);
+        }
+    }
+
+    pub fn step_unread(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(ix) = next_unread(&self.chats, self.selected_index(), forward) {
+            self.open_at(ix, cx);
+        }
+    }
+
     fn render_row(
         &self,
         ix: usize,
         chat: &ChatSummary,
+        focused: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -63,12 +110,19 @@ impl ChatList {
             .border_color(gpui_kit::transparent_black())
             .when(selected, |row| {
                 row.bg(theme.list_active)
-                    .border_color(theme.list_active_border)
+                    .border_color(if focused {
+                        theme.ring
+                    } else {
+                        theme.list_active_border
+                    })
                     .shadow_xs()
             })
             .when(!selected, |row| row.hover(|row| row.bg(theme.list_hover)))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| this.open(id.clone(), cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.focus_handle.focus(window, cx);
+                this.open(id.clone(), cx);
+            }))
             .child(avatar(&chat.title, px(40.), cx))
             .child(
                 v_flex()
@@ -113,16 +167,21 @@ impl ChatList {
 }
 
 impl Render for ChatList {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus_handle.is_focused(window);
         let rows: Vec<_> = self
             .chats
             .iter()
             .enumerate()
-            .map(|(ix, chat)| self.render_row(ix, chat, cx).into_any_element())
+            .map(|(ix, chat)| self.render_row(ix, chat, focused, cx).into_any_element())
             .collect();
         let theme = cx.theme();
 
         v_flex()
+            .key_context("ChatList")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.step(true, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.step(false, cx)))
             .size_full()
             .bg(theme.sidebar)
             .child(
@@ -141,6 +200,7 @@ impl Render for ChatList {
                     .gap_0p5()
                     .pb_2()
                     .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
                     .children(rows),
             )
     }

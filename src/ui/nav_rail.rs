@@ -1,21 +1,23 @@
-//! Narrow left rail: primary destinations and global toggles.
+//! Narrow left rail. Every button dispatches an action, so each one has the
+//! same keyboard equivalent shown in its tooltip.
 
+use gpui::Action;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, IconName, Selectable as _, v_flex};
 use gpui_kit::prelude::*;
-use gpui_kit::{App, ClickEvent, IntoElement, Window, px};
+use gpui_kit::{App, IntoElement, div, px};
+
+use crate::actions::{FocusChatList, OpenPalette, ShowShortcuts, ToggleAppearance};
+use crate::settings::Appearance;
 
 pub const RAIL_WIDTH: f32 = 56.;
 
-pub fn nav_rail(
-    on_toggle_theme: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    cx: &App,
-) -> impl IntoElement {
+pub fn nav_rail(appearance: Appearance, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
-    let theme_icon = if theme.is_dark() {
-        IconName::Sun
-    } else {
-        IconName::Moon
+    let (appearance_icon, appearance_label) = match appearance {
+        Appearance::System => (IconName::Palette, "Appearance: system"),
+        Appearance::Light => (IconName::Sun, "Appearance: light"),
+        Appearance::Dark => (IconName::Moon, "Appearance: dark"),
     };
     v_flex()
         .flex_none()
@@ -27,35 +29,37 @@ pub fn nav_rail(
         .bg(theme.sidebar)
         .border_r_1()
         .border_color(theme.sidebar_border)
-        .child(
-            Button::new("nav-chats")
-                .icon(IconName::Inbox)
-                .ghost()
-                .selected(true)
-                .tooltip("Chats"),
-        )
-        .child(
-            Button::new("nav-contacts")
-                .icon(IconName::CircleUser)
-                .ghost()
-                .tooltip("Contacts"),
-        )
-        .child(div_spacer())
-        .child(
-            Button::new("nav-theme")
-                .icon(theme_icon)
-                .ghost()
-                .tooltip("Toggle light/dark")
-                .on_click(on_toggle_theme),
-        )
-        .child(
-            Button::new("nav-settings")
-                .icon(IconName::Settings)
-                .ghost()
-                .tooltip("Settings"),
-        )
+        .child(rail_button("nav-chats", IconName::Inbox, "Chats", FocusChatList).selected(true))
+        .child(rail_button(
+            "nav-palette",
+            IconName::Search,
+            "Command palette",
+            OpenPalette,
+        ))
+        .child(div().flex_1())
+        .child(rail_button(
+            "nav-appearance",
+            appearance_icon,
+            appearance_label,
+            ToggleAppearance,
+        ))
+        .child(rail_button(
+            "nav-shortcuts",
+            IconName::Info,
+            "Keyboard shortcuts",
+            ShowShortcuts,
+        ))
 }
 
-fn div_spacer() -> impl IntoElement {
-    gpui_kit::div().flex_1()
+fn rail_button(
+    id: &'static str,
+    icon: IconName,
+    label: &'static str,
+    action: impl Action,
+) -> Button {
+    Button::new(id)
+        .icon(icon)
+        .ghost()
+        .tooltip_with_action(label, &action, Some("Workspace"))
+        .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
 }

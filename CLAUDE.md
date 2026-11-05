@@ -23,7 +23,22 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 - `src/session/` (milestone 3+) — ports of upstream `applogic` cubits as GPUI
   entities. Views never touch `aircoreclient` directly.
 - `src/ui/` — views. Render state, dispatch actions; no business logic.
-- `src/theme.rs`, `assets/themes/*.json` — gpui-component JSON themes.
+- `src/theme.rs`, `assets/themes/*.json` — gpui-component JSON themes; user
+  themes from `<config>/themes/*.json`, read at startup (gpui-component's
+  watcher drops string-loaded themes on reload, so it isn't used).
+- `src/actions.rs`, `assets/keymaps/default.json`, `src/keymap.rs` — every
+  command is an `air::` action; defaults and `<config>/keymap.json` share one
+  loader (`null` unbinds; bad entries are warnings, never fatal).
+- `src/settings.rs` — `<config>/settings.json` (`SettingsStore` global).
+- Config dir: XDG (`~/.config/air-desktop`), override with
+  `AIR_DESKTOP_CONFIG_DIR`.
+
+## GPUI gotchas seen here
+- Dialogs (palette) render outside the workspace tree: actions dispatched
+  from inside never reach workspace handlers. Close the dialog, then dispatch.
+- An action handler runs inside its entity's update: don't `read` that
+  entity again from code it calls (panics). Pass data in instead.
+- Entity events are delivered after the current update, not synchronously.
 
 ## Commands
 - `just check` — fmt check, clippy `-D warnings`, tests.

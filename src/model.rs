@@ -49,6 +49,37 @@ pub fn starts_group(messages: &[Message], ix: usize) -> bool {
     }
 }
 
+/// Index one step from `current` in a list of `len`, wrapping around. With
+/// no current item, forward starts at the top and backward at the bottom.
+pub fn step_index(len: usize, current: Option<usize>, forward: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match (current, forward) {
+        (None, true) => 0,
+        (None, false) => len - 1,
+        (Some(ix), true) => (ix + 1) % len,
+        (Some(ix), false) => (ix + len - 1) % len,
+    })
+}
+
+/// The nearest other chat with unread messages in the given direction,
+/// wrapping around.
+pub fn next_unread(chats: &[ChatSummary], current: Option<usize>, forward: bool) -> Option<usize> {
+    let mut ix = current;
+    for _ in 0..chats.len() {
+        ix = step_index(chats.len(), ix, forward);
+        let candidate = ix?;
+        if Some(candidate) == current {
+            break;
+        }
+        if chats[candidate].unread > 0 {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Chat-list timestamp: time today, "Yesterday", weekday within a week,
 /// otherwise the date.
 pub fn format_activity(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -230,6 +261,38 @@ mod tests {
             .map(|ix| starts_group(&messages, ix))
             .collect();
         assert_eq!(groups, [true, false, true, true, false]);
+    }
+
+    #[test]
+    fn step_index_wraps_both_ways() {
+        assert_eq!(step_index(0, None, true), None);
+        assert_eq!(step_index(3, None, true), Some(0));
+        assert_eq!(step_index(3, None, false), Some(2));
+        assert_eq!(step_index(3, Some(2), true), Some(0));
+        assert_eq!(step_index(3, Some(0), false), Some(2));
+    }
+
+    #[test]
+    fn next_unread_skips_read_and_current_chats() {
+        let chats: Vec<_> = [0, 3, 0, 1, 0]
+            .into_iter()
+            .enumerate()
+            .map(|(ix, unread)| ChatSummary {
+                id: ChatId(ix.to_string().into()),
+                title: "chat".into(),
+                is_group: false,
+                last_message: None,
+                last_activity: Utc::now(),
+                unread,
+            })
+            .collect();
+        assert_eq!(next_unread(&chats, None, true), Some(1));
+        assert_eq!(next_unread(&chats, Some(1), true), Some(3));
+        assert_eq!(next_unread(&chats, Some(3), true), Some(1)); // wraps
+        assert_eq!(next_unread(&chats, Some(1), false), Some(3)); // wraps back
+        // The current chat alone being unread is not a target.
+        assert_eq!(next_unread(&chats[..2], Some(1), true), None);
+        assert_eq!(next_unread(&[], None, true), None);
     }
 
     #[test]

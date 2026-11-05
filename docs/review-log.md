@@ -297,3 +297,34 @@ Fixed anyway:
   draft store then a load and checks the load sees the store. Caveat: that
   only shows the queue works. A regression to unqueued loads would fail it
   only on unlucky timing.
+
+## Gate 8 — milestone 6b, contacts (`c072511..d5a4c21`): BLOCK
+
+Fixed:
+- **Taken username reported as "already yours" (high).** The core's
+  `add_username` also returns `None` when the server says the name belongs to
+  someone else. A local check now decides "already yours"; otherwise the
+  message is "taken". Covered in the two-user e2e test: Bob claims Ada's name.
+- **Ended requests shown as open (medium).** An inactive connection chat is
+  now `Request::Closed`, shown as "ended", with no Accept or Decline
+  (`an_ended_contact_request_is_closed_not_open`). Deleting such a chat is
+  deferred.
+- **Unicode case folding loosened usernames (low).** Input is folded with
+  ASCII rules only; the KELVIN SIGN case is now in the test.
+- **Second contact operation silently dropped (low).** The user is now told
+  that the previous request is still running.
+- **Contact operations aborted with the window (low).** The tokio task is
+  no longer aborted when its caller is dropped, so the core's cleanup
+  always runs.
+- **Tests.** `request_keys_leave_a_normal_chat_alone`: ctrl-enter still
+  sends from a normal chat's composer. It fails if accept doesn't
+  propagate.
+
+Deferred:
+- **The request banner leads with the peer-chosen display name (low).**
+  Upstream does the same, and the chat list's "Request" tag marks it. A
+  later version could show which of the user's usernames the request came
+  through.
+- **Still open from gate 7:** in-flight paging flags, flush on drop,
+  initial-load backoff, `Session` batching, the paged-append view test.
+  The two-user e2e now covers read receipts and a sender rename re-patch.

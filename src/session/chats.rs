@@ -10,7 +10,7 @@ use aircommon::identifiers::UserId;
 use aircommon::utils::FibonacciBackoff;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::DbEntityId;
-use aircoreclient::{Chat, ChatId as CoreChatId, ChatType, MessageId};
+use aircoreclient::{Chat, ChatId as CoreChatId, ChatStatus, ChatType, MessageId};
 use gpui_kit::{AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -305,7 +305,7 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
     let (title, request, is_group) = match &chat.chat_type {
         ChatType::HandleConnection(username) => (
             username.plaintext().to_string(),
-            Some(Request::Outgoing),
+            request(&chat.chat_type, chat.status()),
             false,
         ),
         ChatType::Connection(peer)
@@ -313,12 +313,7 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         | ChatType::PendingConnection(peer) => {
             users.push(peer.clone());
             let name = user.user_profile(peer).await.display_name.to_string();
-            let request = match chat.chat_type {
-                ChatType::Connection(_) => None,
-                ChatType::PendingConnection(_) => Some(Request::Incoming),
-                _ => Some(Request::Outgoing),
-            };
-            (name, request, false)
+            (name, request(&chat.chat_type, chat.status()), false)
         }
         ChatType::Group(attributes) => (attributes.title.clone(), None, true),
     };
@@ -358,6 +353,21 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         users,
     };
     (summary, keys)
+}
+
+/// A connection chat's request state. The core closes a request that
+/// expired or was withdrawn by making the chat inactive (as upstream reads
+/// it).
+fn request(chat_type: &ChatType, status: &ChatStatus) -> Option<Request> {
+    let open = match chat_type {
+        ChatType::Connection(_) | ChatType::Group(_) => return None,
+        ChatType::PendingConnection(_) => Request::Incoming,
+        ChatType::HandleConnection(_) | ChatType::TargetedMessageConnection(_) => Request::Outgoing,
+    };
+    Some(match status {
+        ChatStatus::Inactive(_) => Request::Closed,
+        _ => open,
+    })
 }
 
 pub(super) fn model_id(id: &CoreChatId) -> ChatId {
@@ -467,6 +477,27 @@ impl LocalState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_ended_contact_request_is_closed_not_open() {
+        use aircoreclient::ChatStatus;
+        let user = aircommon::identifiers::UserId::random("localhost".parse().unwrap());
+        let incoming = ChatType::PendingConnection(user.clone());
+        let outgoing = ChatType::TargetedMessageConnection(user.clone());
+        let ended = ChatStatus::inactive(vec![user.clone()]);
+        assert_eq!(
+            request(&incoming, &ChatStatus::Active),
+            Some(Request::Incoming)
+        );
+        assert_eq!(
+            request(&outgoing, &ChatStatus::Pending),
+            Some(Request::Outgoing)
+        );
+        // Neither side can act on an ended request: no Accept, no waiting.
+        assert_eq!(request(&incoming, &ended), Some(Request::Closed));
+        assert_eq!(request(&outgoing, &ended), Some(Request::Closed));
+        assert_eq!(request(&ChatType::Connection(user), &ended), None);
+    }
+
     use uuid::Uuid;
 
     use super::*;

@@ -394,6 +394,16 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     assert!(refused(
         contacts::add_username(ada.clone(), name.clone()).await
     ));
+    // Someone else's username is refused as taken, not as Bob's own.
+    let taken = eventually(
+        "Bob's claim is answered",
+        async || match contacts::add_username(bob.clone(), name.clone()).await {
+            Err(Failure::Shown(message)) => Some(message),
+            _ => None,
+        },
+    )
+    .await;
+    assert!(taken.ends_with("is taken"), "{taken}");
     assert!(refused(
         contacts::add_contact(ada.clone(), name.clone()).await
     ));

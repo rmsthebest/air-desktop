@@ -135,9 +135,14 @@ pub(super) async fn accept_request(user: CoreUser, chat: CoreChatId) -> Result<C
 pub(super) async fn add_username(user: CoreUser, input: String) -> Result<String, Failure> {
     let username = parse_username(&input)?;
     let shown = username.plaintext().to_string();
+    if user.usernames().await?.contains(&username) {
+        return Err(Failure::Shown(format!("{shown} is already yours")));
+    }
+    // The core also returns nothing when the server says the username
+    // belongs to someone else.
     match user.add_username(username).await? {
         Some(_) => Ok(shown),
-        None => Err(Failure::Shown(format!("{shown} is already yours"))),
+        None => Err(Failure::Shown(format!("{shown} is taken"))),
     }
 }
 
@@ -175,9 +180,11 @@ fn on_tokio<T: Send + 'static, F>(
 where
     F: Future<Output = Result<T, Failure>> + Send + 'static,
 {
-    let task = Tokio::spawn(cx, future);
+    // Not aborted with the caller: stopping an operation midway (say, the
+    // window closing) could skip the core's cleanup of a failed request.
+    let task = Tokio::handle(cx).spawn(future);
     async move {
-        match task.await {
+        match task.await.map_err(anyhow::Error::from) {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(Failure::Shown(message))) => Err(message),
             Ok(Err(Failure::Internal(err))) | Err(err) => {
@@ -194,7 +201,10 @@ where
 /// matter, and a leading `@` is allowed.
 fn parse_username(input: &str) -> Result<Username, Failure> {
     let input = input.trim();
-    let input = input.strip_prefix('@').unwrap_or(input).to_lowercase();
+    let input = input
+        .strip_prefix('@')
+        .unwrap_or(input)
+        .to_ascii_lowercase();
     Username::new(input).map_err(|err| {
         Failure::Shown(
             match err {
@@ -359,5 +369,8 @@ mod tests {
         assert!(shown("ada--l").is_err());
         assert!(shown("1adal").is_err());
         assert!(shown("@@adal").is_err());
+        // Unicode case folding would turn look-alikes into real names
+        // (KELVIN SIGN lowercases to "k").
+        assert!(shown("\u{212A}ate-x").is_err());
     }
 }

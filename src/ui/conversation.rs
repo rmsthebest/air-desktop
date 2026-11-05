@@ -1019,6 +1019,10 @@ fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElemen
             ))
             .text_color(theme.muted_foreground),
         ),
+        Request::Closed => card.child(
+            text("This contact request ended without a connection.".into())
+                .text_color(theme.muted_foreground),
+        ),
     };
     div()
         .flex_none()

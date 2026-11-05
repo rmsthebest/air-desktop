@@ -45,6 +45,8 @@ pub enum Request {
     Incoming,
     /// The user asked; waiting for the other side.
     Outgoing,
+    /// Expired or withdrawn without a connection; only a record now.
+    Closed,
 }
 
 /// The line under a chat's title: its draft or its last message.

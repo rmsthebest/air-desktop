@@ -474,6 +474,7 @@ impl Workspace {
             return;
         };
         if self.contact_task.is_some() {
+            show_refusal("Still working on the previous request".into(), window, cx);
             return;
         }
         let operation = start(session.read(cx), cx);
@@ -1113,6 +1114,25 @@ mod tests {
         cx.simulate_keystrokes("escape enter");
         cx.simulate_input("hi");
         assert_eq!(composer_text(&workspace, cx), "hi");
+    }
+
+    #[gpui::test]
+    fn request_keys_leave_a_normal_chat_alone(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let focused = focus_probe(&workspace, cx);
+        cx.simulate_keystrokes("j enter");
+        let title = open_title(&workspace, cx);
+        let count = message_count(&workspace, cx);
+        // Without a request to act on, ctrl-enter reaches the composer's
+        // own binding and sends; declining does nothing.
+        cx.simulate_input("ab");
+        cx.simulate_keystrokes("secondary-enter");
+        assert_eq!(message_count(&workspace, cx), count + 1);
+        cx.simulate_input("cd");
+        cx.simulate_keystrokes("secondary-shift-backspace");
+        assert_eq!(composer_text(&workspace, cx), "cd");
+        assert_eq!(focused(cx), Focus::Composer);
+        assert_eq!(open_title(&workspace, cx), title);
     }
 
     #[gpui::test]

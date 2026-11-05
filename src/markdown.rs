@@ -70,7 +70,14 @@ pub fn link_target(raw: &str) -> Option<SharedString> {
                 && url.username().is_empty()
                 && url.password().is_none()
         }
-        "mailto" => !url.path().is_empty(),
+        // Extra recipients would hide behind the address shown.
+        "mailto" => {
+            let recipients = ["to", "cc", "bcc"];
+            !url.path().is_empty()
+                && !url
+                    .query_pairs()
+                    .any(|(key, _)| recipients.iter().any(|r| key.eq_ignore_ascii_case(r)))
+        }
         _ => false,
     };
     allowed.then(|| url.as_str().to_string().into())
@@ -440,6 +447,8 @@ mod tests {
             "https:",
             // A user name can pose as the host.
             "https://bank.example@evil.example/",
+            // Recipients beyond the one shown.
+            "mailto:ada@air.ms?bcc=eve@evil.example",
         ] {
             let inline = paragraph(&format!("[click]({url})"));
             assert_eq!(inline.text, "click");

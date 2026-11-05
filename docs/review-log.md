@@ -205,3 +205,29 @@ Deferred:
   in with it, together with the `Session` batching test from gate 5.
 - **A Replace keeps the index, not the message, in view** (overflow reload
   in place). Rare (a lagging broadcast). Revisit with the e2e for sending.
+
+## Gate 6b — gate 6 fixes (`d341300..8e54447`): PASS
+
+Fixed anyway:
+- **Partly visible counted as seen (medium).** Paging still looks at every
+  message partly in view, but only the newest one in view in full (or
+  filling the view) is marked as read. Test:
+  `only_messages_in_view_in_full_count_as_seen`.
+- **Retried layout passes.** Probes keep the last bounds per message, so a
+  retried pass can't widen what counts as shown (same test).
+- **Read state with equal timestamps.** Ordered by time, then id, as the
+  core orders messages, so it never moves back. Test:
+  `what_was_seen_never_moves_back`.
+- **Empty window.** Paging older from an empty window (everything loaded
+  was deleted) reloads the bottom.
+- **mailto with extra recipients.** Refused (`to`/`cc`/`bcc` query keys),
+  since they'd hide behind the address shown.
+
+Accepted:
+- **Paging flags clear on any update**, not only on the page that answers.
+  At worst one extra page is fetched; bounded.
+
+Deferred (with milestone 6, needs an ephemeral `CoreUser`):
+- A view test that a paged append pins what's shown.
+- Worker tests: the Add|Update reload, initial-load backoff, the flush on
+  drop, and the in-flight flags.

@@ -238,8 +238,9 @@ impl Messages {
         let Some(message) = self.messages.get(ix) else {
             return;
         };
+        // In the order the core keeps messages: by time, then id.
         let covered = self.read_until.as_ref().is_some_and(|(at, id)| {
-            *at > message.sent_at || (*at == message.sent_at && *id == message.id)
+            (*at, id.0.as_ref()) >= (message.sent_at, message.id.0.as_ref())
         });
         if covered {
             return;
@@ -662,7 +663,8 @@ impl Worker {
 
     async fn load_older(&mut self) -> Result<(), Closed> {
         let Some(oldest) = self.window.keys.first().cloned() else {
-            return Ok(());
+            // Everything loaded was deleted: start over.
+            return self.load_bottom(false).await;
         };
         let before = self
             .user
@@ -951,6 +953,23 @@ mod tests {
         assert_eq!(window.keys.len(), MAX_WINDOW);
         assert!(window.has_older && window.at_bottom());
         assert_eq!(view.last(), Some(&(newest + page - 1)));
+    }
+
+    #[gpui::test]
+    fn what_was_seen_never_moves_back(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let at = Utc::now();
+        let sender = (crate::model::UserId("u".into()), "Ada".into(), false);
+        let message = |id: &str| Message::text(MessageId(id.into()), sender.clone(), "hi", at);
+        // Same time: the core orders them by id.
+        let messages = cx.new(|_| Messages::fixed(vec![message("a"), message("b")]));
+        let read = |cx: &mut gpui::TestAppContext| {
+            messages.read_with(cx, |m, _| m.read_until().map(|id| id.0.to_string()))
+        };
+        messages.update(cx, |m, cx| m.seen(1, cx));
+        assert_eq!(read(cx).as_deref(), Some("b"));
+        messages.update(cx, |m, cx| m.seen(0, cx));
+        assert_eq!(read(cx).as_deref(), Some("b"));
     }
 
     #[test]

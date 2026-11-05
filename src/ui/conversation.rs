@@ -10,6 +10,7 @@
 //! is in view is measured from the drawn items themselves (see `Probes`).
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -71,9 +72,13 @@ pub struct Conversation {
 /// The part of the history in view.
 #[derive(Debug, Clone, PartialEq)]
 struct Shown {
+    /// Messages at least partly in view (what paging looks at).
     range: Range<usize>,
     /// How far the first one starts above the top of the list.
     first_offset: Pixels,
+    /// The newest message seen in full (or filling the view): what may be
+    /// marked as read.
+    seen: Option<usize>,
 }
 
 /// Where each message was drawn this frame, collected while the list draws
@@ -87,14 +92,28 @@ struct Probes {
 
 impl Probes {
     fn shown(drawn: &[(usize, Bounds<Pixels>)], viewport: Bounds<Pixels>) -> Option<Shown> {
-        let visible = drawn.iter().filter(|(_, bounds)| {
+        // The list may lay out more than once per frame; its last pass is
+        // what is drawn.
+        let drawn: BTreeMap<usize, Bounds<Pixels>> = drawn.iter().copied().collect();
+        let mut visible = drawn.iter().filter(|(_, bounds)| {
             bounds.bottom() > viewport.top() && bounds.top() < viewport.bottom()
         });
-        let (first, first_bounds) = visible.clone().min_by_key(|(ix, _)| *ix)?;
-        let (last, _) = visible.max_by_key(|(ix, _)| *ix)?;
+        let (first, first_bounds) = visible.next()?;
+        let last = visible.clone().next_back().map_or(*first, |(ix, _)| *ix);
+        let seen = std::iter::once((first, first_bounds))
+            .chain(visible)
+            .filter(|(_, bounds)| {
+                let in_full = bounds.bottom() <= viewport.bottom() + px(1.);
+                let fills_view =
+                    bounds.top() <= viewport.top() + px(1.) && bounds.bottom() >= viewport.bottom();
+                in_full || fills_view
+            })
+            .map(|(ix, _)| *ix)
+            .max();
         Some(Shown {
             range: *first..last + 1,
             first_offset: viewport.top() - first_bounds.top(),
+            seen,
         })
     }
 }
@@ -308,8 +327,8 @@ impl Conversation {
             if shown.range.end + PAGE_AHEAD >= messages.messages().len() {
                 messages.load_newer();
             }
-            if active {
-                messages.seen(shown.range.end - 1, cx);
+            if active && let Some(seen) = shown.seen {
+                messages.seen(seen, cx);
             }
         });
     }
@@ -794,9 +813,35 @@ mod tests {
         assert_eq!(shown.range.start, 120, "the divider tops the view");
         // Only what is in view counts as read, not the rest below it.
         let read = messages.read_with(cx, |m, _| m.read_until().cloned());
-        let expected = format!("m{}", shown.range.end - 1);
+        let expected = format!("m{}", shown.seen.unwrap());
         assert_eq!(read.map(|id| id.0.to_string()), Some(expected));
         assert!(shown.range.end < 200);
+    }
+
+    #[test]
+    fn only_messages_in_view_in_full_count_as_seen() {
+        let rect = |top: f32, height: f32| Bounds {
+            origin: gpui::point(px(0.), px(top)),
+            size: gpui::size(px(100.), px(height)),
+        };
+        let viewport = rect(0., 100.);
+        // Message 2 only peeks in at the bottom; 3 is below the view.
+        let drawn = [
+            (0, rect(-30., 40.)),
+            (1, rect(10., 50.)),
+            (2, rect(60., 80.)),
+            (3, rect(140., 20.)),
+        ];
+        let shown = Probes::shown(&drawn, viewport).unwrap();
+        assert_eq!(shown.range, 0..3);
+        assert_eq!(shown.seen, Some(1));
+        assert_eq!(shown.first_offset, px(30.));
+        // A retried layout pass: only its (later) bounds count.
+        let retried = [(3, rect(50., 20.)), (3, rect(140., 20.))];
+        assert_eq!(Probes::shown(&retried, viewport), None);
+        // A message taller than the view is seen while it fills it.
+        let tall = Probes::shown(&[(0, rect(-50., 300.))], viewport).unwrap();
+        assert_eq!(tall.seen, Some(0));
     }
 
     #[test]

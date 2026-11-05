@@ -4,6 +4,7 @@ extern crate gpui_kit as gpui;
 mod actions;
 mod command_line;
 mod keymap;
+mod markdown;
 mod model;
 mod paths;
 mod runtime;

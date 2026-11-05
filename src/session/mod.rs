@@ -6,6 +6,8 @@ pub mod account;
 pub mod chats;
 #[cfg(test)]
 mod e2e;
+pub mod messages;
+mod pending;
 mod preview;
 pub mod queue;
 

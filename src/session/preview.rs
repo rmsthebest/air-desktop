@@ -4,8 +4,8 @@
 
 use aircoreclient::clients::CoreUser;
 use aircoreclient::{ChatMessage, EventMessage, Message};
-use mimi_content::MessageStatus;
 use mimi_content::content_container::{Disposition, NestedPart};
+use mimi_content::{MessageStatus, MimiContent};
 use pulldown_cmark::{Event, Options, Parser, TagEnd};
 
 use crate::model::{Prefix, Preview, PreviewKind, name_line, preview_line};
@@ -49,26 +49,31 @@ pub async fn describe(user: &CoreUser, message: &ChatMessage) -> Option<LastMess
                 let name = user.user_profile(sender).await.display_name;
                 Some(name_line(name.as_ref()).to_string())
             };
-            let body = match &content.content().nested_part {
-                NestedPart::SinglePart {
-                    content_type,
-                    content,
-                    ..
-                } if content_type == "text/markdown" => {
-                    Body::Markdown(String::from_utf8_lossy(content).into_owned())
-                }
-                NestedPart::MultiPart {
-                    disposition: Disposition::Attachment,
-                    ..
-                } => Body::Attachment,
-                _ => Body::Unsupported,
-            };
+            let body = body_of(content.content());
             Some(LastMessage::Content { sender_name, body })
         }
         Message::Event(event @ EventMessage::System(_)) => {
             Some(LastMessage::Event(event.string_representation(user).await))
         }
         Message::Event(EventMessage::Error(_)) => None,
+    }
+}
+
+/// What a message's content is, as far as this client can show it.
+pub fn body_of(content: &MimiContent) -> Body {
+    match &content.nested_part {
+        NestedPart::SinglePart {
+            content_type,
+            content,
+            ..
+        } if content_type == "text/markdown" => {
+            Body::Markdown(String::from_utf8_lossy(content).into_owned())
+        }
+        NestedPart::MultiPart {
+            disposition: Disposition::Attachment,
+            ..
+        } => Body::Attachment,
+        _ => Body::Unsupported,
     }
 }
 

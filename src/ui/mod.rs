@@ -3,6 +3,7 @@ mod chat_list;
 mod command_line;
 mod conversation;
 mod details_pane;
+mod markdown_view;
 mod nav_rail;
 mod onboarding;
 mod palette;

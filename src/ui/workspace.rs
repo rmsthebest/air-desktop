@@ -20,6 +20,7 @@ use crate::command_line::{self, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, UserId, mock};
 use crate::session::Session;
 use crate::session::chats::{Chats, LoadState};
+use crate::session::messages::Messages;
 use crate::settings::{Appearance, KeymapMode, SettingsStore};
 use crate::theme;
 use crate::ui::chat_list::{ChatList, ChatListEvent};
@@ -62,35 +63,39 @@ impl Workspace {
         let conversation = cx.new(|cx| Conversation::new(window, cx));
 
         let mut subscriptions = vec![
-            cx.subscribe(&chat_list, |this, chat_list, event, cx| match event {
-                ChatListEvent::Opened(id) => {
-                    let Some(chat) = chat_list.read(cx).chat(id).cloned() else {
-                        return;
-                    };
-                    // After a back/forward step this is the jumplist's current
-                    // entry, which `push` ignores.
-                    this.jumps.push(id.clone());
-                    // Real messages load from milestone 5.
-                    let messages = match this.session {
-                        Some(_) => Vec::new(),
-                        None => mock::messages(id),
-                    };
-                    this.conversation
-                        .update(cx, |conversation, cx| conversation.show(chat, messages, cx));
-                    cx.notify();
-                }
-                ChatListEvent::Updated(chat) => {
-                    let chat = chat.clone();
-                    this.conversation
-                        .update(cx, |conversation, cx| conversation.update_chat(chat, cx));
-                    cx.notify();
-                }
-                ChatListEvent::Closed => {
-                    this.conversation
-                        .update(cx, |conversation, cx| conversation.close(cx));
-                    cx.notify();
-                }
-            }),
+            cx.subscribe_in(
+                &chat_list,
+                window,
+                |this, chat_list, event, window, cx| match event {
+                    ChatListEvent::Opened(id) => {
+                        let Some(chat) = chat_list.read(cx).chat(id).cloned() else {
+                            return;
+                        };
+                        // After a back/forward step this is the jumplist's current
+                        // entry, which `push` ignores.
+                        this.jumps.push(id.clone());
+                        let messages = match &this.session {
+                            Some(session) => cx.new(|cx| Messages::open(session, id, cx)),
+                            None => cx.new(|_| Messages::fixed(mock::messages(id))),
+                        };
+                        this.conversation.update(cx, |conversation, cx| {
+                            conversation.show(chat, messages, window, cx)
+                        });
+                        cx.notify();
+                    }
+                    ChatListEvent::Updated(chat) => {
+                        let chat = chat.clone();
+                        this.conversation
+                            .update(cx, |conversation, cx| conversation.update_chat(chat, cx));
+                        cx.notify();
+                    }
+                    ChatListEvent::Closed => {
+                        this.conversation
+                            .update(cx, |conversation, cx| conversation.close(cx));
+                        cx.notify();
+                    }
+                },
+            ),
             cx.subscribe_in(
                 &conversation,
                 window,
@@ -148,14 +153,12 @@ impl Workspace {
             show_error("Sending messages isn't supported yet.".into(), window, cx);
             return;
         }
-        let message = Message {
-            id: MessageId(format!("local-{}", chrono::Utc::now().timestamp_micros()).into()),
-            sender_id: UserId("me".into()),
-            sender_name: "You".into(),
-            own: true,
-            body: text.into(),
-            sent_at: chrono::Utc::now(),
-        };
+        let message = Message::text(
+            MessageId(format!("local-{}", chrono::Utc::now().timestamp_micros()).into()),
+            (UserId("me".into()), "You".into(), true),
+            &text,
+            chrono::Utc::now(),
+        );
         self.conversation.update(cx, |conversation, cx| {
             conversation.push_message(message, cx)
         });
@@ -808,7 +811,7 @@ mod tests {
 
     fn message_count(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
         workspace.read_with(cx, |workspace, cx| {
-            workspace.conversation.read(cx).message_count()
+            workspace.conversation.read(cx).message_count(cx)
         })
     }
 
@@ -1119,7 +1122,7 @@ mod tests {
         cx.simulate_keystrokes("k k y");
         let expected = workspace.read_with(cx, |workspace, cx| {
             let conversation = workspace.conversation.read(cx);
-            conversation.message_body(conversation.cursor().unwrap())
+            conversation.message_body(conversation.cursor().unwrap(), cx)
         });
         assert_eq!(clipboard(cx), Some(expected));
     }

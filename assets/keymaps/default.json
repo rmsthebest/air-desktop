@@ -16,6 +16,7 @@
       "alt-shift-down": "air::NextUnreadChat",
       "alt-shift-up": "air::PrevUnreadChat",
       "secondary-l": "air::FocusConversation",
+      "secondary-m": "air::FocusMessages",
       "secondary-i": "air::ToggleDetails",
       "secondary-shift-t": "air::ToggleAppearance",
       "secondary-1": ["air::OpenChatAt", { "index": 0 }],
@@ -37,6 +38,19 @@
       "down": "air::SelectNext",
       "up": "air::SelectPrev",
       "enter": "air::FocusConversation"
+    }
+  },
+  {
+    "context": "MessageList",
+    "bindings": {
+      "down": "air::CursorDown",
+      "up": "air::CursorUp",
+      "home": "air::CursorFirst",
+      "end": "air::CursorLast",
+      "pagedown": "air::HalfPageDown",
+      "pageup": "air::HalfPageUp",
+      "secondary-c": "air::YankMessage",
+      "enter": "air::OpenLinks"
     }
   },
   {

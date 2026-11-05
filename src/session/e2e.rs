@@ -14,7 +14,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::account::{self, SignUp, SignUpError};
-use super::chats::{self, Pending, Update};
+use super::chats::{self, Update};
+use super::messages;
+use super::pending::Pending;
 use super::queue::{self, ConnectionStatus, QueueEvent};
 use aircoreclient::clients::store::{ClientRecord, ClientRecordState};
 
@@ -93,12 +95,15 @@ async fn e2e_sign_up_connect_and_reload() {
         panic!("the initial load failed");
     };
     assert!(initial.order.is_some());
+    let message_changes = Arc::new(Pending::default());
     let forward = tokio::spawn({
         let pending = pending.clone();
+        let message_changes = message_changes.clone();
         async move {
             use tokio_stream::StreamExt as _;
             while let Some(notification) = notifications.next().await {
-                pending.add(&[notification], false);
+                pending.add(std::slice::from_ref(&notification), false);
+                message_changes.add(&[notification], false);
             }
         }
     });
@@ -133,6 +138,37 @@ async fn e2e_sign_up_connect_and_reload() {
     let preview = renamed.preview.expect("the rename has a preview");
     assert!(preview.text.contains("Field notes"), "{preview:?}");
 
+    // The group's history opens with its system messages, and follows
+    // new ones live.
+    let (messages_worker, mut updates) =
+        messages::start(user.clone(), group_id, message_changes.clone());
+    let initial = next_window(&mut updates).await;
+    let [messages::Change::Replace(history)] = &initial.changes[..] else {
+        panic!("the history opens with a replace: {:?}", initial.changes);
+    };
+    assert!(
+        history
+            .iter()
+            .any(|m| m.is_event() && m.plain_text().contains("Field notes")),
+        "{history:?}"
+    );
+    user.set_chat_title(group_id, "Bench notes".into())
+        .await
+        .unwrap();
+    loop {
+        let update = next_window(&mut updates).await;
+        let inserted = update.changes.iter().any(|change| match change {
+            messages::Change::Insert { items, .. } => {
+                items.iter().any(|m| m.plain_text().contains("Bench notes"))
+            }
+            _ => false,
+        });
+        if inserted {
+            break;
+        }
+    }
+    messages_worker.abort();
+
     // Changes the worker never hears about (dropped notifications) are
     // caught by a full reload: the deleted group leaves the list.
     forward.abort();
@@ -161,5 +197,14 @@ async fn next_delta(deltas: &mut mpsc::Receiver<Update>) -> chats::Delta {
     match update.expect("no delta within 10s") {
         Some(Update::Delta(delta)) => delta,
         _ => panic!("the chat list worker failed"),
+    }
+}
+
+async fn next_window(updates: &mut mpsc::Receiver<messages::Update>) -> messages::WindowUpdate {
+    let update = tokio::time::timeout(Duration::from_secs(10), updates.recv()).await;
+    match update.expect("no message update within 10s") {
+        Some(messages::Update::Window(update)) => update,
+        Some(messages::Update::Failed(err)) => panic!("the message worker failed: {err}"),
+        None => panic!("the message worker stopped"),
     }
 }

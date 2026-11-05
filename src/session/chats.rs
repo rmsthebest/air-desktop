@@ -4,20 +4,21 @@
 //! UI deltas.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use aircommon::identifiers::UserId;
 use aircommon::utils::FibonacciBackoff;
 use aircoreclient::clients::CoreUser;
-use aircoreclient::db::notification::{DbEntityId, DbNotification};
+use aircoreclient::db::notification::DbEntityId;
 use aircoreclient::{Chat, ChatId as CoreChatId, ChatType, MessageId};
 use gpui_kit::{AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::error;
 
 use crate::model::{ChatId, ChatSummary, name_line};
 use crate::runtime::{Tokio, TokioTask};
+use crate::session::pending::Pending;
 use crate::session::preview;
 use crate::session::{Session, SessionEvent};
 
@@ -143,38 +144,6 @@ fn apply(chats: &mut Vec<ChatSummary>, delta: Delta) {
         .collect();
 }
 
-/// Database changes the worker hasn't looked at yet, merged: a burst of
-/// changes leads to one reload.
-#[derive(Default)]
-pub(super) struct Pending {
-    changes: Mutex<Changes>,
-    wake: Notify,
-}
-
-#[derive(Default)]
-struct Changes {
-    entities: BTreeSet<DbEntityId>,
-    /// Changes were dropped: reload every chat.
-    all: bool,
-}
-
-impl Pending {
-    pub(super) fn add(&self, notifications: &[Arc<DbNotification>], overflowed: bool) {
-        {
-            let mut changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
-            changes.all |= overflowed;
-            for notification in notifications {
-                changes.entities.extend(notification.ops.keys().cloned());
-            }
-        }
-        self.wake.notify_one();
-    }
-
-    fn take(&self) -> Changes {
-        std::mem::take(&mut *self.changes.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-}
-
 pub(super) async fn run(user: CoreUser, pending: Arc<Pending>, tx: mpsc::Sender<Update>) {
     let mut state = LocalState::default();
     let mut backoff = FibonacciBackoff::default();
@@ -198,7 +167,7 @@ pub(super) async fn run(user: CoreUser, pending: Arc<Pending>, tx: mpsc::Sender<
         let affected = if changes.all {
             state.published.keys().copied().collect()
         } else {
-            state.affected(&changes.entities)
+            state.affected(&changes.entities().cloned().collect())
         };
         // A full reload or an order retry can find chats nothing pointed
         // to, so they run even with nothing affected.
@@ -680,14 +649,5 @@ mod tests {
         assert!(!state.contains(&deleted) && !state.contains(&left));
         apply(&mut chats, delta);
         assert_eq!(ids(&chats), [kept.uuid.to_string()]);
-    }
-
-    #[test]
-    fn an_overflow_is_not_lost_to_a_later_batch() {
-        let pending = Pending::default();
-        pending.add(&[], true);
-        pending.add(&[], false);
-        assert!(pending.take().all);
-        assert!(!pending.take().all);
     }
 }

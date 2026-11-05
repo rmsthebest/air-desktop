@@ -6,9 +6,13 @@
 //! Identity always comes from IDs. Display names are peer-controlled and are
 //! only ever shown, never compared.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Datelike as _, Local, Utc};
 use gpui_kit::SharedString;
 use unicode_segmentation::UnicodeSegmentation as _;
+
+use crate::markdown::{self, Markdown};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChatId(pub SharedString);
@@ -125,24 +129,110 @@ fn one_line(text: &str, max: usize) -> SharedString {
 /// seven), not for stacks of combining marks.
 const MAX_GRAPHEME_CHARS: usize = 8;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     pub id: MessageId,
-    pub sender_id: UserId,
+    /// For events, the user who caused them, if known.
+    pub sender_id: Option<UserId>,
     /// Display name at render time; never used for identity.
     pub sender_name: SharedString,
     /// Set by the producer by comparing `sender_id` with the local user's ID.
     pub own: bool,
-    pub body: SharedString,
+    pub body: MessageBody,
     pub sent_at: DateTime<Utc>,
+    pub status: MessageStatus,
+    pub edited: bool,
 }
 
-/// Whether the message at `ix` starts a new visual group, i.e. its sender
-/// differs from the previous message's sender.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessageBody {
+    Text {
+        /// The markdown as sent; what copying a message copies.
+        source: SharedString,
+        markdown: Arc<Markdown>,
+    },
+    /// A system message (member added, title changed…), already in words.
+    Event(SharedString),
+    /// Stands in for content that can't be shown (deleted, hidden…).
+    Notice(SharedString),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageStatus {
+    Sending,
+    Sent,
+    Delivered,
+    Read,
+    Failed,
+}
+
+impl Message {
+    pub fn text(
+        id: MessageId,
+        sender: (UserId, SharedString, bool),
+        source: &str,
+        sent_at: DateTime<Utc>,
+    ) -> Self {
+        let (sender_id, sender_name, own) = sender;
+        Self {
+            id,
+            sender_id: Some(sender_id),
+            sender_name,
+            own,
+            body: MessageBody::Text {
+                source: source.to_string().into(),
+                markdown: Arc::new(markdown::parse(source)),
+            },
+            sent_at,
+            status: MessageStatus::Sent,
+            edited: false,
+        }
+    }
+
+    /// The text copying the message gives.
+    pub fn plain_text(&self) -> SharedString {
+        match &self.body {
+            MessageBody::Text { source, .. } => source.clone(),
+            MessageBody::Event(text) | MessageBody::Notice(text) => text.clone(),
+        }
+    }
+
+    pub fn is_event(&self) -> bool {
+        matches!(self.body, MessageBody::Event(_))
+    }
+}
+
+/// Whether the message at `ix` starts a new visual group: its sender
+/// differs from the previous message's, or either is an event.
 pub fn starts_group(messages: &[Message], ix: usize) -> bool {
     match ix.checked_sub(1).and_then(|prev| messages.get(prev)) {
-        Some(prev) => prev.sender_id != messages[ix].sender_id,
+        Some(prev) => {
+            let message = &messages[ix];
+            prev.is_event() || message.is_event() || prev.sender_id != message.sender_id
+        }
         None => true,
+    }
+}
+
+/// Whether the message at `ix` is the first of its (local) day, so a date
+/// divider goes above it.
+pub fn starts_day(messages: &[Message], ix: usize) -> bool {
+    let day = |message: &Message| message.sent_at.with_timezone(&Local).date_naive();
+    match ix.checked_sub(1).and_then(|prev| messages.get(prev)) {
+        Some(prev) => day(prev) != day(&messages[ix]),
+        None => true,
+    }
+}
+
+/// A date divider's label: "Today", "Yesterday", or the date.
+pub fn format_day(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let at = at.with_timezone(&Local);
+    let now = now.with_timezone(&Local);
+    match (now.date_naive() - at.date_naive()).num_days() {
+        0 => "Today".to_string(),
+        1 => "Yesterday".to_string(),
+        _ if at.year() == now.year() => at.format("%A, %B %-d").to_string(),
+        _ => at.format("%B %-d, %Y").to_string(),
     }
 }
 
@@ -389,14 +479,14 @@ pub mod mock {
         let mut next_id = 0;
         let mut msg = |own: bool, body: &'static str, minutes_ago: i64| {
             next_id += 1;
-            Message {
-                id: MessageId(format!("{}-{next_id}", chat.0).into()),
-                sender_id: UserId(if own { "me" } else { "peer" }.into()),
-                sender_name: if own { "You".into() } else { peer_name.clone() },
-                own,
-                body: body.into(),
-                sent_at: now - Duration::minutes(minutes_ago),
-            }
+            let sender_id = UserId(if own { "me" } else { "peer" }.into());
+            let sender_name = if own { "You".into() } else { peer_name.clone() };
+            Message::text(
+                MessageId(format!("{}-{next_id}", chat.0).into()),
+                (sender_id, sender_name, own),
+                body,
+                now - Duration::minutes(minutes_ago),
+            )
         };
         vec![
             msg(
@@ -419,14 +509,12 @@ mod tests {
     use super::*;
 
     fn message(sender_id: &str, sender_name: &str) -> Message {
-        Message {
-            id: MessageId("m".into()),
-            sender_id: UserId(sender_id.to_string().into()),
-            sender_name: sender_name.to_string().into(),
-            own: false,
-            body: "hi".into(),
-            sent_at: Utc::now(),
-        }
+        let sender = (
+            UserId(sender_id.to_string().into()),
+            sender_name.to_string().into(),
+            false,
+        );
+        Message::text(MessageId("m".into()), sender, "hi", Utc::now())
     }
 
     #[test]
@@ -444,6 +532,19 @@ mod tests {
             .map(|ix| starts_group(&messages, ix))
             .collect();
         assert_eq!(groups, [true, false, true, true, false]);
+
+        // An event between two messages of one sender splits the group.
+        let mut messages = vec![message("alice", "Alice"), message("alice", "Alice")];
+        messages.insert(
+            1,
+            Message {
+                sender_id: Some(UserId("alice".into())),
+                body: MessageBody::Event("Alice changed the title".into()),
+                ..message("alice", "Alice")
+            },
+        );
+        let groups: Vec<_> = (0..3).map(|ix| starts_group(&messages, ix)).collect();
+        assert_eq!(groups, [true, true, true]);
     }
 
     #[test]
@@ -599,6 +700,29 @@ mod tests {
         assert!(name_line(&zalgo).chars().count() <= MAX_NAME * MAX_GRAPHEME_CHARS);
         // Names made of fillers or marks alone would show as blank.
         assert_eq!(name_line("\u{3164}\u{115F} \u{061C}"), "Unnamed");
+    }
+
+    #[test]
+    fn days_divide_by_local_date() {
+        let at = |day, hour| {
+            Local
+                .with_ymd_and_hms(2026, 11, day, hour, 0, 0)
+                .unwrap()
+                .to_utc()
+        };
+        let messages: Vec<_> = [at(3, 23), at(4, 0), at(4, 9)]
+            .into_iter()
+            .map(|sent_at| Message {
+                sent_at,
+                ..message("alice", "Alice")
+            })
+            .collect();
+        let starts: Vec<_> = (0..3).map(|ix| starts_day(&messages, ix)).collect();
+        assert_eq!(starts, [true, true, false]);
+        let now = at(5, 12);
+        assert_eq!(format_day(at(5, 1), now), "Today");
+        assert_eq!(format_day(at(4, 23), now), "Yesterday");
+        assert_eq!(format_day(at(2, 9), now), "Monday, November 2");
     }
 
     #[test]

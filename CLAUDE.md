@@ -36,6 +36,17 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   - `preview.rs`: the chat-list preview line (draft > last message), names
     and system-message text resolved by the core. Peer text goes through
     `model::preview_line` (one line, invisible chars stripped, bounded).
+  - `messages.rs`: port of `MessageListCubit`. A tokio worker owns a
+    bounded window (`MAX_WINDOW`) of one chat's messages, pages it on
+    request, follows changes, and sends `Change`s the entity applies and
+    re-emits as list splices. Opens at the first unread message. Marking as
+    read is debounced, only for messages shown while the window is active,
+    and sends receipts as upstream (self chat only when receipts are off).
+  - `pending.rs`: the merged change set both workers wake on.
+- `src/markdown.rs` — bounded message markdown parse (size/depth caps; only
+  http/https/mailto become links; images and HTML stay inert text).
+  `ui/markdown_view.rs` renders it; links always open through a confirm
+  dialog showing the real target.
 - `src/ui/app_root.rs` — window root: loading → onboarding → workspace.
 - `src/ui/` — views. Render state, dispatch actions; no business logic.
 - `src/theme.rs`, `assets/themes/*.json` — gpui-component JSON themes; user

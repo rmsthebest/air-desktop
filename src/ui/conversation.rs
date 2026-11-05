@@ -92,6 +92,25 @@ impl Conversation {
         cx.notify();
     }
 
+    /// The open chat's summary changed; its messages stay as they are.
+    pub fn update_chat(&mut self, chat: ChatSummary, cx: &mut Context<Self>) {
+        self.chat = Some(chat);
+        cx.notify();
+    }
+
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.chat = None;
+        self.messages.clear();
+        self.cursor = None;
+        cx.notify();
+    }
+
+    pub fn set_composer_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_value(text.to_string(), window, cx)
+        });
+    }
+
     /// Appends a message to the open chat, e.g. the local echo of a send.
     pub fn push_message(&mut self, message: Message, cx: &mut Context<Self>) {
         self.messages.push(message);

@@ -1,0 +1,213 @@
+//! The chat list's preview line: the draft, or a description of the last
+//! message. Port of the app's `_LastMessage` widget and applogic's
+//! `preview_text` (markdown flattened to plain text).
+
+use aircoreclient::clients::CoreUser;
+use aircoreclient::{ChatMessage, EventMessage, Message};
+use mimi_content::MessageStatus;
+use mimi_content::content_container::{Disposition, NestedPart};
+use pulldown_cmark::{Event, Options, Parser, TagEnd};
+
+use crate::model::{Preview, PreviewKind, preview_line};
+
+/// What the preview needs to know about a chat's last message.
+#[derive(Debug, PartialEq)]
+pub enum LastMessage {
+    Hidden,
+    Deleted,
+    Content {
+        /// `None` when the local user sent it.
+        sender_name: Option<String>,
+        body: Body,
+    },
+    /// A system message, already put into words.
+    Event(String),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Body {
+    Markdown(String),
+    Attachment,
+    Unsupported,
+}
+
+/// Describes a message, loading the names it mentions. `None` for messages
+/// the list doesn't preview (errors), as upstream.
+pub async fn describe(user: &CoreUser, message: &ChatMessage) -> Option<LastMessage> {
+    if message.status() == MessageStatus::Hidden {
+        return Some(LastMessage::Hidden);
+    }
+    if message.message().is_deleted() {
+        return Some(LastMessage::Deleted);
+    }
+    match message.message() {
+        Message::Content(content) => {
+            let sender = content.sender();
+            let sender_name = if sender == user.user_id() {
+                None
+            } else {
+                Some(user.user_profile(sender).await.display_name.to_string())
+            };
+            let body = match &content.content().nested_part {
+                NestedPart::SinglePart {
+                    content_type,
+                    content,
+                    ..
+                } if content_type == "text/markdown" => {
+                    Body::Markdown(String::from_utf8_lossy(content).into_owned())
+                }
+                NestedPart::MultiPart {
+                    disposition: Disposition::Attachment,
+                    ..
+                } => Body::Attachment,
+                _ => Body::Unsupported,
+            };
+            Some(LastMessage::Content { sender_name, body })
+        }
+        Message::Event(event @ EventMessage::System(_)) => {
+            Some(LastMessage::Event(event.string_representation(user).await))
+        }
+        Message::Event(EventMessage::Error(_)) => None,
+    }
+}
+
+/// The preview of a chat: a non-empty draft wins over the last message.
+/// Senders are named in groups only; the local user is always "You".
+pub fn preview(draft: Option<&str>, last: Option<LastMessage>, is_group: bool) -> Option<Preview> {
+    let make = |prefix: Option<String>, text: &str, kind| {
+        Some(Preview {
+            prefix: prefix.map(Into::into),
+            text: preview_line(text),
+            kind,
+        })
+    };
+    if let Some(draft) = draft.map(plain_text).filter(|text| !text.is_empty()) {
+        return make(Some("Draft".into()), &draft, PreviewKind::Draft);
+    }
+    match last? {
+        LastMessage::Hidden => make(None, "Hidden message", PreviewKind::Notice),
+        LastMessage::Deleted => make(None, "Message deleted", PreviewKind::Notice),
+        LastMessage::Event(text) => make(None, &text, PreviewKind::Message),
+        LastMessage::Content { sender_name, body } => {
+            let prefix = match sender_name {
+                None => Some("You".to_string()),
+                Some(name) if is_group => Some(name),
+                Some(_) => None,
+            };
+            let text = match body {
+                Body::Markdown(markdown) => plain_text(&markdown),
+                Body::Attachment => "Attachment".into(),
+                Body::Unsupported => "Unsupported message".into(),
+            };
+            make(prefix, &text, PreviewKind::Message)
+        }
+    }
+}
+
+/// Markdown flattened to its text, falling back to the raw markdown when
+/// that is empty (e.g. only an image). As upstream's `preview_text`.
+fn plain_text(markdown: &str) -> String {
+    let options =
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+    let mut text = String::new();
+    for event in Parser::new_ext(markdown, options) {
+        match event {
+            Event::Text(value) | Event::Code(value) => text.push_str(&value),
+            Event::SoftBreak
+            | Event::HardBreak
+            | Event::End(
+                TagEnd::Paragraph
+                | TagEnd::Heading(_)
+                | TagEnd::Item
+                | TagEnd::CodeBlock
+                | TagEnd::TableCell,
+            ) => text.push(' '),
+            _ => {}
+        }
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        markdown.trim().to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(preview: Option<Preview>) -> Option<(Option<String>, String, PreviewKind)> {
+        preview.map(|p| (p.prefix.map(|s| s.to_string()), p.text.to_string(), p.kind))
+    }
+
+    fn content(sender_name: Option<&str>, markdown: &str) -> Option<LastMessage> {
+        Some(LastMessage::Content {
+            sender_name: sender_name.map(Into::into),
+            body: Body::Markdown(markdown.into()),
+        })
+    }
+
+    #[test]
+    fn markdown_is_flattened_to_one_line() {
+        assert_eq!(
+            plain_text("# Title\n\n**bold** and `code`\n\n- one\n- two"),
+            "Title bold and code one two"
+        );
+        assert_eq!(
+            text(preview(
+                None,
+                content(None, "a\nb [link](https://x)"),
+                false
+            ))
+            .unwrap()
+            .1,
+            "a b link"
+        );
+        // Nothing but markup: show the source rather than nothing.
+        assert_eq!(plain_text("![](x.png)"), "![](x.png)");
+    }
+
+    #[test]
+    fn prefixes_follow_who_sent_it_and_where() {
+        let you = Some("You".to_string());
+        let ada = Some("Ada".to_string());
+        let message = PreviewKind::Message;
+        assert_eq!(
+            text(preview(None, content(None, "hi"), false)),
+            Some((you, "hi".into(), message))
+        );
+        assert_eq!(
+            text(preview(None, content(Some("Ada"), "hi"), false)),
+            Some((None, "hi".into(), message))
+        );
+        assert_eq!(
+            text(preview(None, content(Some("Ada"), "hi"), true)),
+            Some((ada, "hi".into(), message))
+        );
+    }
+
+    #[test]
+    fn a_draft_wins_unless_it_is_blank() {
+        let last = || content(Some("Ada"), "hi");
+        assert_eq!(
+            text(preview(Some("*soon*"), last(), false)),
+            Some((Some("Draft".into()), "soon".into(), PreviewKind::Draft))
+        );
+        assert_eq!(text(preview(Some(" \n "), last(), false)).unwrap().1, "hi");
+        assert_eq!(preview(Some(""), None, false), None);
+    }
+
+    #[test]
+    fn unshowable_messages_get_a_notice() {
+        for (last, notice) in [
+            (LastMessage::Hidden, "Hidden message"),
+            (LastMessage::Deleted, "Message deleted"),
+        ] {
+            assert_eq!(
+                text(preview(None, Some(last), true)),
+                Some((None, notice.into(), PreviewKind::Notice))
+            );
+        }
+    }
+}

@@ -19,6 +19,7 @@ use crate::actions::{
 use crate::command_line::{self, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, UserId, mock};
 use crate::session::Session;
+use crate::session::chats::{Chats, LoadState};
 use crate::settings::{Appearance, KeymapMode, SettingsStore};
 use crate::theme;
 use crate::ui::chat_list::{ChatList, ChatListEvent};
@@ -35,6 +36,8 @@ const CHAT_LIST_MAX: f32 = 480.;
 pub struct Workspace {
     /// `None` only in tests, which run on mock data without an account.
     session: Option<Entity<Session>>,
+    /// The account's chats; the chat list shows a copy.
+    _chats: Option<Entity<Chats>>,
     chat_list: Entity<ChatList>,
     conversation: Entity<Conversation>,
     focus_handle: FocusHandle,
@@ -49,7 +52,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let chat_list = cx.new(|cx| ChatList::new(mock::chats(), cx));
+        let chats = session
+            .as_ref()
+            .map(|session| cx.new(|cx| Chats::new(session, cx)));
+        let chat_list = cx.new(|cx| match &chats {
+            Some(_) => ChatList::new(Vec::new(), LoadState::Loading, cx),
+            None => ChatList::new(mock::chats(), LoadState::Loaded, cx),
+        });
         let conversation = cx.new(|cx| Conversation::new(window, cx));
 
         let mut subscriptions = vec![
@@ -61,15 +70,34 @@ impl Workspace {
                     // After a back/forward step this is the jumplist's current
                     // entry, which `push` ignores.
                     this.jumps.push(id.clone());
-                    let messages = mock::messages(id);
+                    // Real messages load from milestone 5.
+                    let messages = match this.session {
+                        Some(_) => Vec::new(),
+                        None => mock::messages(id),
+                    };
                     this.conversation
                         .update(cx, |conversation, cx| conversation.show(chat, messages, cx));
                     cx.notify();
                 }
+                ChatListEvent::Updated(chat) => {
+                    let chat = chat.clone();
+                    this.conversation
+                        .update(cx, |conversation, cx| conversation.update_chat(chat, cx));
+                    cx.notify();
+                }
+                ChatListEvent::Closed => {
+                    this.conversation
+                        .update(cx, |conversation, cx| conversation.close(cx));
+                    cx.notify();
+                }
             }),
-            cx.subscribe(&conversation, |this, _, event, cx| match event {
-                ConversationEvent::Send(text) => this.send(text.clone(), cx),
-            }),
+            cx.subscribe_in(
+                &conversation,
+                window,
+                |this, _, event, window, cx| match event {
+                    ConversationEvent::Send(text) => this.send(text.clone(), window, cx),
+                },
+            ),
             // Redraw the status line and which-key popup as keys are typed.
             cx.observe_pending_input(window, |_, _, cx| cx.notify()),
         ];
@@ -77,10 +105,21 @@ impl Workspace {
             // Account name and connection status are shown in the rail.
             subscriptions.push(cx.observe(session, |_, _, cx| cx.notify()));
         }
+        if let Some(chats) = &chats {
+            subscriptions.push(cx.observe(chats, |this, chats, cx| {
+                let (list, state) = {
+                    let chats = chats.read(cx);
+                    (chats.chats().to_vec(), chats.state().clone())
+                };
+                this.chat_list
+                    .update(cx, |chat_list, cx| chat_list.set_chats(list, state, cx));
+            }));
+        }
         chat_list.focus_handle(cx).focus(window, cx);
 
         Self {
             session,
+            _chats: chats,
             chat_list,
             conversation,
             focus_handle: cx.focus_handle(),
@@ -98,8 +137,17 @@ impl Workspace {
         SettingsStore::get(cx).keymap_mode == KeymapMode::Helix
     }
 
-    /// Placeholder until the session layer: echo the message locally.
-    fn send(&mut self, text: String, cx: &mut Context<Self>) {
+    /// Mock data echoes the message locally; sending for real comes with
+    /// milestone 6.
+    fn send(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.is_some() {
+            // Keep what the user wrote.
+            self.conversation.update(cx, |conversation, cx| {
+                conversation.set_composer_text(&text, window, cx)
+            });
+            show_error("Sending messages isn't supported yet.".into(), window, cx);
+            return;
+        }
         let message = Message {
             id: MessageId(format!("local-{}", chrono::Utc::now().timestamp_micros()).into()),
             sender_id: UserId("me".into()),
@@ -622,6 +670,48 @@ mod tests {
         assert_eq!(open_title(&workspace, cx).as_ref(), Some(&titles[2]));
         cx.simulate_keystrokes("alt-up alt-up alt-up");
         assert_eq!(open_title(&workspace, cx).as_ref(), titles.last());
+    }
+
+    #[gpui::test]
+    fn live_chat_updates_keep_the_open_chat_in_step(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let mut chats = workspace.read_with(cx, |workspace, cx| workspace.chats(cx));
+        cx.simulate_keystrokes("alt-down alt-down");
+        let open = chats[1].id.clone();
+        let set_chats = |chats: Vec<ChatSummary>, cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                workspace
+                    .chat_list
+                    .update(cx, |list, cx| list.set_chats(chats, LoadState::Loaded, cx))
+            });
+        };
+        let messages = message_count(&workspace, cx);
+        assert!(messages > 0);
+
+        // Renamed and moved to the top: the header follows, the messages
+        // stay, and navigation continues from its new place.
+        let mut renamed = chats.remove(1);
+        renamed.title = "Renamed".into();
+        chats.insert(0, renamed);
+        set_chats(chats.clone(), cx);
+        assert_eq!(open_title(&workspace, cx).as_deref(), Some("Renamed"));
+        assert_eq!(message_count(&workspace, cx), messages);
+        cx.simulate_keystrokes("alt-down");
+        assert_eq!(
+            open_title(&workspace, cx).as_deref(),
+            Some(&*chats[1].title)
+        );
+
+        // Deleted elsewhere while open: the conversation closes.
+        cx.simulate_keystrokes("alt-up");
+        chats.retain(|chat| chat.id != open);
+        set_chats(chats.clone(), cx);
+        assert_eq!(open_title(&workspace, cx), None);
+        cx.simulate_keystrokes("alt-down");
+        assert_eq!(
+            open_title(&workspace, cx).as_deref(),
+            Some(&*chats[0].title)
+        );
     }
 
     #[gpui::test]

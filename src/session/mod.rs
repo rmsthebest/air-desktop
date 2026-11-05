@@ -3,8 +3,10 @@
 //! state from here and never touch `aircoreclient` themselves.
 
 pub mod account;
+pub mod chats;
 #[cfg(test)]
 mod e2e;
+mod preview;
 pub mod queue;
 
 use std::sync::Arc;
@@ -31,7 +33,6 @@ const CHANGES_BUFFER: usize = 256;
 pub enum SessionEvent {
     /// Data changed in the database (new messages, chats, profiles…).
     /// Batched: one event may carry several notifications.
-    #[allow(dead_code, reason = "the chat list consumes it from milestone 4")]
     Changed {
         notifications: Vec<Arc<DbNotification>>,
         /// Some notifications were dropped: reload everything shown.
@@ -114,6 +115,10 @@ impl Session {
             session.reload_profile(cx);
             session
         })
+    }
+
+    pub(crate) fn user(&self) -> &CoreUser {
+        &self.user
     }
 
     pub fn display_name(&self) -> &SharedString {

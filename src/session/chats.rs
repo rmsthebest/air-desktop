@@ -1,0 +1,574 @@
+//! The account's chats, in order, kept current from database changes. Port
+//! of upstream `applogic`'s `chats_data_source.rs`: a tokio worker loads all
+//! chats once, then reloads only the chats each change touches and sends the
+//! UI deltas.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use aircommon::identifiers::UserId;
+use aircoreclient::clients::CoreUser;
+use aircoreclient::db::notification::{DbEntityId, DbNotification};
+use aircoreclient::{Chat, ChatId as CoreChatId, ChatType, MessageId};
+use gpui_kit::{AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
+use tokio::sync::{Notify, mpsc};
+use tracing::error;
+
+use crate::model::{ChatId, ChatSummary};
+use crate::runtime::{Tokio, TokioTask};
+use crate::session::preview;
+use crate::session::{Session, SessionEvent};
+
+/// Chats loaded per delta on startup: about a screenful, so the list shows
+/// up before a large account has loaded. As upstream.
+const CHUNK: usize = 32;
+/// Deltas in flight to the UI; the worker waits beyond this.
+const DELTAS_BUFFER: usize = 8;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoadState {
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
+pub struct Chats {
+    chats: Vec<ChatSummary>,
+    state: LoadState,
+    pending: Arc<Pending>,
+    _worker: TokioTask<()>,
+    _receive: Task<()>,
+    _subscription: Subscription,
+}
+
+impl Chats {
+    pub fn new(session: &Entity<Session>, cx: &mut Context<Self>) -> Self {
+        let user = session.read(cx).user().clone();
+        let pending = Arc::new(Pending::default());
+        let (tx, rx) = mpsc::channel(DELTAS_BUFFER);
+        // The session subscribed to database changes before anything ran;
+        // changes from now on queue up in `pending` until the initial load
+        // is done, so none is missed.
+        let subscription = cx.subscribe(session, |this: &mut Self, _, event, _| match event {
+            SessionEvent::Changed {
+                notifications,
+                overflowed,
+            } => this.pending.add(notifications, *overflowed),
+        });
+        Self {
+            chats: Vec::new(),
+            state: LoadState::Loading,
+            _worker: Tokio::spawn(cx, run(user, pending.clone(), tx)),
+            _receive: cx.spawn(async move |this, cx| receive(this, rx, cx).await),
+            pending,
+            _subscription: subscription,
+        }
+    }
+
+    pub fn chats(&self) -> &[ChatSummary] {
+        &self.chats
+    }
+
+    pub fn state(&self) -> &LoadState {
+        &self.state
+    }
+
+    fn update(&mut self, update: Update, cx: &mut Context<Self>) {
+        match update {
+            Update::Delta(delta) => {
+                apply(&mut self.chats, delta);
+                self.state = LoadState::Loaded;
+            }
+            Update::Failed(message) => self.state = LoadState::Failed(message),
+        }
+        cx.notify();
+    }
+}
+
+/// Applies deltas in batches, so a burst costs one redraw.
+async fn receive(this: WeakEntity<Chats>, mut rx: mpsc::Receiver<Update>, cx: &mut AsyncApp) {
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        while let Ok(update) = rx.try_recv() {
+            batch.push(update);
+        }
+        let applied = this.update(cx, |this, cx| {
+            for update in batch {
+                this.update(update, cx);
+            }
+        });
+        if applied.is_err() {
+            return;
+        }
+    }
+}
+
+pub(super) enum Update {
+    Delta(Delta),
+    Failed(String),
+}
+
+#[derive(Debug, Default)]
+pub(super) struct Delta {
+    pub(super) upserted: Vec<ChatSummary>,
+    pub(super) removed: HashSet<ChatId>,
+    /// Only when the order changed.
+    pub(super) order: Option<Vec<ChatId>>,
+}
+
+impl Delta {
+    fn is_empty(&self) -> bool {
+        self.upserted.is_empty() && self.removed.is_empty() && self.order.is_none()
+    }
+}
+
+/// Replaces upserted chats, drops removed ones and applies the new order.
+fn apply(chats: &mut Vec<ChatSummary>, delta: Delta) {
+    let order = delta
+        .order
+        .unwrap_or_else(|| chats.iter().map(|chat| chat.id.clone()).collect());
+    let mut by_id: HashMap<ChatId, ChatSummary> = chats
+        .drain(..)
+        .map(|chat| (chat.id.clone(), chat))
+        .collect();
+    for chat in delta.upserted {
+        by_id.insert(chat.id.clone(), chat);
+    }
+    *chats = order
+        .into_iter()
+        .filter(|id| !delta.removed.contains(id))
+        .filter_map(|id| by_id.remove(&id))
+        .collect();
+}
+
+/// Database changes the worker hasn't looked at yet, merged: a burst of
+/// changes leads to one reload.
+#[derive(Default)]
+pub(super) struct Pending {
+    changes: Mutex<Changes>,
+    wake: Notify,
+}
+
+#[derive(Default)]
+struct Changes {
+    entities: BTreeSet<DbEntityId>,
+    /// Changes were dropped: reload every chat.
+    all: bool,
+}
+
+impl Pending {
+    pub(super) fn add(&self, notifications: &[Arc<DbNotification>], overflowed: bool) {
+        {
+            let mut changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+            changes.all |= overflowed;
+            for notification in notifications {
+                changes.entities.extend(notification.ops.keys().cloned());
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    fn take(&self) -> Changes {
+        std::mem::take(&mut *self.changes.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+pub(super) async fn run(user: CoreUser, pending: Arc<Pending>, tx: mpsc::Sender<Update>) {
+    let mut state = LocalState::default();
+    if initial_load(&user, &mut state, &tx).await.is_err() {
+        return;
+    }
+    loop {
+        pending.wake.notified().await;
+        let changes = pending.take();
+        let affected = if changes.all {
+            state.published.keys().copied().collect()
+        } else {
+            state.affected(&changes.entities)
+        };
+        // Even with nothing published, a full reload picks up new chats.
+        if affected.is_empty() && !changes.all {
+            continue;
+        }
+        let delta = reload(&user, affected, &mut state).await;
+        if !delta.is_empty() && tx.send(Update::Delta(delta)).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Publishes every chat, in chunks. Errs when the UI is gone.
+async fn initial_load(
+    user: &CoreUser,
+    state: &mut LocalState,
+    tx: &mpsc::Sender<Update>,
+) -> Result<(), ()> {
+    let all = match user.ordered_chat_ids().await {
+        Ok(all) => all,
+        Err(err) => {
+            error!("failed to load chats: {err:#}");
+            _ = tx.send(Update::Failed(format!("{err:#}"))).await;
+            return Err(());
+        }
+    };
+    if all.is_empty() {
+        let empty = Delta {
+            order: Some(Vec::new()),
+            ..Delta::default()
+        };
+        return tx.send(Update::Delta(empty)).await.map_err(drop);
+    }
+    for chunk in all.chunks(CHUNK) {
+        let mut upserted = Vec::with_capacity(chunk.len());
+        for id in chunk {
+            if let Some(chat) = user.chat(id).await {
+                let (summary, keys) = load_chat(user, chat).await;
+                state.record(*id, keys);
+                state.order.push(*id);
+                upserted.push(summary);
+            }
+        }
+        let delta = Delta {
+            upserted,
+            order: Some(state.order.iter().map(model_id).collect()),
+            ..Delta::default()
+        };
+        tx.send(Update::Delta(delta)).await.map_err(drop)?;
+    }
+    Ok(())
+}
+
+async fn reload(user: &CoreUser, affected: HashSet<CoreChatId>, state: &mut LocalState) -> Delta {
+    let mut delta = Delta::default();
+    let mut removed = Vec::new();
+    for id in affected {
+        match user.chat(&id).await {
+            Some(chat) => {
+                let (summary, keys) = load_chat(user, chat).await;
+                state.record(id, keys);
+                delta.upserted.push(summary);
+            }
+            None if state.contains(&id) => removed.push(id),
+            None => {}
+        }
+    }
+
+    // Unlike upstream, an order that fails to load keeps the current one
+    // rather than emptying the list.
+    match user.ordered_chat_ids().await {
+        Ok(ids) => {
+            let mut order = Vec::with_capacity(ids.len());
+            for id in ids {
+                if state.contains(&id) {
+                    order.push(id);
+                } else if let Some(chat) = user.chat(&id).await {
+                    // A chat no notification told us about.
+                    let (summary, keys) = load_chat(user, chat).await;
+                    state.record(id, keys);
+                    delta.upserted.push(summary);
+                    order.push(id);
+                }
+            }
+            // Chats that left the order without a notification.
+            let retained: HashSet<_> = order.iter().copied().collect();
+            removed.extend(state.order.iter().filter(|id| !retained.contains(id)));
+            if state.order != order {
+                delta.order = Some(order.iter().map(model_id).collect());
+                state.order = order;
+            }
+        }
+        Err(err) => error!("failed to load chat order: {err:#}"),
+    }
+
+    for id in removed {
+        state.published.remove(&id);
+        delta.removed.insert(model_id(&id));
+    }
+    delta
+}
+
+/// Loads what the list shows for a chat. Port of `load_chat_details`, minus
+/// what the list doesn't show yet.
+async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
+    let unread = user.unread_messages_count(chat.id).await;
+    let last = user
+        .last_message(chat.id)
+        .await
+        .inspect_err(|err| error!("failed to load last message: {err:#}"))
+        .ok()
+        .flatten();
+    let draft = user
+        .message_draft(chat.id)
+        .await
+        .inspect_err(|err| error!("failed to load draft: {err:#}"))
+        .ok()
+        .flatten();
+    let is_self_chat = user
+        .chat_is_self_group(&chat.group_id)
+        .await
+        .unwrap_or(false);
+
+    let mut users = Vec::new();
+    let (title, pending, is_group) = match &chat.chat_type {
+        ChatType::HandleConnection(username) => (username.plaintext().to_string(), true, false),
+        ChatType::Connection(peer)
+        | ChatType::TargetedMessageConnection(peer)
+        | ChatType::PendingConnection(peer) => {
+            users.push(peer.clone());
+            let name = user.user_profile(peer).await.display_name.to_string();
+            let pending = !matches!(chat.chat_type, ChatType::Connection(_));
+            (name, pending, false)
+        }
+        ChatType::Group(attributes) => (attributes.title.clone(), false, true),
+    };
+    let title = if is_self_chat {
+        "Notes to self".to_string()
+    } else {
+        title
+    };
+
+    let last_message = match &last {
+        Some(message) => {
+            users.extend(message.message().actor().cloned());
+            preview::describe(user, message).await
+        }
+        None => None,
+    };
+    let summary = ChatSummary {
+        id: model_id(&chat.id),
+        title: title.into(),
+        is_group,
+        pending,
+        preview: preview::preview(
+            draft.as_ref().map(|draft| draft.message.as_str()),
+            last_message,
+            is_group,
+        ),
+        last_activity: last
+            .as_ref()
+            .map(|message| message.timestamp())
+            .or(chat.last_message_at),
+        unread: u32::try_from(unread).unwrap_or(u32::MAX),
+    };
+    let keys = ChatKeys {
+        last_message: last.map(|message| message.id()),
+        users,
+    };
+    (summary, keys)
+}
+
+pub(super) fn model_id(id: &CoreChatId) -> ChatId {
+    ChatId(id.uuid.to_string().into())
+}
+
+/// What the worker published: enough to tell which chats a change touches.
+#[derive(Default)]
+struct LocalState {
+    published: HashMap<CoreChatId, ChatKeys>,
+    order: Vec<CoreChatId>,
+}
+
+#[derive(Debug)]
+struct ChatKeys {
+    last_message: Option<MessageId>,
+    /// Users whose names the summary shows: the peer, the last message's
+    /// sender. (Upstream's app looks names up live; ours are baked in.)
+    users: Vec<UserId>,
+}
+
+impl LocalState {
+    fn contains(&self, id: &CoreChatId) -> bool {
+        self.published.contains_key(id)
+    }
+
+    fn record(&mut self, id: CoreChatId, keys: ChatKeys) {
+        self.published.insert(id, keys);
+    }
+
+    /// Chats a change touches: changed chats, and published chats whose last
+    /// message or named users changed.
+    fn affected(&self, entities: &BTreeSet<DbEntityId>) -> HashSet<CoreChatId> {
+        let mut affected = HashSet::new();
+        let mut messages = HashSet::new();
+        let mut users = HashSet::new();
+        for entity in entities {
+            match entity {
+                DbEntityId::Chat(id) => {
+                    affected.insert(*id);
+                }
+                DbEntityId::Message(id) => {
+                    messages.insert(id);
+                }
+                DbEntityId::User(id) => {
+                    users.insert(id);
+                }
+                _ => {}
+            }
+        }
+        if messages.is_empty() && users.is_empty() {
+            return affected;
+        }
+        for (id, keys) in &self.published {
+            let touched = keys
+                .last_message
+                .as_ref()
+                .is_some_and(|message| messages.contains(message))
+                || keys.users.iter().any(|user| users.contains(user));
+            if touched {
+                affected.insert(*id);
+            }
+        }
+        affected
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn summary(id: &str, title: &str) -> ChatSummary {
+        ChatSummary {
+            id: ChatId(id.to_string().into()),
+            title: title.to_string().into(),
+            is_group: false,
+            pending: false,
+            preview: None,
+            last_activity: None,
+            unread: 0,
+        }
+    }
+
+    fn ids(chats: &[ChatSummary]) -> Vec<String> {
+        chats.iter().map(|chat| chat.id.0.to_string()).collect()
+    }
+
+    fn id(s: &str) -> ChatId {
+        ChatId(s.to_string().into())
+    }
+
+    #[test]
+    fn deltas_upsert_remove_and_reorder() {
+        let mut chats = vec![summary("a", "A"), summary("b", "B"), summary("c", "C")];
+
+        // An update in place keeps the order.
+        apply(
+            &mut chats,
+            Delta {
+                upserted: vec![summary("b", "B2")],
+                ..Delta::default()
+            },
+        );
+        assert_eq!(ids(&chats), ["a", "b", "c"]);
+        assert_eq!(chats[1].title, "B2");
+
+        // A new chat comes with an order; a removed one drops out of it.
+        apply(
+            &mut chats,
+            Delta {
+                upserted: vec![summary("d", "D")],
+                removed: HashSet::from([id("a")]),
+                order: Some(vec![id("d"), id("c"), id("a"), id("b")]),
+            },
+        );
+        assert_eq!(ids(&chats), ["d", "c", "b"]);
+
+        apply(
+            &mut chats,
+            Delta {
+                removed: HashSet::from([id("c")]),
+                ..Delta::default()
+            },
+        );
+        assert_eq!(ids(&chats), ["d", "b"]);
+    }
+
+    fn user() -> UserId {
+        UserId::new(Uuid::new_v4(), "localhost".parse().unwrap())
+    }
+
+    fn chat_id() -> CoreChatId {
+        CoreChatId {
+            uuid: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn changes_reach_chats_through_their_last_message_and_named_users() {
+        let (alice, bob) = (user(), user());
+        let message = MessageId::new(Uuid::new_v4());
+        let (with_alice, group, quiet) = (chat_id(), chat_id(), chat_id());
+        let mut state = LocalState::default();
+        state.record(
+            with_alice,
+            ChatKeys {
+                last_message: None,
+                users: vec![alice.clone()],
+            },
+        );
+        state.record(
+            group,
+            ChatKeys {
+                last_message: Some(message),
+                users: vec![bob.clone()],
+            },
+        );
+        state.record(
+            quiet,
+            ChatKeys {
+                last_message: None,
+                users: Vec::new(),
+            },
+        );
+        let affected = |entities: &[DbEntityId]| {
+            state.affected(&entities.iter().cloned().collect::<BTreeSet<_>>())
+        };
+
+        assert_eq!(
+            affected(&[DbEntityId::User(alice)]),
+            HashSet::from([with_alice])
+        );
+        assert_eq!(
+            affected(&[DbEntityId::Message(message)]),
+            HashSet::from([group])
+        );
+        // The sender of the last message renamed themselves.
+        assert_eq!(affected(&[DbEntityId::User(bob)]), HashSet::from([group]));
+        // A chat change reaches the chat even before it was published.
+        let new = chat_id();
+        assert_eq!(affected(&[DbEntityId::Chat(new)]), HashSet::from([new]));
+        // Other users' and other messages' changes reach nothing.
+        assert!(
+            affected(&[
+                DbEntityId::User(user()),
+                DbEntityId::Message(MessageId::new(Uuid::new_v4()))
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn pending_changes_merge_until_taken() {
+        let pending = Pending::default();
+        let (a, b) = (chat_id(), chat_id());
+        let notification = |id| {
+            let mut notification = DbNotification::default();
+            notification
+                .ops
+                .insert(DbEntityId::Chat(id), Default::default());
+            Arc::new(notification)
+        };
+        pending.add(&[notification(a)], false);
+        pending.add(&[notification(b), notification(a)], true);
+
+        let changes = pending.take();
+        assert!(changes.all);
+        assert_eq!(
+            changes.entities,
+            BTreeSet::from([DbEntityId::Chat(a), DbEntityId::Chat(b)])
+        );
+        let next = pending.take();
+        assert!(!next.all && next.entities.is_empty());
+    }
+}

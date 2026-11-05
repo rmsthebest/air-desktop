@@ -28,6 +28,14 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     the queue's Empty sentinel is what starts the core's outbound service.
   - `Session` entity: owns `CoreUser`, runs the listener, forwards
     `db_notifications` to the UI as batched `SessionEvent::Changed`.
+  - `chats.rs`: port of `ChatsDataSource`. A tokio worker owns what was
+    published (`LocalState`), reloads only chats a change touches (directly,
+    via their last message, or via a user whose name they show) and sends
+    deltas; `Chats` entity applies them. Session changes reach the worker
+    through a merged `Pending` set, so bursts coalesce.
+  - `preview.rs`: the chat-list preview line (draft > last message), names
+    and system-message text resolved by the core. Peer text goes through
+    `model::preview_line` (one line, invisible chars stripped, bounded).
 - `src/ui/app_root.rs` — window root: loading → onboarding → workspace.
 - `src/ui/` — views. Render state, dispatch actions; no business logic.
 - `src/theme.rs`, `assets/themes/*.json` — gpui-component JSON themes; user
@@ -76,7 +84,8 @@ From an Air checkout:
    (the local server requires them).
 Clients use domain `localhost`. E2E: `AIR_E2E_CODE=<code> cargo test e2e --
 --ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
-`AIR_DESKTOP_DATA_DIR=<dir> cargo run`.
+`AIR_DESKTOP_DATA_DIR=<dir> cargo run`. E2E tests use `flavor = "multi_thread"`: the
+core calls `block_in_place`.
 
 ## Review gate
 After every milestone commit (and any commit touching session/crypto/storage or

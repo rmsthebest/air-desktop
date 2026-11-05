@@ -15,9 +15,14 @@ aircoreclient = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c5
 aircommon = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c56fba102d4554ec01c86e79311" }
 airapiclient = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c56fba102d4554ec01c86e79311" }
 
+# Message content types, at the rev Air pins.
+mimi_content = { git = "https://github.com/phnx-im/mimi-content", rev = "9690d8f28a5470695b9fb715e284d7ea59d97fc0" }
+
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 directories = "6"
+# Air's markdown flavour; previews are flattened from it.
+pulldown-cmark = { version = "0.13", default-features = false }
 # Must match gpui's schemars major: the Action derive implements its trait.
 schemars = "1"
 serde = { version = "1", features = ["derive"] }

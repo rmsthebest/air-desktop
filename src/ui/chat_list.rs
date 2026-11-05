@@ -1,28 +1,35 @@
-//! Middle-left pane: the list of chats.
+//! Middle-left pane: the list of chats. Virtualized: only visible rows are
+//! built, so large accounts cost the same as small ones.
 
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    Context, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, Render, ScrollHandle,
-    SharedString, Window, div, px,
+    AnyElement, Context, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, Render,
+    ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 
 use crate::actions::{SelectNext, SelectPrev};
-use crate::model::{ChatId, ChatSummary, format_activity, next_unread, step_index};
+use crate::model::{ChatId, ChatSummary, PreviewKind, format_activity, next_unread, step_index};
+use crate::session::chats::LoadState;
 use crate::ui::key_context;
 use crate::ui::widgets::{avatar, badge};
 
 pub enum ChatListEvent {
     Opened(ChatId),
+    /// The open chat's summary changed (title, preview…).
+    Updated(ChatSummary),
+    /// The open chat is gone (deleted, or left on another device).
+    Closed,
 }
 
 pub struct ChatList {
     chats: Vec<ChatSummary>,
+    state: LoadState,
     /// The open chat. Selecting a chat opens it; there is no separate
     /// highlight, so keyboard and mouse always agree on what is shown.
     selected: Option<ChatId>,
     focus_handle: FocusHandle,
-    scroll_handle: ScrollHandle,
+    scroll_handle: UniformListScrollHandle,
 }
 
 impl EventEmitter<ChatListEvent> for ChatList {}
@@ -34,13 +41,32 @@ impl Focusable for ChatList {
 }
 
 impl ChatList {
-    pub fn new(chats: Vec<ChatSummary>, cx: &mut Context<Self>) -> Self {
+    pub fn new(chats: Vec<ChatSummary>, state: LoadState, cx: &mut Context<Self>) -> Self {
         Self {
             chats,
+            state,
             selected: None,
             focus_handle: cx.focus_handle(),
-            scroll_handle: ScrollHandle::new(),
+            scroll_handle: UniformListScrollHandle::new(),
         }
+    }
+
+    /// Replaces the chats, keeping the open chat open if it still exists.
+    pub fn set_chats(&mut self, chats: Vec<ChatSummary>, state: LoadState, cx: &mut Context<Self>) {
+        if let Some(selected) = &self.selected {
+            let old = self.chats.iter().find(|chat| &chat.id == selected);
+            match chats.iter().find(|chat| &chat.id == selected) {
+                Some(new) if old != Some(new) => cx.emit(ChatListEvent::Updated(new.clone())),
+                Some(_) => {}
+                None => {
+                    self.selected = None;
+                    cx.emit(ChatListEvent::Closed);
+                }
+            }
+        }
+        self.chats = chats;
+        self.state = state;
+        cx.notify();
     }
 
     pub fn chats(&self) -> &[ChatSummary] {
@@ -66,7 +92,8 @@ impl ChatList {
         let Some(ix) = self.chats.iter().position(|chat| chat.id == id) else {
             return;
         };
-        self.scroll_handle.scroll_to_item(ix);
+        self.scroll_handle
+            .scroll_to_item(ix, ScrollStrategy::Nearest);
         self.selected = Some(id.clone());
         cx.emit(ChatListEvent::Opened(id));
         cx.notify();
@@ -90,24 +117,47 @@ impl ChatList {
         }
     }
 
-    fn render_row(
-        &self,
-        ix: usize,
-        chat: &ChatSummary,
-        focused: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_row(&self, ix: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
+        let chat = &self.chats[ix];
         let selected = self.selected.as_ref() == Some(&chat.id);
         let id = chat.id.clone();
-        let preview: SharedString = chat.last_message.clone().unwrap_or_default();
+        let activity: SharedString = chat
+            .last_activity
+            .map(|at| format_activity(at, chrono::Utc::now()).into())
+            .unwrap_or_default();
 
-        h_flex()
+        let preview = chat.preview.as_ref().map(|preview| {
+            let italic = preview.kind != PreviewKind::Message;
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .when_some(preview.prefix.clone(), |line, prefix| {
+                    line.child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::MEDIUM)
+                            .when(preview.kind == PreviewKind::Draft, |prefix| prefix.italic())
+                            .child(format!("{prefix}:\u{a0}")),
+                    )
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .when(italic, |text| text.italic())
+                        .child(preview.text.clone()),
+                )
+        });
+
+        let row = h_flex()
             .id(("chat-row", ix))
             .gap_3()
             .px_3()
             .py_2()
-            .mx_2()
             .rounded(theme.radius_lg)
             .border_1()
             .border_color(gpui_kit::transparent_black())
@@ -143,42 +193,76 @@ impl ChatList {
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(chat.title.clone()),
                             )
+                            .when(chat.pending, |line| {
+                                line.child(
+                                    div()
+                                        .flex_none()
+                                        .px_1p5()
+                                        .rounded(theme.radius)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("Request"),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex_none()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .child(format_activity(chat.last_activity, chrono::Utc::now())),
+                                    .child(activity),
                             ),
                     )
                     .child(
+                        // Fixed height, so every row is as tall as the one
+                        // the list measures, with or without a preview.
                         h_flex()
+                            .h(px(20.))
                             .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child(preview),
-                            )
-                            .when(chat.unread > 0, |row| row.child(badge(chat.unread, cx))),
+                            .children(preview)
+                            .when(chat.unread > 0, |line| {
+                                line.child(div().flex_1()).child(badge(chat.unread, cx))
+                            }),
                     ),
-            )
+            );
+        div().px_2().pb_0p5().child(row).into_any_element()
+    }
+
+    fn render_placeholder(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let message: SharedString = match &self.state {
+            LoadState::Loading => "Loading chats…".into(),
+            LoadState::Failed(err) => format!("Couldn't load your chats: {err}").into(),
+            LoadState::Loaded if self.chats.is_empty() => "No chats yet".into(),
+            LoadState::Loaded => return None,
+        };
+        Some(
+            div()
+                .p_4()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(message)
+                .into_any_element(),
+        )
     }
 }
 
 impl Render for ChatList {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
-        let rows: Vec<_> = self
-            .chats
-            .iter()
-            .enumerate()
-            .map(|(ix, chat)| self.render_row(ix, chat, focused, cx).into_any_element())
-            .collect();
         let theme = cx.theme();
+        let list = uniform_list(
+            "chat-list",
+            self.chats.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                range
+                    .map(|ix| this.render_row(ix, focused, cx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .pb_2()
+        .track_scroll(&self.scroll_handle);
 
         v_flex()
             .key_context(key_context("ChatList", cx))
@@ -196,15 +280,7 @@ impl Render for ChatList {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Chats"),
             )
-            .child(
-                v_flex()
-                    .id("chat-list-scroll")
-                    .flex_1()
-                    .gap_0p5()
-                    .pb_2()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll_handle)
-                    .children(rows),
-            )
+            .children(self.render_placeholder(cx))
+            .child(list)
     }
 }

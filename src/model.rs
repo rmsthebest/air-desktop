@@ -1,6 +1,7 @@
 //! View-model types the UI renders. They are deliberately plain data so views
-//! never reach into `aircoreclient` directly; the session layer (milestone 3)
-//! produces them from core state. Until then, [`mock`] supplies sample data.
+//! never reach into `aircoreclient` directly; the session layer produces them
+//! from core state. [`mock`] supplies sample data for tests and for parts the
+//! session doesn't load yet (messages).
 //!
 //! Identity always comes from IDs. Display names are peer-controlled and are
 //! only ever shown, never compared.
@@ -18,14 +19,58 @@ pub struct UserId(pub SharedString);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageId(pub SharedString);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatSummary {
     pub id: ChatId,
     pub title: SharedString,
     pub is_group: bool,
-    pub last_message: Option<SharedString>,
-    pub last_activity: DateTime<Utc>,
+    /// A contact request that neither side has accepted yet.
+    pub pending: bool,
+    pub preview: Option<Preview>,
+    /// `None` for a chat without messages.
+    pub last_activity: Option<DateTime<Utc>>,
     pub unread: u32,
+}
+
+/// The line under a chat's title: its draft or its last message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Preview {
+    /// "Draft", "You" or, in groups, the sender's name.
+    pub prefix: Option<SharedString>,
+    pub text: SharedString,
+    pub kind: PreviewKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewKind {
+    Message,
+    Draft,
+    /// Stands in for a message that can't be shown (deleted, hidden).
+    Notice,
+}
+
+/// Longest preview kept, in graphemes; a row shows one line of it anyway.
+const MAX_PREVIEW: usize = 160;
+
+/// One line of peer-controlled text for a preview: invisible and control
+/// characters dropped, whitespace runs collapsed, and bounded in length.
+pub fn preview_line(text: &str) -> SharedString {
+    let visible: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !is_invisible(*c))
+        .collect();
+    let mut line = String::new();
+    for word in visible.split_whitespace() {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    match line.grapheme_indices(true).nth(MAX_PREVIEW) {
+        Some((end, _)) => format!("{}…", &line[..end]).into(),
+        None => line.into(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -187,13 +232,23 @@ pub mod mock {
 
     pub fn chats() -> Vec<ChatSummary> {
         let now = Utc::now();
-        let chat = |id: &'static str, title: &'static str, group, last, ago: Duration, unread| {
+        let chat = |id: &'static str,
+                    title: &'static str,
+                    group,
+                    last: &'static str,
+                    ago: Duration,
+                    unread| {
             ChatSummary {
                 id: ChatId(id.into()),
                 title: title.into(),
                 is_group: group,
-                last_message: Some(SharedString::from(last)),
-                last_activity: now - ago,
+                pending: false,
+                preview: Some(Preview {
+                    prefix: None,
+                    text: last.into(),
+                    kind: PreviewKind::Message,
+                }),
+                last_activity: Some(now - ago),
                 unread,
             }
         };
@@ -328,8 +383,9 @@ mod tests {
                 id: ChatId(ix.to_string().into()),
                 title: "chat".into(),
                 is_group: false,
-                last_message: None,
-                last_activity: Utc::now(),
+                pending: false,
+                preview: None,
+                last_activity: None,
                 unread,
             })
             .collect();
@@ -400,6 +456,24 @@ mod tests {
         assert_eq!(at(Duration::days(400)), "2025-10-01");
         // Clock skew: a peer timestamp in the future still renders as a time.
         assert_eq!(at(Duration::hours(-2)), "17:00");
+    }
+
+    #[test]
+    fn preview_lines_are_single_bounded_and_visible() {
+        assert_eq!(preview_line("  two\n\nlines\t here "), "two lines here");
+        // A bidi override can't reorder the row around it.
+        assert_eq!(preview_line("\u{202E}evil\u{200B}"), "evil");
+        let long = "é".repeat(10_000);
+        let line = preview_line(&long);
+        assert_eq!(line.graphemes(true).count(), MAX_PREVIEW + 1);
+        assert!(line.ends_with('…'));
+        // Grapheme clusters are never split.
+        let flags = "🏳️‍🌈".repeat(MAX_PREVIEW + 5);
+        assert!(preview_line(&flags).starts_with("🏳️‍🌈"));
+        assert_eq!(
+            preview_line(&flags).graphemes(true).count(),
+            MAX_PREVIEW + 1
+        );
     }
 
     #[test]

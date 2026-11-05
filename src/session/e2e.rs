@@ -8,11 +8,13 @@
 //! With `AIR_E2E_DATA_DIR` set, the account is kept there, so the app can
 //! be started on it: `AIR_DESKTOP_DATA_DIR=<same dir> cargo run`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use super::account::{self, SignUp, SignUpError};
+use super::chats::{self, Pending, Update};
 use super::queue::{self, ConnectionStatus, QueueEvent};
 use aircoreclient::clients::store::{ClientRecord, ClientRecordState};
 
@@ -24,7 +26,7 @@ fn sign_up(code: Option<&str>) -> SignUp {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a local Air server and AIR_E2E_CODE"]
 async fn e2e_sign_up_connect_and_reload() {
     let code = std::env::var("AIR_E2E_CODE").expect("set AIR_E2E_CODE to an invitation code");
@@ -80,6 +82,51 @@ async fn e2e_sign_up_connect_and_reload() {
     })
     .await;
     assert_eq!(connected, Ok(true));
+
+    // The chat list loads, then follows database changes: a new group
+    // shows up, titled and in the order.
+    let pending = Arc::new(Pending::default());
+    let (deltas_tx, mut deltas) = mpsc::channel(8);
+    let mut notifications = user.db_notifications();
+    let worker = tokio::spawn(chats::run(user.clone(), pending.clone(), deltas_tx));
+    let Some(Update::Delta(initial)) = deltas.recv().await else {
+        panic!("the initial load failed");
+    };
+    assert!(initial.order.is_some());
+    let forward = tokio::spawn({
+        let pending = pending.clone();
+        async move {
+            use tokio_stream::StreamExt as _;
+            while let Some(notification) = notifications.next().await {
+                pending.add(&[notification], false);
+            }
+        }
+    });
+    let group = user
+        .create_chat("Lab notes".into(), None, false)
+        .await
+        .unwrap();
+    let group = chats::model_id(&group);
+    let shown = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(update) = deltas.recv().await {
+            let Update::Delta(delta) = update else {
+                continue;
+            };
+            let chat = delta.upserted.iter().find(|chat| chat.id == group);
+            if let (Some(chat), Some(order)) = (chat, &delta.order) {
+                return Some((chat.clone(), order.contains(&group)));
+            }
+        }
+        None
+    })
+    .await
+    .unwrap()
+    .expect("the new group never showed up");
+    assert_eq!(shown.0.title, "Lab notes");
+    assert!(shown.0.is_group && shown.1);
+    eprintln!("group preview: {:?}", shown.0.preview);
+    worker.abort();
+    forward.abort();
     listener.abort();
     drop(user);
 

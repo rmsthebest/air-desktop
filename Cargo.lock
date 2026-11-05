@@ -181,6 +181,8 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",
+ "mimi_content",
+ "pulldown-cmark",
  "schemars",
  "serde",
  "serde_json",

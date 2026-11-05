@@ -17,7 +17,7 @@ use crate::session::{Session, account};
 use crate::settings::{Appearance, SettingsStore};
 use crate::theme;
 use crate::ui::Workspace;
-use crate::ui::onboarding::{DEFAULT_DOMAIN, Onboarding, OnboardingEvent};
+use crate::ui::onboarding::{Onboarding, OnboardingEvent};
 
 enum Screen {
     Loading,
@@ -81,7 +81,7 @@ impl AppRoot {
     }
 
     fn onboard(&mut self, db_path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let onboarding = cx.new(|cx| Onboarding::new(db_path, DEFAULT_DOMAIN, window, cx));
+        let onboarding = cx.new(|cx| Onboarding::new(db_path, window, cx));
         let subscription =
             cx.subscribe_in(
                 &onboarding,
@@ -119,21 +119,35 @@ impl AppRoot {
 /// Creates the private data directory and returns it as the core's
 /// `db_path`.
 fn prepare_data_dir(dir: &std::path::Path) -> Result<String, String> {
+    // The core builds `sqlite://{db_path}/…` URLs from it, unescaped.
+    let path = dir
+        .to_str()
+        .ok_or_else(|| format!("{} is not valid UTF-8", dir.display()))?;
+    if path.contains(['?', '#', '%']) {
+        return Err(format!(
+            "{path} contains ?, # or %, which the database can't open; \
+             set AIR_DESKTOP_DATA_DIR to another directory"
+        ));
+    }
     paths::ensure_private_dir(dir)
         .map_err(|err| format!("Couldn't create {}: {err}", dir.display()))?;
     paths::restrict_files(dir)
         .map_err(|err| format!("Couldn't secure {}: {err}", dir.display()))?;
-    // The core builds `sqlite://{db_path}/…` URLs from it.
-    dir.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| format!("{} is not valid UTF-8", dir.display()))
+    Ok(path.to_string())
 }
 
 impl Render for AppRoot {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let content: AnyElement = match &self.screen {
-            Screen::Loading => div().into_any_element(),
+            Screen::Loading => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme.muted_foreground)
+                .child("Opening your account…")
+                .into_any_element(),
             Screen::Onboarding { view, .. } => view.clone().into_any_element(),
             Screen::Ready(workspace) => workspace.clone().into_any_element(),
             Screen::Failed(message) => v_flex()
@@ -157,5 +171,38 @@ impl Render for AppRoot {
             .text_color(theme.foreground)
             .font_family(theme.font_family.clone())
             .child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+
+    use super::*;
+
+    fn open(data_dir: Option<PathBuf>, cx: &mut TestAppContext) -> Entity<AppRoot> {
+        let (_, root) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::runtime::init(cx).unwrap();
+            crate::settings::SettingsStore::init(None, Default::default(), cx);
+            theme::init(None, cx).unwrap();
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| AppRoot::new(data_dir, window, cx))
+            })
+            .unwrap()
+        });
+        root
+    }
+
+    #[gpui::test]
+    fn unusable_data_dirs_fail_visibly_without_touching_disk(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        // `#` would cut the sqlite URL short and open a different database.
+        let bad = root.path().join("air#desktop");
+        for data_dir in [None, Some(bad.clone())] {
+            let app = open(data_dir, cx);
+            assert!(app.read_with(cx, |app, _| matches!(app.screen, Screen::Failed(_))));
+        }
+        assert!(!bad.exists());
     }
 }

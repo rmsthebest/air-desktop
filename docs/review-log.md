@@ -54,3 +54,38 @@ Deferred:
   disappear. Prune the entry when `ChatList::open` rejects it.
 - **Copying a message is Helix-only** → milestone 5, with message hover
   actions and a context menu.
+
+## Gate 4 — milestone 3 session layer and onboarding (`82c8843`) — PASS
+
+Fixed in follow-up:
+- **Interrupted sign-ups.** Startup loads only finished accounts; it no
+  longer resumes a half-finished registration with a generated name behind
+  a blank window. Sign-up resumes an unfinished registration for the same
+  server (no second challenge, so a spent invitation code isn't lost) and
+  then applies the chosen name. Registrations that never got past the
+  challenge, or that were for another server, are deleted. The e2e test
+  checks that a rejected attempt leaves no record behind.
+- **Queue.** The server's version-expiry announcements are shown in the rail
+  tooltip. "Unsupported version" stays shown while retrying. A sibling-state
+  setup error fails the stream with a log line instead of being dropped.
+- **Session.** Database changes go through a bounded channel; on overflow a
+  "reload everything" flag is set. Connection state uses a watch channel.
+  A profile reload replaces the previous one, so results can't land out of
+  order.
+- **Onboarding.** No server is contacted until the user edits the server
+  field or signs up. A loading message replaces the blank screen.
+- **Data dir.** Paths containing `?`, `#` or `%` are rejected before
+  anything is created, since the core puts the path unescaped into a SQLite
+  URL.
+- **Tests.**
+  - Added: `fail()` focus routing; AppRoot failure paths.
+  - Merged the duplicate push-only test into the challenge test.
+  - Trimmed the reconnect test's assertions on upstream's backoff schedule.
+  - Fixed the e2e comment.
+
+Deferred:
+- **`Session` batching/profile-reload test** → milestone 4, when a fake or
+  ephemeral `CoreUser` (upstream `test_utils`) lands with the chat list.
+- **A resume after the challenge was spent** (AS registration done, QS step
+  failed) isn't covered by a test; it needs a server fault injected
+  mid-registration.

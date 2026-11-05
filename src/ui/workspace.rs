@@ -457,6 +457,7 @@ impl Render for Workspace {
             Account {
                 name: session.display_name().clone(),
                 status: session.status(),
+                version_expires: session.version_expires(),
             }
         });
         let theme = cx.theme();

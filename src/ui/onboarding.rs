@@ -22,7 +22,7 @@ use crate::session::account::{self, SignUp, SignUpError};
 /// what sign-up needs. As upstream.
 const DOMAIN_SETTLE: Duration = Duration::from_millis(500);
 /// Upstream's default server.
-pub const DEFAULT_DOMAIN: &str = "air.ms";
+const DEFAULT_DOMAIN: &str = "air.ms";
 
 pub enum OnboardingEvent {
     SignedUp(CoreUser),
@@ -52,10 +52,10 @@ impl Focusable for Onboarding {
 }
 
 impl Onboarding {
-    pub fn new(db_path: String, domain: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(db_path: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let domain = cx.new(|cx| {
             InputState::new(window, cx)
-                .default_value(domain.to_string())
+                .default_value(DEFAULT_DOMAIN)
                 .placeholder(DEFAULT_DOMAIN)
         });
         let display_name =
@@ -84,7 +84,9 @@ impl Onboarding {
             cx.subscribe_in(&display_name, window, submit_on_enter),
             cx.subscribe_in(&code, window, submit_on_enter),
         ];
-        let mut this = Self {
+        // The server is first contacted when the user edits the field or
+        // signs up, not merely because the app was opened.
+        Self {
             db_path,
             domain,
             display_name,
@@ -95,27 +97,25 @@ impl Onboarding {
             info_task: None,
             sign_up_task: None,
             _subscriptions: subscriptions,
-        };
-        this.lookup_registration_info(Duration::ZERO, cx);
-        this
+        }
     }
 
     fn domain_changed(&mut self, cx: &mut Context<Self>) {
         self.error = None;
-        self.lookup_registration_info(DOMAIN_SETTLE, cx);
+        self.lookup_registration_info(cx);
         cx.notify();
     }
 
     /// Asks the server whether sign-up needs an invitation code, to show the
     /// field up front. Best effort: sign-up reports it anyway.
-    fn lookup_registration_info(&mut self, settle: Duration, cx: &mut Context<Self>) {
+    fn lookup_registration_info(&mut self, cx: &mut Context<Self>) {
         let domain = self.domain.read(cx).value().to_string();
         let Ok(domain) = account::parse_domain(&domain) else {
             self.info_task = None;
             return;
         };
         self.info_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(settle).await;
+            cx.background_executor().timer(DOMAIN_SETTLE).await;
             let info = cx.update(|cx| Tokio::spawn(cx, account::registration_info(domain)));
             let Ok(info) = info.await else {
                 return;
@@ -280,9 +280,9 @@ mod tests {
         let (window, onboarding) = cx.update(|cx| {
             gpui_kit::init(cx);
             crate::runtime::init(cx).unwrap();
-            // No default server, so nothing is looked up over the network.
+            // Nothing is looked up until the server field is edited.
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
-                cx.new(|cx| Onboarding::new(String::new(), "", window, cx))
+                cx.new(|cx| Onboarding::new(String::new(), window, cx))
             })
             .unwrap()
         });
@@ -300,21 +300,56 @@ mod tests {
     fn form_is_filled_and_validated_by_keyboard(cx: &mut TestAppContext) {
         let (onboarding, cx) = setup(cx);
 
-        // Enter with nothing filled in: the server is checked first, locally.
+        // Enter with no name: caught locally, focus stays on the name.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            error(&onboarding, cx),
+            Some(SignUpError::EmptyDisplayName.to_string())
+        );
+        // Tab to the server field and make it invalid (nothing is looked up
+        // for an invalid server), then Shift+Tab back and fill in the name.
+        cx.simulate_keystrokes(&format!("tab {MOD}-a"));
+        cx.simulate_input("not a server!");
+        cx.simulate_keystrokes("shift-tab");
+        cx.simulate_input("Ada");
         cx.simulate_keystrokes("enter");
         assert_eq!(
             error(&onboarding, cx),
             Some(SignUpError::InvalidDomain.to_string())
         );
-        // Focus went to the field that needs fixing; type a server there,
-        // then Shift+Tab back to the name, which is still empty.
-        cx.simulate_input("localhost");
-        cx.simulate_keystrokes("shift-tab enter");
-        assert_eq!(
-            error(&onboarding, cx),
-            Some(SignUpError::EmptyDisplayName.to_string())
-        );
         assert!(!onboarding.read_with(cx, |this, _| this.busy));
-        assert!(!onboarding.read_with(cx, |this, _| this.shows_code()));
     }
+
+    #[gpui::test]
+    fn server_answers_route_focus_to_the_field_that_fixes_them(cx: &mut TestAppContext) {
+        let (onboarding, cx) = setup(cx);
+        let fail = |err: SignUpError, cx: &mut VisualTestContext| {
+            onboarding.update_in(cx, |this, window, cx| this.fail(err, window, cx));
+        };
+        let focused = |input: fn(&Onboarding) -> &Entity<InputState>,
+                       cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                input(onboarding.read(cx))
+                    .focus_handle(cx)
+                    .is_focused(window)
+            })
+        };
+
+        assert!(!onboarding.read_with(cx, |this, _| this.shows_code()));
+        for err in [SignUpError::CodeRequired, SignUpError::CodeRejected] {
+            fail(err, cx);
+            assert!(onboarding.read_with(cx, |this, _| this.shows_code()));
+            assert!(focused(|this| &this.code, cx));
+        }
+        fail(SignUpError::ChallengeUnsupported, cx);
+        assert!(focused(|this| &this.domain, cx));
+        // Typing a new name doesn't hide the code field again.
+        assert!(onboarding.read_with(cx, |this, _| this.shows_code()));
+    }
+
+    const MOD: &str = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
 }

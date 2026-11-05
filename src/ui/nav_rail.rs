@@ -19,6 +19,8 @@ pub const RAIL_WIDTH: f32 = 56.;
 pub struct Account {
     pub name: SharedString,
     pub status: ConnectionStatus,
+    /// When the server stops accepting this client version, if announced.
+    pub version_expires: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub fn nav_rail(appearance: Appearance, account: Option<Account>, cx: &App) -> impl IntoElement {
@@ -75,7 +77,18 @@ fn account_badge(account: Account, cx: &App) -> AnyElement {
             "this version is no longer supported; please update",
         ),
     };
-    let tooltip: SharedString = format!("{} — {status}", account.name).into();
+    let (color, tooltip) = match account.version_expires {
+        Some(at) if account.status == ConnectionStatus::Connected => (
+            theme.warning,
+            format!(
+                "{} — connected; this version stops working on {}, please update",
+                account.name,
+                at.with_timezone(&chrono::Local).format("%Y-%m-%d")
+            ),
+        ),
+        _ => (color, format!("{} — {status}", account.name)),
+    };
+    let tooltip = SharedString::from(tooltip);
     div()
         .id("nav-account")
         .relative()

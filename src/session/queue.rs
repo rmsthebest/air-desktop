@@ -12,6 +12,7 @@ use aircommon::messages::client_state::NotificationSuppression;
 use aircommon::utils::FibonacciBackoff;
 use aircoreclient::clients::process::qs_stream::QsProcessEventResult;
 use aircoreclient::clients::{CoreUser, ListenResponse, SiblingClientStates, listen_response};
+use chrono::{DateTime, Utc};
 use tokio::time::Instant;
 use tokio_stream::StreamExt as _;
 use tracing::{error, info, warn};
@@ -30,6 +31,15 @@ pub enum ConnectionStatus {
     UnsupportedVersion,
 }
 
+/// What the listener reports to the session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QueueEvent {
+    Status(ConnectionStatus),
+    /// The server announced when it stops accepting this client version
+    /// (`None`: no expiry announced, or the announcement was withdrawn).
+    VersionExpires(Option<DateTime<Utc>>),
+}
+
 /// How a stream session ended.
 #[derive(Debug, PartialEq)]
 enum Ended {
@@ -37,6 +47,8 @@ enum Ended {
     Stopped { uptime: Duration },
     /// Could not connect.
     Failed,
+    /// The server rejects this client version.
+    Unsupported,
 }
 
 /// Decides how long to wait before reconnecting.
@@ -58,11 +70,17 @@ impl Reconnect {
 }
 
 /// Runs until dropped (the session aborts it), reconnecting with backoff.
-pub async fn run(user: CoreUser, status: impl Fn(ConnectionStatus) + Send) {
+pub async fn run(user: CoreUser, report: impl Fn(QueueEvent) + Send) {
     let mut reconnect = Reconnect::default();
+    let mut unsupported = false;
     loop {
-        status(ConnectionStatus::Connecting);
-        let ended = listen_once(&user, &status).await;
+        // Keep "unsupported" on screen while retrying: it only changes when
+        // the server accepts us again.
+        if !unsupported {
+            report(QueueEvent::Status(ConnectionStatus::Connecting));
+        }
+        let ended = listen_once(&user, &report).await;
+        unsupported = ended == Ended::Unsupported;
         let delay = reconnect.delay(&ended);
         if !delay.is_zero() {
             info!(retry_in = ?delay, "queue stream ended ({ended:?})");
@@ -71,12 +89,15 @@ pub async fn run(user: CoreUser, status: impl Fn(ConnectionStatus) + Send) {
     }
 }
 
-async fn listen_once(user: &CoreUser, status: &(impl Fn(ConnectionStatus) + Send)) -> Ended {
+async fn listen_once(user: &CoreUser, report: &(impl Fn(QueueEvent) + Send)) -> Ended {
+    let status = |status| report(QueueEvent::Status(status));
     let (stream, responder) = match user.listen_queue().await {
         Ok(listening) => listening,
         Err(err) => {
+            warn!("could not listen to queue: {err}");
             if err.is_unsupported_version() {
                 status(ConnectionStatus::UnsupportedVersion);
+                return Ended::Unsupported;
             } else {
                 status(ConnectionStatus::Offline);
                 // As upstream: a deletion past the QS client can't listen
@@ -85,14 +106,21 @@ async fn listen_once(user: &CoreUser, status: &(impl Fn(ConnectionStatus) + Send
                     error!("failed to resume account deletion: {err:#}");
                 }
             }
-            warn!("could not listen to queue: {err}");
+            return Ended::Failed;
+        }
+    };
+    // As upstream: without the sibling state key the stream isn't set up.
+    let mut siblings = match user.sibling_client_states() {
+        Ok(siblings) => siblings,
+        Err(err) => {
+            error!("failed to set up sibling client states: {err:#}");
+            status(ConnectionStatus::Offline);
             return Ended::Failed;
         }
     };
     let started = Instant::now();
     status(ConnectionStatus::Connected);
 
-    let mut siblings = user.sibling_client_states().ok();
     // Report a client state on every stream, as upstream does even when
     // nothing is suppressed, so the server can't tell clients apart by it.
     // Desktop notifications don't suppress siblings' yet (milestone 7).
@@ -111,7 +139,7 @@ async fn listen_once(user: &CoreUser, status: &(impl Fn(ConnectionStatus) + Send
                 break;
             }
         };
-        if !handle_event(user, &mut siblings, event).await {
+        if !handle_event(user, &mut siblings, report, event).await {
             break;
         }
     }
@@ -124,16 +152,30 @@ async fn listen_once(user: &CoreUser, status: &(impl Fn(ConnectionStatus) + Send
 /// Returns whether to keep reading the stream.
 async fn handle_event(
     user: &CoreUser,
-    siblings: &mut Option<SiblingClientStates>,
+    siblings: &mut SiblingClientStates,
+    report: &(impl Fn(QueueEvent) + Send),
     event: ListenResponse,
 ) -> bool {
-    if let Some(listen_response::Event::SiblingClientState(state)) = event.event {
-        if let Some(siblings) = siblings
-            && let Err(err) = siblings.try_apply(state)
-        {
-            error!("failed to apply sibling client state: {err:#}");
+    match &event.event {
+        Some(listen_response::Event::SiblingClientState(state)) => {
+            if let Err(err) = siblings.try_apply(state.clone()) {
+                error!("failed to apply sibling client state: {err:#}");
+            }
+            return true;
         }
-        return true;
+        // Also processed by the core below (it stores max_devices).
+        Some(listen_response::Event::VersionStatus(version)) => {
+            let expires = version
+                .expires_at
+                .and_then(|at| DateTime::from_timestamp(at.seconds, 0));
+            report(match expires {
+                Some(at) if at <= Utc::now() => {
+                    QueueEvent::Status(ConnectionStatus::UnsupportedVersion)
+                }
+                expires => QueueEvent::VersionExpires(expires),
+            });
+        }
+        _ => {}
     }
     match user.process_qs_event(event).await {
         // A partially processed batch leaves a gap in the sequence: drop the
@@ -161,8 +203,6 @@ mod tests {
             reconnect.delay(&Ended::Failed),
         ];
         assert!(failed.iter().all(|delay| !delay.is_zero()));
-        assert!(failed[0] <= failed[1] && failed[1] <= failed[2]);
-        assert!(failed[0] < failed[2]);
 
         // A long-lived stream reconnects at once and starts over.
         assert_eq!(

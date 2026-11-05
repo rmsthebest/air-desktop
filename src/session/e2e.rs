@@ -13,7 +13,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::account::{self, SignUp, SignUpError};
-use super::queue::{self, ConnectionStatus};
+use super::queue::{self, ConnectionStatus, QueueEvent};
+use aircoreclient::clients::store::{ClientRecord, ClientRecordState};
 
 fn sign_up(code: Option<&str>) -> SignUp {
     SignUp {
@@ -34,8 +35,8 @@ async fn e2e_sign_up_connect_and_reload() {
     crate::paths::ensure_private_dir(&data).unwrap();
     let db_path = data.to_str().unwrap().to_string();
 
-    // The local server is gated: no code is caught before any request, a
-    // wrong one is turned down by the server.
+    // The local server is gated: a missing code is caught once the server
+    // says it wants one, without registering; a wrong one is turned down.
     let err = account::sign_up(db_path.clone(), sign_up(None)).await.err();
     assert_eq!(err, Some(SignUpError::CodeRequired));
     let err = account::sign_up(db_path.clone(), sign_up(Some("WRONG000")))
@@ -47,6 +48,12 @@ async fn e2e_sign_up_connect_and_reload() {
         .await
         .unwrap();
     let user_id = user.user_id().clone();
+
+    // The rejected attempt left an unfinished registration behind; the
+    // successful sign-up discarded it.
+    let records = ClientRecord::load_all_from_air_db(&db_path).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].client_record_state, ClientRecordState::Finished);
 
     // Database files end up private once the app restricts them.
     crate::paths::restrict_files(&data).unwrap();
@@ -65,7 +72,7 @@ async fn e2e_sign_up_connect_and_reload() {
     }));
     let connected = tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(status) = rx.recv().await {
-            if status == ConnectionStatus::Connected {
+            if status == QueueEvent::Status(ConnectionStatus::Connected) {
                 return true;
             }
         }

@@ -20,14 +20,17 @@ use uuid::Uuid;
 /// unreachable server counts as open; sign-up itself then reports the truth.
 const REGISTRATION_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Loads the account to use at startup, as upstream does: the default one
-/// with finished registration, else any finished one, else the newest.
+/// Loads the account to use at startup: the default finished one, else the
+/// newest finished one.
+///
+/// Unlike upstream, an unfinished registration is not resumed here: that
+/// would finish it with a generated display name (the chosen one is set
+/// only after registration) and contact the server before the window shows
+/// anything. Sign-up resumes it instead, see [`sign_up`].
 pub async fn load_default(db_path: String) -> anyhow::Result<Option<CoreUser>> {
     let mut records = ClientRecord::load_all_from_air_db(&db_path).await?;
-    records.sort_unstable_by_key(|record| {
-        let finished = matches!(record.client_record_state, ClientRecordState::Finished);
-        Reverse((record.is_default, finished, record.created_at))
-    });
+    records.retain(|record| record.client_record_state == ClientRecordState::Finished);
+    records.sort_unstable_by_key(|record| Reverse((record.is_default, record.created_at)));
     for record in records {
         match CoreUser::load(&db_path, record.client_record_id).await {
             Ok(user) => return Ok(Some(user)),
@@ -154,19 +157,28 @@ fn from_core_error(err: anyhow::Error) -> SignUpError {
 }
 
 /// Registers a new account at `sign_up.domain` and sets its display name.
+///
+/// An earlier attempt that got past the server's challenge (so its
+/// invitation code is spent) but failed later is resumed rather than
+/// started over; attempts that didn't get that far are discarded.
 pub async fn sign_up(db_path: String, sign_up: SignUp) -> Result<CoreUser, SignUpError> {
     let domain = parse_domain(&sign_up.domain)?;
     let display_name: DisplayName = sign_up
         .display_name
         .parse()
         .map_err(|_| SignUpError::EmptyDisplayName)?;
-    let info = registration_info(domain.clone()).await;
-    let challenge = challenge(info.as_ref(), sign_up.invitation_code.as_deref())?;
 
-    let user_id = UserId::new(Uuid::new_v4(), domain);
-    let user = CoreUser::new(user_id, &db_path, None, challenge)
-        .await
-        .map_err(from_core_error)?;
+    let user = match resume_unfinished(&db_path, &domain).await? {
+        Some(user) => user,
+        None => {
+            let info = registration_info(domain.clone()).await;
+            let challenge = challenge(info.as_ref(), sign_up.invitation_code.as_deref())?;
+            let user_id = UserId::new(Uuid::new_v4(), domain);
+            CoreUser::new(user_id, &db_path, None, challenge)
+                .await
+                .map_err(from_core_error)?
+        }
+    };
     let profile = UserProfile {
         user_id: user.user_id().clone(),
         display_name,
@@ -177,6 +189,38 @@ pub async fn sign_up(db_path: String, sign_up: SignUp) -> Result<CoreUser, SignU
         error!("could not set own profile: {err:#}");
     }
     Ok(user)
+}
+
+/// Finishes an interrupted registration at `domain`, if there is one that
+/// needs no new challenge. Removes interrupted registrations that can't be
+/// finished that way, and those for other servers (the user moved on).
+async fn resume_unfinished(db_path: &str, domain: &Fqdn) -> Result<Option<CoreUser>, SignUpError> {
+    fn other(err: impl Into<anyhow::Error>) -> SignUpError {
+        SignUpError::Other(format!("{:#}", err.into()))
+    }
+    let records = ClientRecord::load_all_from_air_db(db_path)
+        .await
+        .map_err(other)?;
+    for record in records {
+        if record.client_record_state == ClientRecordState::Finished {
+            continue;
+        }
+        let id = record.client_record_id;
+        if record.user_id.domain() == domain {
+            match CoreUser::load(db_path, id).await {
+                Ok(user) => return Ok(Some(user)),
+                // Stuck before the challenge: nothing was spent on it.
+                Err(err) if err.is::<RegistrationError>() => {}
+                // E.g. offline: keep it, it may still be resumable.
+                Err(err) => return Err(other(err)),
+            }
+        }
+        info!("discarding an unfinished registration");
+        aircoreclient::delete_client_database(db_path, id)
+            .await
+            .map_err(other)?;
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -219,10 +263,8 @@ mod tests {
         );
         assert!(needs_code(Some(&gated)));
         assert!(!needs_code(Some(&open)) && !needs_code(None));
-    }
 
-    #[test]
-    fn push_only_servers_are_reported_as_unsupported() {
+        // A server that only takes push-based admission can't be answered.
         let push_only = info(true, &[ChallengeKind::AdmissionSession]);
         assert_eq!(
             code(challenge(Some(&push_only), Some("ABC"))),

@@ -109,6 +109,11 @@ impl Conversation {
     }
 
     #[cfg(test)]
+    pub fn message_body(&self, ix: usize) -> String {
+        self.messages[ix].body.to_string()
+    }
+
+    #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages.len()
     }
@@ -119,8 +124,10 @@ impl Conversation {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).value().trim().to_string();
-        if text.is_empty() || self.chat.is_none() {
+        // Keep leading whitespace (indented code); only drop the trailing
+        // newlines/spaces left by typing.
+        let text = self.composer.read(cx).value().trim_end().to_string();
+        if text.trim().is_empty() || self.chat.is_none() {
             return;
         }
         self.composer

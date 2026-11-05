@@ -150,22 +150,46 @@ pub fn normalize(text: &str) -> String {
         .collect()
 }
 
-/// Exact normalized match first, then the first candidate containing it.
+/// Result of resolving a typed name against candidates.
+#[derive(Debug, PartialEq)]
+pub enum NameMatch<'a> {
+    One(&'a str),
+    None,
+    /// Several candidates match; acting on any of them would be a guess.
+    Ambiguous(usize),
+}
+
+/// Resolves `query` to a single candidate: the only exact normalized match,
+/// or else the only candidate containing it. Never guesses between several,
+/// since names (e.g. peers' display names) may be chosen to collide.
 pub fn matches_name<'a>(
     query: &str,
     candidates: impl IntoIterator<Item = &'a str>,
-) -> Option<&'a str> {
+) -> NameMatch<'a> {
     let query = normalize(query);
+    if query.is_empty() {
+        return NameMatch::None;
+    }
     let candidates: Vec<_> = candidates.into_iter().collect();
-    candidates
+    let pick = |hits: Vec<&'a str>| match hits.as_slice() {
+        [] => NameMatch::None,
+        [one] => NameMatch::One(one),
+        many => NameMatch::Ambiguous(many.len()),
+    };
+    let exact: Vec<_> = candidates
         .iter()
-        .find(|candidate| normalize(candidate) == query)
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|candidate| normalize(candidate).contains(&query))
-        })
         .copied()
+        .filter(|candidate| normalize(candidate) == query)
+        .collect();
+    if !exact.is_empty() {
+        return pick(exact);
+    }
+    pick(
+        candidates
+            .into_iter()
+            .filter(|candidate| normalize(candidate).contains(&query))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -227,11 +251,41 @@ mod tests {
     }
 
     #[test]
-    fn name_matching_prefers_exact_then_contains() {
+    fn every_command_name_parses() {
+        for spec in SPECS {
+            for name in spec.names {
+                let line = match spec.arg {
+                    Arg::None => name.to_string(),
+                    Arg::Appearance => format!("{name} dark"),
+                    Arg::Keymap => format!("{name} helix"),
+                    Arg::Theme | Arg::Chat => format!("{name} x"),
+                };
+                assert!(parse(&line).is_ok(), "{line:?} should parse");
+            }
+        }
+    }
+
+    #[test]
+    fn name_matching_never_guesses() {
         let names = ["Grace Hopper", "Grace", "Alan Turing"];
-        assert_eq!(matches_name("grace", names), Some("Grace"));
-        assert_eq!(matches_name("hopper", names), Some("Grace Hopper"));
-        assert_eq!(matches_name("air-dark", ["Air Dark"]), Some("Air Dark"));
-        assert_eq!(matches_name("nobody", names), None);
+        assert_eq!(matches_name("grace", names), NameMatch::One("Grace"));
+        assert_eq!(
+            matches_name("hopper", names),
+            NameMatch::One("Grace Hopper")
+        );
+        assert_eq!(
+            matches_name("air-dark", ["Air Dark"]),
+            NameMatch::One("Air Dark")
+        );
+        assert_eq!(matches_name("nobody", names), NameMatch::None);
+        // Look-alike names (normalizing equal) are ambiguous, as are
+        // several partial matches.
+        assert_eq!(
+            matches_name("grace hopper", ["grace-hopper", "Grace Hopper"]),
+            NameMatch::Ambiguous(2)
+        );
+        assert_eq!(matches_name("a", names), NameMatch::Ambiguous(3));
+        // A query that normalizes to nothing matches nothing.
+        assert_eq!(matches_name(" -_", names), NameMatch::None);
     }
 }

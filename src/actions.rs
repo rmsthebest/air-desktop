@@ -19,6 +19,7 @@ gpui_kit::actions!(
         FocusConversation,
         ToggleDetails,
         ToggleAppearance,
+        ToggleHelixMode,
         SelectNext,
         SelectPrev,
         // Helix-style
@@ -88,6 +89,7 @@ pub fn commands() -> Vec<Command> {
             ToggleAppearance,
             "Workspace",
         ),
+        cmd("Toggle Helix keymap", ToggleHelixMode, "Workspace"),
         cmd("Keyboard shortcuts", ShowShortcuts, "Workspace"),
         cmd("Quit", Quit, "Workspace"),
     ]
@@ -109,6 +111,7 @@ pub fn label(action: &dyn Action) -> String {
         "FocusConversation" => "conversation",
         "ToggleDetails" => "toggle details",
         "ToggleAppearance" => "cycle appearance",
+        "ToggleHelixMode" => "toggle helix keymap",
         "SelectNext" => "next",
         "SelectPrev" => "previous",
         "FindChat" => "find chat",

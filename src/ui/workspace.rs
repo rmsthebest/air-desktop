@@ -14,9 +14,9 @@ use crate::actions::{
     self, FindChat, FocusChatList, FocusComposer, FocusConversation, FocusMessages, FocusNextPane,
     JumpBack, JumpForward, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette,
     PickTheme, PrevChat, PrevUnreadChat, SelectFirst, SelectLast, ShowShortcuts, ToggleAppearance,
-    ToggleDetails,
+    ToggleDetails, ToggleHelixMode,
 };
-use crate::command_line::{self, Command, matches_name};
+use crate::command_line::{self, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, UserId, mock};
 use crate::settings::{Appearance, KeymapMode, SettingsStore};
 use crate::theme;
@@ -208,6 +208,24 @@ impl Workspace {
         self.set_appearance(next, window, cx);
     }
 
+    fn toggle_helix_mode(
+        &mut self,
+        _: &ToggleHelixMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mode = match SettingsStore::get(cx).keymap_mode {
+            KeymapMode::Standard => KeymapMode::Helix,
+            KeymapMode::Helix => KeymapMode::Standard,
+        };
+        self.set_keymap_mode(mode, window, cx);
+    }
+
+    fn set_keymap_mode(&mut self, mode: KeymapMode, window: &mut Window, cx: &mut Context<Self>) {
+        update_settings(window, cx, |settings| settings.keymap_mode = mode);
+        window.refresh();
+    }
+
     fn open_palette_scoped(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
         palette::open_palette(scope, self.chats(cx), cx.weak_entity(), window, cx);
     }
@@ -251,30 +269,39 @@ impl Workspace {
             Command::Theme(query) => {
                 let themes = theme::available(cx);
                 match matches_name(&query, themes.iter().map(String::as_str)) {
-                    Some(name) => {
+                    NameMatch::One(name) => {
                         if let Err(err) = theme::select_theme(name, window, cx) {
                             show_error(format!("Couldn't switch theme: {err:#}"), window, cx);
                         }
                     }
-                    None => show_error(format!("No theme matches {query:?}"), window, cx),
+                    NameMatch::None => {
+                        show_error(format!("No theme matches {query:?}"), window, cx)
+                    }
+                    NameMatch::Ambiguous(n) => show_error(
+                        format!("{n} themes match {query:?}; be more specific"),
+                        window,
+                        cx,
+                    ),
                 }
             }
             Command::Open(query) => {
                 let chats = self.chats(cx);
                 let titles = chats.iter().map(|chat| chat.title.as_ref());
-                match matches_name(&query, titles)
-                    .and_then(|title| chats.iter().find(|chat| chat.title.as_ref() == title))
-                {
-                    Some(chat) => self.jump_to_chat(chat.id.clone(), window, cx),
-                    None => show_error(format!("No chat matches {query:?}"), window, cx),
+                match matches_name(&query, titles) {
+                    NameMatch::One(title) => {
+                        if let Some(chat) = chats.iter().find(|chat| chat.title.as_ref() == title) {
+                            self.jump_to_chat(chat.id.clone(), window, cx);
+                        }
+                    }
+                    NameMatch::None => show_error(format!("No chat matches {query:?}"), window, cx),
+                    // Never guess: names are peer-chosen and may imitate
+                    // each other. Let the user pick from the list instead.
+                    NameMatch::Ambiguous(_) => self.open_palette_scoped(Scope::Chats, window, cx),
                 }
             }
             Command::Appearance(appearance) => self.set_appearance(appearance, window, cx),
             Command::ToggleDetails => self.toggle_details(&ToggleDetails, window, cx),
-            Command::Keymap(mode) => {
-                update_settings(window, cx, |settings| settings.keymap_mode = mode);
-                window.refresh();
-            }
+            Command::Keymap(mode) => self.set_keymap_mode(mode, window, cx),
             Command::Shortcuts => palette::show_shortcuts(window, cx),
         }
     }
@@ -334,22 +361,7 @@ impl Workspace {
     fn render_which_key(&self, window: &Window, cx: &App) -> Option<AnyElement> {
         let pending = window.pending_input_keystrokes()?;
         let os = cx.platform_info().os;
-        let mut rows: Vec<(String, String)> = window
-            .possible_bindings_for_input(pending)
-            .iter()
-            .filter(|binding| !gpui::is_no_action(binding.action()))
-            .filter_map(|binding| {
-                let rest = binding.keystrokes().get(pending.len()..)?;
-                let keys = rest
-                    .iter()
-                    .map(|k| k.as_keystroke().unparse(os))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                Some((keys, actions::label(binding.action())))
-            })
-            .collect();
-        rows.sort();
-        rows.dedup();
+        let rows = which_key_rows(window, os);
         if rows.is_empty() {
             return None;
         }
@@ -390,6 +402,31 @@ impl Workspace {
                 .into_any_element(),
         )
     }
+}
+
+/// `(remaining keys, label)` for every binding that continues the pending
+/// prefix, skipping unbound (`null`) entries.
+fn which_key_rows(window: &Window, os: OperatingSystem) -> Vec<(String, String)> {
+    let Some(pending) = window.pending_input_keystrokes() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(String, String)> = window
+        .possible_bindings_for_input(pending)
+        .iter()
+        .filter(|binding| !gpui::is_no_action(binding.action()))
+        .filter_map(|binding| {
+            let rest = binding.keystrokes().get(pending.len()..)?;
+            let keys = rest
+                .iter()
+                .map(|k| k.as_keystroke().unparse(os))
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some((keys, actions::label(binding.action())))
+        })
+        .collect();
+    rows.sort();
+    rows.dedup();
+    rows
 }
 
 fn format_keystrokes(keystrokes: &[Keystroke], os: OperatingSystem) -> String {
@@ -449,6 +486,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_next_pane))
             .on_action(cx.listener(Self::toggle_details))
             .on_action(cx.listener(Self::toggle_appearance))
+            .on_action(cx.listener(Self::toggle_helix_mode))
             .on_action(cx.listener(Self::open_command_line))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 this.open_palette_scoped(Scope::All, window, cx)
@@ -863,18 +901,21 @@ mod tests {
     fn which_key_lists_continuations_of_pending_prefix(cx: &mut TestAppContext) {
         let (_, cx) = setup(cx);
         enable_helix(cx);
+        // A user unbinding must disappear from the popup.
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "space d",
+                gpui::NoAction,
+                Some("Workspace && helix && !Input"),
+            )])
+        });
         cx.simulate_keystrokes("space");
         cx.run_until_parked();
-        let labels: Vec<String> = cx.update(|window, _| {
-            let pending = window.pending_input_keystrokes().unwrap().to_vec();
-            window
-                .possible_bindings_for_input(&pending)
-                .iter()
-                .map(|binding| actions::label(binding.action()))
-                .collect()
-        });
-        assert!(labels.contains(&"find chat".to_string()), "{labels:?}");
-        assert!(labels.contains(&"toggle details".to_string()), "{labels:?}");
+        let rows = cx.update(|window, cx| which_key_rows(window, cx.platform_info().os));
+        let row = |keys: &str, label: &str| (keys.to_string(), label.to_string());
+        // Only the keys after the prefix are shown.
+        assert!(rows.contains(&row("f", "find chat")), "{rows:?}");
+        assert!(!rows.iter().any(|(keys, _)| keys == "d"), "{rows:?}");
     }
 
     #[gpui::test]
@@ -906,19 +947,74 @@ mod tests {
         assert!(workspace.read_with(cx, |workspace, _| workspace.command_line.is_none()));
         assert_eq!(focus_probe(&workspace, cx)(cx), Focus::Messages);
 
-        // Tab completes, escape cancels without running anything.
-        cx.simulate_keystrokes(":");
+        // Tab cycles through completions; escape cancels without running
+        // anything and returns focus to where it was.
+        cx.simulate_keystrokes("h :");
         cx.run_until_parked();
-        cx.simulate_input("deta");
-        cx.simulate_keystrokes("tab escape");
+        cx.simulate_input("q");
+        let line = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .command_line
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .read(cx)
+                    .value(cx)
+            })
+        };
+        cx.simulate_keystrokes("tab");
+        assert_eq!(line(cx), "quit");
+        cx.simulate_keystrokes("tab");
+        assert_eq!(line(cx), "q");
+        cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert!(workspace.read_with(cx, |workspace, _| workspace.command_line.is_none()));
-        assert!(cx.update(|_, cx| SettingsStore::get(cx).details_open));
+        assert_eq!(focus_probe(&workspace, cx)(cx), Focus::ChatList);
 
+        // Leaving Helix mode takes effect immediately.
         run("keymap standard", cx);
         assert_eq!(
             cx.update(|_, cx| SettingsStore::get(cx).keymap_mode),
             KeymapMode::Standard
         );
+        cx.simulate_keystrokes("space d");
+        assert!(cx.update(|_, cx| SettingsStore::get(cx).details_open));
+    }
+
+    #[gpui::test]
+    fn ambiguous_open_lets_the_user_pick(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        enable_helix(cx);
+        let before = open_title(&workspace, cx);
+        // "a" is in several titles: nothing is opened, the chat picker is.
+        cx.simulate_keystrokes(":");
+        cx.run_until_parked();
+        cx.simulate_input("o a");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(open_title(&workspace, cx), before);
+        cx.simulate_input("Grace");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(open_title(&workspace, cx).as_deref(), Some("Grace Hopper"));
+    }
+
+    #[gpui::test]
+    fn yank_copies_only_the_message_under_the_cursor(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        enable_helix(cx);
+        let clipboard = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        };
+        cx.simulate_keystrokes("g g l y");
+        assert_eq!(clipboard(cx), None);
+        cx.simulate_keystrokes("k k y");
+        let expected = workspace.read_with(cx, |workspace, cx| {
+            let conversation = workspace.conversation.read(cx);
+            conversation.message_body(conversation.cursor().unwrap())
+        });
+        assert_eq!(clipboard(cx), Some(expected));
     }
 }

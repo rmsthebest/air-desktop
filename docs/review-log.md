@@ -32,3 +32,25 @@ overview lists ctrl-1..9; persistence and palette theme tests added.
 Deferred:
 - **Palette chat list unbounded/unvirtualized** → joins the gate 1
   virtualization deferral (milestone 4).
+
+## Gate 3 — Helix modal keymap and composer (`2c879fd`) — PASS
+
+Fixed in follow-up:
+- `:open`/`:theme` never guess. Name matching opens only a unique match;
+  look-alike or partial collisions open the chat picker instead, and an
+  empty normalized query matches nothing. Peers choose their display names,
+  so a guess could be steered.
+- Added a "Toggle Helix keymap" palette command, so Helix mode is reachable
+  from standard mode by keyboard.
+- Fixed the misleading Tab-completion comment and removed its dead code.
+- The composer keeps leading indentation and trims only trailing whitespace.
+- Tests: every `:` command name parses; Tab cycling; Escape restores focus
+  to the chat list; `:keymap standard` makes Helix bindings inert live;
+  ambiguous `:open`; yank writes only the cursor's message, or nothing.
+  The which-key test now covers our row builder, including unbound entries.
+
+Deferred:
+- **Jumplist advances onto a vanished chat** → milestone 4, once chats can
+  disappear. Prune the entry when `ChatList::open` rejects it.
+- **Copying a message is Helix-only** → milestone 5, with message hover
+  actions and a context menu.

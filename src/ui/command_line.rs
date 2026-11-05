@@ -68,6 +68,11 @@ impl CommandLine {
         }
     }
 
+    #[cfg(test)]
+    pub fn value(&self, cx: &gpui::App) -> String {
+        self.input.read(cx).value().to_string()
+    }
+
     fn accept_completion(
         &mut self,
         _: &CommandComplete,
@@ -78,12 +83,11 @@ impl CommandLine {
             return;
         };
         self.selected = (self.selected + 1) % self.completions.len();
-        let keep = self.selected;
+        // `set_value` emits no Change, so the list stays as it is and the
+        // next Tab cycles to the following completion until the user types.
         self.input
             .update(cx, |input, cx| input.set_value(line, window, cx));
-        // Setting the value recomputes completions; keep cycling through the
-        // previous list until the user types.
-        self.selected = keep;
+        cx.notify();
     }
 }
 

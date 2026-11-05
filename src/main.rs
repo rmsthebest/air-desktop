@@ -14,7 +14,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::{AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
-use crate::settings::{Settings, SettingsStore};
+use crate::settings::SettingsStore;
 use crate::ui::Workspace;
 
 /// Air's core logs user, chat and attachment IDs at `info`; keep dependencies
@@ -87,15 +87,7 @@ fn load_config(cx: &mut gpui::App) -> anyhow::Result<Vec<String>> {
     let mut warnings = Vec::new();
 
     let settings_path = config_dir.as_ref().map(|dir| dir.join("settings.json"));
-    let settings = match &settings_path {
-        Some(path) => {
-            let (settings, error) = Settings::load(path);
-            warnings.extend(error);
-            settings
-        }
-        None => Settings::default(),
-    };
-    SettingsStore::init(settings_path, settings, cx);
+    warnings.extend(SettingsStore::open(settings_path, cx));
 
     let keymap_path = config_dir.as_ref().map(|dir| dir.join("keymap.json"));
     warnings.extend(keymap::load(keymap_path.as_deref(), cx));

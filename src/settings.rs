@@ -1,7 +1,8 @@
 //! Persisted app preferences (`settings.json` in the config dir).
 //!
-//! Unknown or invalid fields fall back to defaults rather than failing, so a
-//! hand-edited file never prevents startup. Writes are atomic.
+//! Missing and unknown fields are fine. A file that doesn't parse is never
+//! fatal: the app runs on defaults and, so the user's hand edits aren't
+//! lost, stops saving until the file is fixed. Writes are atomic.
 
 use std::path::{Path, PathBuf};
 
@@ -93,26 +94,68 @@ pub struct SettingsStore {
 impl Global for SettingsStore {}
 
 impl SettingsStore {
+    #[cfg(test)]
     pub fn init(path: Option<PathBuf>, settings: Settings, cx: &mut App) {
         cx.set_global(Self { path, settings });
+    }
+
+    /// Loads settings from `path` and installs the store. Returns a problem
+    /// to report, if any.
+    pub fn open(path: Option<PathBuf>, cx: &mut App) -> Option<String> {
+        let (store, warning) = Self::load(path);
+        cx.set_global(store);
+        warning
+    }
+
+    fn load(path: Option<PathBuf>) -> (Self, Option<String>) {
+        let Some(path) = path else {
+            return (
+                Self {
+                    path: None,
+                    settings: Settings::default(),
+                },
+                None,
+            );
+        };
+        match Settings::load(&path) {
+            (settings, None) => (
+                Self {
+                    path: Some(path),
+                    settings,
+                },
+                None,
+            ),
+            // Don't save over a file we couldn't read.
+            (settings, Some(error)) => (
+                Self {
+                    path: None,
+                    settings,
+                },
+                Some(format!(
+                    "{error}. Settings changes won't be saved until it is fixed."
+                )),
+            ),
+        }
     }
 
     pub fn get(cx: &App) -> &Settings {
         &cx.global::<Self>().settings
     }
 
-    /// Applies `edit` and persists the result if anything changed.
-    pub fn update(cx: &mut App, edit: impl FnOnce(&mut Settings)) {
-        let store = cx.global_mut::<Self>();
-        let before = store.settings.clone();
-        edit(&mut store.settings);
-        if store.settings == before {
-            return;
-        }
-        if let Some(path) = &store.path
-            && let Err(err) = store.settings.save(path)
-        {
-            tracing::warn!("failed to save settings: {err:#}");
+    /// Applies `edit` and persists the result if anything changed. The
+    /// change applies in memory even if saving fails.
+    pub fn update(cx: &mut App, edit: impl FnOnce(&mut Settings)) -> anyhow::Result<()> {
+        cx.global_mut::<Self>().apply(edit)
+    }
+
+    fn apply(&mut self, edit: impl FnOnce(&mut Settings)) -> anyhow::Result<()> {
+        let before = self.settings.clone();
+        edit(&mut self.settings);
+        match &self.path {
+            Some(path) if self.settings != before => {
+                self.settings.save(path).context("couldn't save settings")
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -152,6 +195,34 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(settings.appearance, Appearance::Light);
         assert_eq!(settings.dark_theme, theme::DEFAULT_DARK);
+    }
+
+    #[test]
+    fn store_never_overwrites_a_file_it_could_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let hand_edited = r#"{ "appearance": "purple", "chat_list_width": 300 }"#;
+        std::fs::write(&path, hand_edited).unwrap();
+
+        let (mut store, warning) = SettingsStore::load(Some(path.clone()));
+        assert!(warning.is_some());
+        store
+            .apply(|settings| settings.details_open = false)
+            .unwrap();
+        assert!(!store.settings.details_open);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), hand_edited);
+    }
+
+    #[test]
+    fn store_saves_changes_to_a_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let (mut store, warning) = SettingsStore::load(Some(path.clone()));
+        assert_eq!(warning, None);
+        store
+            .apply(|settings| settings.details_open = false)
+            .unwrap();
+        assert_eq!(Settings::load(&path).0, store.settings);
     }
 
     #[test]

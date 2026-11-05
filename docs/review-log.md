@@ -20,3 +20,15 @@ Deferred:
 - **Unwired nav buttons, `details_open` never toggled** → milestone 2 actions.
 - **Log-filter test** → not added; it would restate the constant. Revisit when
   log output tests land (security regression layer).
+
+## Gate 2 — milestone 2 keyboard/palette/settings (`09412a0`) — PASS
+
+Fixed in follow-up: theme selection after a startup fallback (pair built
+from active themes, validated before saving, errors shown in the window);
+an unparseable settings file is never overwritten (store stops saving);
+save failures are shown; `ChatList::open` ignores unknown ids; shortcuts
+overview lists ctrl-1..9; persistence and palette theme tests added.
+
+Deferred:
+- **Palette chat list unbounded/unvirtualized** → joins the gate 1
+  virtualization deferral (milestone 4).

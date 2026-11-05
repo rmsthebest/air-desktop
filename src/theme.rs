@@ -84,25 +84,37 @@ pub fn set_theme_pair(light: &str, dark: &str, cx: &mut App) -> anyhow::Result<(
     Ok(())
 }
 
-/// Switches to the named theme: it becomes the light or dark theme (by its
-/// mode), and the appearance follows it so the choice is visible.
+/// Switches to the named theme: it replaces the active light or dark theme
+/// (by its mode), and the appearance follows it so the choice is visible.
+///
+/// The other half of the pair is taken from what is active, not from
+/// settings, which may name a theme that failed to load at startup. The
+/// pair is applied before it is saved, so settings never record a pair
+/// that doesn't work.
 pub fn select_theme(name: &str, window: &mut Window, cx: &mut App) -> anyhow::Result<()> {
     let config = find(name, cx)?;
-    let is_dark = config.mode.is_dark();
-    let name = config.name.to_string();
-    SettingsStore::update(cx, |settings| {
-        if is_dark {
-            settings.dark_theme = name;
-            settings.appearance = Appearance::Dark;
-        } else {
-            settings.light_theme = name;
-            settings.appearance = Appearance::Light;
-        }
+    let active = Theme::global(cx);
+    let (light, dark, appearance) = if config.mode.is_dark() {
+        (
+            active.light_theme.name.to_string(),
+            config.name.to_string(),
+            Appearance::Dark,
+        )
+    } else {
+        (
+            config.name.to_string(),
+            active.dark_theme.name.to_string(),
+            Appearance::Light,
+        )
+    };
+    set_theme_pair(&light, &dark, cx)?;
+    let saved = SettingsStore::update(cx, |settings| {
+        settings.light_theme = light;
+        settings.dark_theme = dark;
+        settings.appearance = appearance;
     });
-    let settings = SettingsStore::get(cx).clone();
-    set_theme_pair(&settings.light_theme, &settings.dark_theme, cx)?;
     apply_appearance(window, cx);
-    Ok(())
+    saved
 }
 
 /// Registered theme names, sorted.
@@ -182,6 +194,33 @@ mod tests {
             assert_eq!(errors.len(), 1, "{errors:?}");
             assert!(errors[0].contains("broken.json"));
             assert_eq!(Theme::global(cx).dark_theme.name, "Midnight");
+        });
+    }
+
+    #[gpui::test]
+    fn selecting_a_theme_after_startup_fallback_works(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            setup(
+                Settings {
+                    light_theme: "Deleted Theme".into(),
+                    ..Settings::default()
+                },
+                cx,
+            );
+            assert_eq!(init(None, cx).unwrap().len(), 1);
+        });
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| select_theme("Default Dark", window, cx))
+            .unwrap();
+        cx.update(|_, cx| {
+            let theme = Theme::global(cx);
+            assert_eq!(theme.dark_theme.name, "Default Dark");
+            assert!(theme.is_dark());
+            // Settings now name the pair that is actually in effect.
+            let settings = SettingsStore::get(cx);
+            assert_eq!(settings.light_theme, DEFAULT_LIGHT);
+            assert_eq!(settings.dark_theme, "Default Dark");
+            assert_eq!(settings.appearance, Appearance::Dark);
         });
     }
 

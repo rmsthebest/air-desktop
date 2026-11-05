@@ -43,7 +43,8 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 ## Commands
 - `just check` — fmt check, clippy `-D warnings`, tests.
 - `cargo run` — run the app.
-- Tests use `#[gpui::test]` (`gpui` is an alias for `gpui_kit` under cfg(test)).
+- `gpui` is an alias for `gpui_kit` (`extern crate` in main.rs) so GPUI
+  derive macros resolve; tests use `#[gpui::test]`.
   Test support comes from `gpui-pre`/`gpui-pre-platform` dev-deps, not
   gpui-kit's `test-support` feature (it pulls a conflicting backend).
 

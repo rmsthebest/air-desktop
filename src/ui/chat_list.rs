@@ -61,9 +61,11 @@ impl ChatList {
         if self.selected.as_ref() == Some(&id) {
             return;
         }
-        if let Some(ix) = self.chats.iter().position(|chat| chat.id == id) {
-            self.scroll_handle.scroll_to_item(ix);
-        }
+        // The id may come from a stale snapshot (e.g. the palette's).
+        let Some(ix) = self.chats.iter().position(|chat| chat.id == id) else {
+            return;
+        };
+        self.scroll_handle.scroll_to_item(ix);
         self.selected = Some(id.clone());
         cx.emit(ChatListEvent::Opened(id));
         cx.notify();

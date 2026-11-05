@@ -18,7 +18,7 @@ use crate::ui::chat_list::{ChatList, ChatListEvent};
 use crate::ui::conversation::Conversation;
 use crate::ui::details_pane::details_pane;
 use crate::ui::nav_rail::nav_rail;
-use crate::ui::palette;
+use crate::ui::{palette, update_settings};
 
 const CHAT_LIST_MIN: f32 = 240.;
 const CHAT_LIST_MAX: f32 = 480.;
@@ -101,8 +101,8 @@ impl Workspace {
         }
     }
 
-    fn toggle_details(&mut self, _: &ToggleDetails, _: &mut Window, cx: &mut Context<Self>) {
-        SettingsStore::update(cx, |settings| {
+    fn toggle_details(&mut self, _: &ToggleDetails, window: &mut Window, cx: &mut Context<Self>) {
+        update_settings(window, cx, |settings| {
             settings.details_open = !settings.details_open
         });
         cx.notify();
@@ -114,7 +114,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        SettingsStore::update(cx, |settings| {
+        update_settings(window, cx, |settings| {
             settings.appearance = settings.appearance.next()
         });
         theme::apply_appearance(window, cx);
@@ -169,12 +169,12 @@ impl Render for Workspace {
             .child(nav_rail(settings.appearance, cx))
             .child(
                 h_resizable("workspace-panes")
-                    .on_resize(|state, _, cx| {
+                    .on_resize(|state, window, cx| {
                         let Some(width) = state.read(cx).sizes().first().copied() else {
                             return;
                         };
                         let width = f32::from(width);
-                        SettingsStore::update(cx, |settings| settings.chat_list_width = width);
+                        update_settings(window, cx, |settings| settings.chat_list_width = width);
                     })
                     .child(
                         resizable_panel()
@@ -210,9 +210,16 @@ mod tests {
     };
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+        setup_with_settings(None, cx)
+    }
+
+    fn setup_with_settings(
+        settings_path: Option<std::path::PathBuf>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
         let (window, workspace) = cx.update(|cx| {
             gpui_kit::init(cx);
-            SettingsStore::init(None, Settings::default(), cx);
+            assert_eq!(SettingsStore::open(settings_path, cx), None);
             theme::init(None, cx).unwrap();
             assert_eq!(keymap::load(None, cx), Vec::<String>::new());
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
@@ -317,19 +324,20 @@ mod tests {
     }
 
     #[gpui::test]
-    fn toggles_update_persisted_settings(cx: &mut TestAppContext) {
-        let (_, cx) = setup(cx);
-        let settings =
-            |cx: &mut VisualTestContext| cx.update(|_, cx| SettingsStore::get(cx).clone());
-        assert!(settings(cx).details_open);
+    fn toggles_are_saved_to_disk(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let (_, cx) = setup_with_settings(Some(path.clone()), cx);
+        let on_disk = || Settings::load(&path).0;
+        assert!(on_disk().details_open);
 
         cx.simulate_keystrokes(&format!("{MOD}-i"));
-        assert!(!settings(cx).details_open);
+        assert!(!on_disk().details_open);
 
         cx.simulate_keystrokes(&format!("{MOD}-shift-t"));
-        assert_eq!(settings(cx).appearance, Appearance::Light);
+        assert_eq!(on_disk().appearance, Appearance::Light);
         cx.simulate_keystrokes(&format!("{MOD}-shift-t {MOD}-shift-t"));
-        assert_eq!(settings(cx).appearance, Appearance::System);
+        assert_eq!(on_disk().appearance, Appearance::System);
     }
 
     #[gpui::test]
@@ -370,6 +378,22 @@ mod tests {
         let conversation_focus =
             workspace.read_with(cx, |workspace, cx| workspace.conversation.focus_handle(cx));
         assert!(cx.update(|window, _| conversation_focus.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn palette_selects_themes(cx: &mut TestAppContext) {
+        let (_, cx) = setup(cx);
+        cx.simulate_keystrokes(&format!("{MOD}-k"));
+        cx.run_until_parked();
+        cx.simulate_input("Theme: Default Dark");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let theme = gpui_kit::component::Theme::global(cx);
+            assert_eq!(theme.dark_theme.name, "Default Dark");
+            assert!(theme.is_dark());
+        });
     }
 
     #[gpui::test]

@@ -16,10 +16,10 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{App, IntoElement, div, px};
 
-use crate::actions::{self, FocusChatList, SelectNext, SelectPrev};
+use crate::actions::{self, FocusChatList, OpenChatAt, SelectNext, SelectPrev};
 use crate::model::{ChatId, ChatSummary};
 use crate::theme;
-use crate::ui::Workspace;
+use crate::ui::{Workspace, show_error};
 
 enum Entry {
     Chat { id: ChatId, title: SharedString },
@@ -116,7 +116,7 @@ fn build(
             }
             Entry::Theme(name) => {
                 if let Err(err) = theme::select_theme(name, window, cx) {
-                    tracing::warn!("failed to select theme: {err:#}");
+                    show_error(format!("Couldn't switch theme: {err:#}"), window, cx);
                 }
             }
         }
@@ -147,6 +147,12 @@ pub fn show_shortcuts(window: &mut Window, cx: &mut App) {
                 .into_iter()
                 .map(|cmd| ("Anywhere", cmd.label, cmd.action, cmd.context))
                 .collect();
+        rows.push((
+            "Anywhere",
+            "Open chat 1–9".into(),
+            Box::new(OpenChatAt { index: 0 }),
+            "Workspace",
+        ));
         rows.push((
             "Chat list",
             "Next chat".into(),

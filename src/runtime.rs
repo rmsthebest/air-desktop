@@ -15,8 +15,6 @@ use gpui_kit::{App, Global};
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
 
-// Wired into the session layer in milestone 3.
-#[allow(dead_code)]
 pub struct Tokio {
     runtime: Option<Runtime>,
 }
@@ -46,7 +44,6 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 impl Tokio {
     pub fn handle(cx: &App) -> Handle {
         cx.global::<Self>()
@@ -65,19 +62,6 @@ impl Tokio {
         R: Send + 'static,
     {
         TokioTask(Self::handle(cx).spawn(future))
-    }
-
-    /// Like [`Tokio::spawn`] for fallible futures, flattening the result.
-    pub fn spawn_result<F, R>(
-        cx: &App,
-        future: F,
-    ) -> impl Future<Output = anyhow::Result<R>> + use<F, R>
-    where
-        F: Future<Output = anyhow::Result<R>> + Send + 'static,
-        R: Send + 'static,
-    {
-        let task = Self::spawn(cx, future);
-        async move { task.await? }
     }
 }
 
@@ -123,14 +107,6 @@ mod tests {
         // what sqlx/tonic/reqwest in Air's core require.
         let task = cx.update(|cx| Tokio::spawn(cx, async { Handle::try_current().is_ok() }));
         assert!(task.await.unwrap());
-    }
-
-    #[gpui::test]
-    async fn spawn_result_flattens_errors(cx: &mut TestAppContext) {
-        setup(cx);
-        let task = cx
-            .update(|cx| Tokio::spawn_result(cx, async { Err::<(), _>(anyhow::anyhow!("boom")) }));
-        assert_eq!(task.await.unwrap_err().to_string(), "boom");
     }
 
     #[gpui::test]

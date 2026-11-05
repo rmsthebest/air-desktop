@@ -7,6 +7,7 @@ mod keymap;
 mod model;
 mod paths;
 mod runtime;
+mod session;
 mod settings;
 mod theme;
 mod ui;
@@ -16,7 +17,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::{AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 use crate::settings::SettingsStore;
-use crate::ui::Workspace;
+use crate::ui::AppRoot;
 
 /// Air's core logs user, chat and attachment IDs at `info`; keep dependencies
 /// at `warn` so identifiers don't end up in the journal by default.
@@ -63,7 +64,7 @@ fn main() {
                 ..Default::default()
             };
             let window = match gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Workspace::new(window, cx))
+                cx.new(|cx| AppRoot::new(paths::data_dir(), window, cx))
             }) {
                 Ok((window, _)) => window,
                 Err(err) => {

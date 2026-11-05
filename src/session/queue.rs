@@ -1,0 +1,176 @@
+//! Listens to the queue service (QS) for incoming messages. Port of
+//! upstream `applogic`'s `user_cubit/qs.rs` + `util/background.rs` for a
+//! desktop app that is always in the foreground.
+//!
+//! Processing a QS event stores its effects in the database; the UI learns
+//! about them from `CoreUser::db_notifications`, not from here. Processing
+//! the queue's Empty sentinel also starts the core's outbound service.
+
+use std::time::Duration;
+
+use aircommon::messages::client_state::NotificationSuppression;
+use aircommon::utils::FibonacciBackoff;
+use aircoreclient::clients::process::qs_stream::QsProcessEventResult;
+use aircoreclient::clients::{CoreUser, ListenResponse, SiblingClientStates, listen_response};
+use tokio::time::Instant;
+use tokio_stream::StreamExt as _;
+use tracing::{error, info, warn};
+
+/// A stream that stayed up this long was healthy: reconnect at once and
+/// reset the backoff. Same as upstream.
+const HEALTHY_UPTIME: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Connecting,
+    Connected,
+    /// Waiting before the next connection attempt.
+    Offline,
+    /// The server no longer accepts this client version.
+    UnsupportedVersion,
+}
+
+/// How a stream session ended.
+#[derive(Debug, PartialEq)]
+enum Ended {
+    /// Closed, or stopped because processing left a gap in the queue.
+    Stopped { uptime: Duration },
+    /// Could not connect.
+    Failed,
+}
+
+/// Decides how long to wait before reconnecting.
+#[derive(Default)]
+struct Reconnect {
+    backoff: FibonacciBackoff,
+}
+
+impl Reconnect {
+    fn delay(&mut self, ended: &Ended) -> Duration {
+        match ended {
+            Ended::Stopped { uptime } if *uptime >= HEALTHY_UPTIME => {
+                self.backoff.reset();
+                Duration::ZERO
+            }
+            _ => self.backoff.next_backoff(),
+        }
+    }
+}
+
+/// Runs until dropped (the session aborts it), reconnecting with backoff.
+pub async fn run(user: CoreUser, status: impl Fn(ConnectionStatus) + Send) {
+    let mut reconnect = Reconnect::default();
+    loop {
+        status(ConnectionStatus::Connecting);
+        let ended = listen_once(&user, &status).await;
+        let delay = reconnect.delay(&ended);
+        if !delay.is_zero() {
+            info!(retry_in = ?delay, "queue stream ended ({ended:?})");
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+async fn listen_once(user: &CoreUser, status: &(impl Fn(ConnectionStatus) + Send)) -> Ended {
+    let (stream, responder) = match user.listen_queue().await {
+        Ok(listening) => listening,
+        Err(err) => {
+            if err.is_unsupported_version() {
+                status(ConnectionStatus::UnsupportedVersion);
+            } else {
+                status(ConnectionStatus::Offline);
+                // As upstream: a deletion past the QS client can't listen
+                // anymore, which is what would otherwise resume it.
+                if let Err(err) = user.resume_account_deletion().await {
+                    error!("failed to resume account deletion: {err:#}");
+                }
+            }
+            warn!("could not listen to queue: {err}");
+            return Ended::Failed;
+        }
+    };
+    let started = Instant::now();
+    status(ConnectionStatus::Connected);
+
+    let mut siblings = user.sibling_client_states().ok();
+    // Report a client state on every stream, as upstream does even when
+    // nothing is suppressed, so the server can't tell clients apart by it.
+    // Desktop notifications don't suppress siblings' yet (milestone 7).
+    match user.encrypt_client_state(NotificationSuppression::None) {
+        Ok(state) => responder.report_client_state(state).await,
+        Err(err) => error!("failed to encrypt client state: {err:#}"),
+    }
+    user.replace_qs_listen_responder(responder).await;
+
+    let mut stream = std::pin::pin!(stream);
+    while let Some(event) = stream.next().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                warn!("queue stream closed: {err}");
+                break;
+            }
+        };
+        if !handle_event(user, &mut siblings, event).await {
+            break;
+        }
+    }
+    status(ConnectionStatus::Offline);
+    Ended::Stopped {
+        uptime: started.elapsed(),
+    }
+}
+
+/// Returns whether to keep reading the stream.
+async fn handle_event(
+    user: &CoreUser,
+    siblings: &mut Option<SiblingClientStates>,
+    event: ListenResponse,
+) -> bool {
+    if let Some(listen_response::Event::SiblingClientState(state)) = event.event {
+        if let Some(siblings) = siblings
+            && let Err(err) = siblings.try_apply(state)
+        {
+            error!("failed to apply sibling client state: {err:#}");
+        }
+        return true;
+    }
+    match user.process_qs_event(event).await {
+        // A partially processed batch leaves a gap in the sequence: drop the
+        // stream and resume from the stored position on reconnect.
+        Ok(result) => !matches!(result, QsProcessEventResult::PartiallyProcessed { .. }),
+        Err(err) => {
+            error!("failed to process queue event: {err:#}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backs_off_until_a_stream_was_healthy() {
+        let mut reconnect = Reconnect::default();
+        let failed = [
+            reconnect.delay(&Ended::Failed),
+            reconnect.delay(&Ended::Stopped {
+                uptime: Duration::from_secs(5),
+            }),
+            reconnect.delay(&Ended::Failed),
+        ];
+        assert!(failed.iter().all(|delay| !delay.is_zero()));
+        assert!(failed[0] <= failed[1] && failed[1] <= failed[2]);
+        assert!(failed[0] < failed[2]);
+
+        // A long-lived stream reconnects at once and starts over.
+        assert_eq!(
+            reconnect.delay(&Ended::Stopped {
+                uptime: HEALTHY_UPTIME
+            }),
+            Duration::ZERO
+        );
+        assert_eq!(reconnect.delay(&Ended::Failed), failed[0]);
+    }
+}

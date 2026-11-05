@@ -186,9 +186,11 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
+ "uuid",
 ]
 
 [[package]]

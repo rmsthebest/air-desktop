@@ -1,12 +1,15 @@
+mod app_root;
 mod chat_list;
 mod command_line;
 mod conversation;
 mod details_pane;
 mod nav_rail;
+mod onboarding;
 mod palette;
 mod widgets;
 mod workspace;
 
+pub use app_root::AppRoot;
 pub use workspace::Workspace;
 
 use gpui::{App, KeyContext, Window};

@@ -18,13 +18,14 @@ use crate::actions::{
 };
 use crate::command_line::{self, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, UserId, mock};
+use crate::session::Session;
 use crate::settings::{Appearance, KeymapMode, SettingsStore};
 use crate::theme;
 use crate::ui::chat_list::{ChatList, ChatListEvent};
 use crate::ui::command_line::{CommandLine, CommandLineEvent};
 use crate::ui::conversation::{Conversation, ConversationEvent};
 use crate::ui::details_pane::details_pane;
-use crate::ui::nav_rail::nav_rail;
+use crate::ui::nav_rail::{Account, nav_rail};
 use crate::ui::palette::{self, Scope};
 use crate::ui::{key_context, show_error, update_settings};
 
@@ -32,6 +33,8 @@ const CHAT_LIST_MIN: f32 = 240.;
 const CHAT_LIST_MAX: f32 = 480.;
 
 pub struct Workspace {
+    /// `None` only in tests, which run on mock data without an account.
+    session: Option<Entity<Session>>,
     chat_list: Entity<ChatList>,
     conversation: Entity<Conversation>,
     focus_handle: FocusHandle,
@@ -41,11 +44,15 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session: Option<Entity<Session>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let chat_list = cx.new(|cx| ChatList::new(mock::chats(), cx));
         let conversation = cx.new(|cx| Conversation::new(window, cx));
 
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe(&chat_list, |this, chat_list, event, cx| match event {
                 ChatListEvent::Opened(id) => {
                     let Some(chat) = chat_list.read(cx).chat(id).cloned() else {
@@ -63,18 +70,17 @@ impl Workspace {
             cx.subscribe(&conversation, |this, _, event, cx| match event {
                 ConversationEvent::Send(text) => this.send(text.clone(), cx),
             }),
-            cx.observe_window_appearance(window, |_, window, cx| {
-                if SettingsStore::get(cx).appearance == Appearance::System {
-                    theme::apply_appearance(window, cx);
-                }
-            }),
             // Redraw the status line and which-key popup as keys are typed.
             cx.observe_pending_input(window, |_, _, cx| cx.notify()),
         ];
-        theme::apply_appearance(window, cx);
+        if let Some(session) = &session {
+            // Account name and connection status are shown in the rail.
+            subscriptions.push(cx.observe(session, |_, _, cx| cx.notify()));
+        }
         chat_list.focus_handle(cx).focus(window, cx);
 
         Self {
+            session,
             chat_list,
             conversation,
             focus_handle: cx.focus_handle(),
@@ -446,6 +452,13 @@ impl Render for Workspace {
         let status_line =
             (helix || self.command_line.is_some()).then(|| self.render_status_line(window, cx));
         let which_key = self.render_which_key(window, cx);
+        let account = self.session.as_ref().map(|session| {
+            let session = session.read(cx);
+            Account {
+                name: session.display_name().clone(),
+                status: session.status(),
+            }
+        });
         let theme = cx.theme();
 
         v_flex()
@@ -509,7 +522,7 @@ impl Render for Workspace {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(nav_rail(settings.appearance, cx))
+                    .child(nav_rail(settings.appearance, account, cx))
                     .child(
                         h_resizable("workspace-panes")
                             .on_resize(|state, window, cx| {
@@ -571,7 +584,7 @@ mod tests {
             theme::init(None, cx).unwrap();
             assert_eq!(keymap::load(None, cx), Vec::<String>::new());
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
-                cx.new(|cx| Workspace::new(window, cx))
+                cx.new(|cx| Workspace::new(None, window, cx))
             })
             .unwrap()
         });

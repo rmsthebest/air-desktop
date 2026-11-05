@@ -227,6 +227,19 @@ mod tests {
     }
 
     #[test]
+    fn a_quote_of_a_deleted_message_says_so() {
+        let mut deleted = MimiContent::simple_markdown_message("gone".into(), [0; 16]);
+        deleted.nested_part = NestedPart::NullPart {
+            disposition: Disposition::Render,
+            language: String::new(),
+        };
+        assert_eq!(quote_line(Some(&deleted)), "Deleted message");
+        let text = MimiContent::simple_markdown_message("**hi** there".into(), [0; 16]);
+        assert_eq!(quote_line(Some(&text)), "hi there");
+        assert_eq!(quote_line(None), "Message unavailable");
+    }
+
+    #[test]
     fn a_draft_wins_unless_it_is_blank() {
         let last = || content(Some("Ada"), "hi");
         assert_eq!(

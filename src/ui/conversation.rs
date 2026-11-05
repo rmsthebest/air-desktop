@@ -397,8 +397,13 @@ impl Conversation {
         else {
             return;
         };
-        // An edit starts from the message's text: don't drop what's typed.
-        if !self.composer.read(cx).value().trim().is_empty() {
+        // An edit starts from the message's text: don't drop what's typed
+        // (switching from one edit to another is fine).
+        let editing = self
+            .compose
+            .as_ref()
+            .is_some_and(|c| c.read(cx).is_editing());
+        if !editing && !self.composer.read(cx).value().trim().is_empty() {
             crate::ui::show_error(
                 "Send or clear the message you're writing before editing another.".into(),
                 window,

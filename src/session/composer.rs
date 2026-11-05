@@ -43,8 +43,14 @@ pub struct DraftQueue(mpsc::UnboundedSender<Job>);
 
 impl DraftQueue {
     pub(super) fn start(user: CoreUser, cx: &App) -> (Self, TokioTask<()>) {
+        let (queue, run) = Self::new(user);
+        (queue, Tokio::spawn(cx, run))
+    }
+
+    /// The queue, and the future that runs it.
+    pub(super) fn new(user: CoreUser) -> (Self, impl Future<Output = ()> + Send + 'static) {
         let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
-        let task = Tokio::spawn(cx, async move {
+        let run = async move {
             // Drafts still being typed when the app last quit. As upstream,
             // at startup.
             if let Err(err) = user.commit_all_message_drafts().await {
@@ -53,11 +59,11 @@ impl DraftQueue {
             while let Some(job) = rx.recv().await {
                 job.await;
             }
-        });
-        (Self(tx), task)
+        };
+        (Self(tx), run)
     }
 
-    fn run<R: Send + 'static>(
+    pub(super) fn run<R: Send + 'static>(
         &self,
         job: impl Future<Output = R> + Send + 'static,
     ) -> oneshot::Receiver<R> {
@@ -115,6 +121,9 @@ impl Draft {
 #[derive(Debug, Default)]
 struct DraftState {
     draft: Option<Draft>,
+    /// Text was typed since the last send: a new message, which a failed
+    /// send's reply or edit must not attach to.
+    typed_since_send: bool,
 }
 
 impl DraftState {
@@ -196,14 +205,20 @@ impl DraftState {
     /// is in flight (another send, leaving the chat) reuses its reply or
     /// edit.
     fn take_for_send(&mut self) -> Option<Draft> {
+        self.typed_since_send = false;
         self.draft.take()
+    }
+
+    /// The composer's text changed (before it is stored).
+    fn typed(&mut self, text: &str) {
+        self.typed_since_send |= !text.trim().is_empty();
     }
 
     /// The send of `text` with `sent` failed: the draft comes back, unless
     /// the user started another one meanwhile. A refused edit comes back as
     /// a new message. Returns whether the draft changed.
     fn send_failed(&mut self, sent: Option<Draft>, text: String, edit_refused: bool) -> bool {
-        if self.draft.is_some() {
+        if self.draft.is_some() || self.typed_since_send {
             return false;
         }
         let mut draft = sent.unwrap_or_else(Draft::empty);
@@ -228,8 +243,9 @@ enum Cancelled {
 #[derive(Debug)]
 pub(super) enum Sent {
     Ok,
-    /// The edit window passed or the edit limit was reached.
-    EditRefused(MessageEditError),
+    /// The edit can't be made (window passed, limit reached, original
+    /// gone); says why.
+    EditRefused(&'static str),
     Failed(anyhow::Error),
 }
 
@@ -323,6 +339,7 @@ impl Composer {
 
     /// The user typed: stores the text once typing pauses.
     pub fn typed(&mut self, text: String, cx: &mut Context<Self>) {
+        self.state.typed(&text);
         let Some(live) = &mut self.live else { return };
         live.store_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(STORE_DEBOUNCE).await;
@@ -370,43 +387,48 @@ impl Composer {
             let (text, draft) = (text.clone(), draft.clone());
             async move { send(&user, chat, text, draft.as_ref()).await }
         });
+        let restore = (live.user.clone(), live.chat, live.queue.clone());
         // Not tied to the entity: a send completes even if the chat closes.
         cx.spawn(async move |this, cx| {
             let sent = task
                 .await
                 .unwrap_or_else(|_| Sent::Failed(anyhow::anyhow!("the draft queue stopped")));
-            _ = this.update(cx, |this, cx| {
-                let refused = matches!(sent, Sent::EditRefused(_));
-                if !matches!(sent, Sent::Ok) && this.state.send_failed(draft, text.clone(), refused)
-                {
+            let (refused, error) = match &sent {
+                Sent::Ok => return,
+                Sent::EditRefused(reason) => (true, SharedString::from(*reason)),
+                Sent::Failed(err) => {
+                    error!("failed to send a message: {err:#}");
+                    let error = format!("Couldn't send the message: {err:#}");
+                    (false, error.into())
+                }
+            };
+            let shown = this.update(cx, |this, cx| {
+                if this.state.send_failed(draft.clone(), text.clone(), refused) {
                     this.persist();
                 }
-                match sent {
-                    Sent::Ok => {}
-                    Sent::EditRefused(refused) => {
-                        let error = match refused {
-                            MessageEditError::WindowPassed => {
-                                "This message can't be edited anymore. Your text is kept as a new message."
-                            }
-                            MessageEditError::LimitReached => {
-                                "This message was edited too often. Your text is kept as a new message."
-                            }
-                        };
-                        cx.emit(ComposerEvent::SendFailed {
-                            text,
-                            error: error.into(),
-                        });
-                    }
-                    Sent::Failed(err) => {
-                        error!("failed to send a message: {err:#}");
-                        cx.emit(ComposerEvent::SendFailed {
-                            text,
-                            error: format!("Couldn't send the message: {err:#}").into(),
-                        });
-                    }
-                }
+                cx.emit(ComposerEvent::SendFailed {
+                    text: text.clone(),
+                    error: error.clone(),
+                });
                 cx.notify();
             });
+            if shown.is_err() {
+                // The chat was closed: keep the text as its draft, unless it
+                // has a newer one.
+                let mut state = DraftState::default();
+                state.send_failed(draft, text, refused);
+                let Some(draft) = state.draft.map(|draft| draft.to_core()) else {
+                    return;
+                };
+                let (user, chat, queue) = restore;
+                drop(queue.run(async move {
+                    if let Ok(None) = user.message_draft(chat).await
+                        && let Err(err) = user.store_message_draft(chat, Some(&draft)).await
+                    {
+                        error!("failed to keep an unsent message as a draft: {err:#}");
+                    }
+                }));
+            }
         })
         .detach();
     }
@@ -551,6 +573,18 @@ pub(super) async fn load_draft(user: CoreUser, chat: CoreChatId) -> anyhow::Resu
     }))
 }
 
+/// The message being edited was deleted meanwhile.
+#[derive(Debug)]
+struct EditGone;
+
+impl std::fmt::Display for EditGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the edited message is gone")
+    }
+}
+
+impl std::error::Error for EditGone {}
+
 /// Port of upstream's `try_send_message`: the draft says whether this edits
 /// or replies; the draft itself is cleared only once the message is
 /// stored, so its context survives a failed send.
@@ -563,10 +597,9 @@ pub(super) async fn send(
     let result = async {
         let replaces = match draft.and_then(|draft| draft.editing) {
             Some(id) => {
-                let original = user
-                    .message(id)
-                    .await?
-                    .context("the edited message is gone")?;
+                let Some(original) = user.message(id).await? else {
+                    return Err(EditGone.into());
+                };
                 let body = original.message().mimi_content().and_then(plain_body);
                 if body == Some(text.as_str()) {
                     // Unchanged: just leave edit mode.
@@ -597,10 +630,24 @@ pub(super) async fn send(
             }
             Sent::Ok
         }
-        Err(err) => match err.downcast_ref::<MessageEditError>() {
-            Some(refused) => Sent::EditRefused(*refused),
-            None => Sent::Failed(err),
-        },
+        Err(err) => {
+            if let Some(refused) = err.downcast_ref::<MessageEditError>() {
+                Sent::EditRefused(match refused {
+                    MessageEditError::WindowPassed => {
+                        "This message can't be edited anymore. Your text is kept as a new message."
+                    }
+                    MessageEditError::LimitReached => {
+                        "This message was edited too often. Your text is kept as a new message."
+                    }
+                })
+            } else if err.is::<EditGone>() {
+                Sent::EditRefused(
+                    "The message you were editing is gone. Your text is kept as a new message.",
+                )
+            } else {
+                Sent::Failed(err)
+            }
+        }
     }
 }
 
@@ -682,6 +729,14 @@ mod tests {
         assert!(state.send_failed(sent, "new text".into(), true));
         let draft = state.draft.as_ref().unwrap();
         assert_eq!((draft.editing, draft.text.as_str()), (None, "new text"));
+
+        // Not onto a new message typed meanwhile (not yet stored).
+        let mut state = DraftState::default();
+        state.start_reply(mimi(1), quote("q"));
+        let sent = state.take_for_send();
+        state.typed("something else");
+        assert!(!state.send_failed(sent, "my reply".into(), false));
+        assert_eq!(state.draft, None);
 
         // Not over a draft started meanwhile.
         let mut state = DraftState::default();

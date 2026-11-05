@@ -227,6 +227,33 @@ async fn e2e_sign_up_connect_and_reload() {
         ),
         ("unsent", Some(quote))
     );
+    // Drafts go through one queue: a load queued right after a store (a
+    // chat reopened just after leaving it) reads what was stored.
+    let (queue, run) = composer::DraftQueue::new(user.clone());
+    let queue_task = tokio::spawn(run);
+    let left = composer::Draft {
+        text: "left behind".into(),
+        committed: true,
+        ..composer::Draft::empty()
+    };
+    let (store_user, stored) = (user.clone(), left.to_core());
+    drop(queue.run(async move {
+        store_user
+            .store_message_draft(group_id, Some(&stored))
+            .await
+            .unwrap();
+    }));
+    let reopened = queue
+        .run(composer::load_draft(user.clone(), group_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.map(|d| d.text).as_deref(), Some("left behind"));
+    queue_task.abort();
+    user.store_message_draft(group_id, Some(&loaded_draft.to_core()))
+        .await
+        .unwrap();
+
     // Sending it clears the stored draft (by the version stored).
     let sent = composer::send(&user, group_id, "sent at last".into(), Some(&loaded_draft)).await;
     assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");

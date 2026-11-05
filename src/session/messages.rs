@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aircommon::identifiers::UserId as CoreUserId;
+use aircommon::identifiers::{MimiId, UserId as CoreUserId};
 use aircommon::utils::FibonacciBackoff;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::{DbEntityId, DbOperation};
@@ -446,6 +446,9 @@ struct Key {
     quoted: Option<CoreUserId>,
     /// The message it quotes, to refresh the quote when that changes.
     quotes: Option<CoreMessageId>,
+    /// The quoted message's MIMI id while it isn't here, to pick it up
+    /// when it arrives.
+    awaits: Option<MimiId>,
 }
 
 /// The loaded window's bookkeeping: what the view shows, as keys. Each
@@ -718,6 +721,7 @@ impl Worker {
         let mut new_messages = false;
         let mut own_new_message = false;
         let mut renamed = Vec::new();
+        let mut arrived = Vec::new();
         for (entity, ops) in &changes.merged.ops {
             match entity {
                 DbEntityId::Message(id) if ops.contains(DbOperation::Remove) => {
@@ -739,6 +743,7 @@ impl Worker {
                     match self.user.message(*id).await {
                         Ok(Some(message)) if message.chat_id() == self.chat => {
                             new_messages = true;
+                            arrived.extend(message.message().mimi_id().copied());
                             // Writing in the chat is engaging with it.
                             own_new_message |= !message.is_sent();
                         }
@@ -765,7 +770,7 @@ impl Worker {
                 _ => None,
             })
             .collect();
-        edits.extend(self.reload_replies_to(&changed).await);
+        edits.extend(self.reload_replies_to(&changed, &arrived).await);
         let divider = own_new_message.then_some(None);
         if !edits.is_empty() || divider.is_some() {
             self.send(edits, divider, false).await?;
@@ -779,20 +784,32 @@ impl Worker {
         Ok(())
     }
 
-    /// Reloads the loaded replies to any of `originals`.
-    async fn reload_replies_to(&mut self, originals: &[CoreMessageId]) -> Vec<Change<Message>> {
+    /// Reloads the loaded replies to any of `originals`, or awaiting one
+    /// of the `arrived`.
+    async fn reload_replies_to(
+        &mut self,
+        originals: &[CoreMessageId],
+        arrived: &[MimiId],
+    ) -> Vec<Change<Message>> {
         let ids: Vec<_> = self
             .window
             .keys
             .iter()
-            .filter(|key| key.quotes.is_some_and(|id| originals.contains(&id)))
+            .filter(|key| {
+                key.quotes.is_some_and(|id| originals.contains(&id))
+                    || key.awaits.is_some_and(|id| arrived.contains(&id))
+            })
             .map(|key| key.id)
             .collect();
         let mut edits = Vec::new();
         for id in ids {
-            if let Ok(Some(message)) = self.user.message(id).await {
-                let (key, item) = self.convert(message).await;
-                edits.extend(self.window.patch(key, item));
+            match self.user.message(id).await {
+                Ok(Some(message)) => {
+                    let (key, item) = self.convert(message).await;
+                    edits.extend(self.window.patch(key, item));
+                }
+                Ok(None) => {}
+                Err(err) => error!("failed to reload a reply: {err:#}"),
             }
         }
         edits
@@ -945,6 +962,10 @@ impl Worker {
             sender: sender.clone(),
             quoted,
             quotes,
+            awaits: match message.in_reply_to() {
+                Some((mimi_id, None)) => Some(*mimi_id),
+                _ => None,
+            },
         };
         let item = Message {
             id: model_message_id(message.id()),
@@ -972,6 +993,7 @@ mod tests {
             sender: None,
             quoted: None,
             quotes: None,
+            awaits: None,
         }
     }
 

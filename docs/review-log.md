@@ -274,3 +274,26 @@ Deferred:
 - View tests that a loaded draft only fills an empty composer and that a
   failed send restores text only into a blank one. Both need a live
   composer; they go with the two-user e2e harness.
+
+## Gate 7b — gate 7 fixes (`2c45bba..3131d76`): PASS
+
+Fixed anyway:
+- **Failed send re-attached to new text (medium).** "Started a new
+  message" now means the same for state and view: text typed since the
+  send, stored or not. A failure then doesn't bring back its reply/edit.
+  Covered in `a_send_takes_the_draft_and_a_failure_gives_it_back`.
+- **Edit of a deleted message stuck in edit mode (medium).** A missing
+  original is refused like a passed edit window: the text comes back as a
+  new message.
+- **Failure after leaving the chat was lost (low).** It is logged outside
+  the entity, and the text is kept as the chat's draft (through the queue,
+  unless the chat has a newer draft).
+- **Replies whose original arrives later (low).** They keep the awaited MIMI
+  id and reload when a message with it arrives.
+- **Errors reloading replies are logged (low).**
+- **`e` while editing (low).** Switching from one edit to another is
+  allowed.
+- **Tests.** `a_quote_of_a_deleted_message_says_so`. The e2e test queues a
+  draft store then a load and checks the load sees the store. Caveat: that
+  only shows the queue works. A regression to unqueued loads would fail it
+  only on unlucky timing.

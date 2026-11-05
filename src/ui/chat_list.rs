@@ -6,7 +6,7 @@ use gpui_kit::{
     Context, EventEmitter, FontWeight, IntoElement, Render, SharedString, Window, div, px,
 };
 
-use crate::model::{ChatId, ChatSummary};
+use crate::model::{ChatId, ChatSummary, format_activity};
 use crate::ui::widgets::{avatar, badge};
 
 pub enum ChatListEvent {
@@ -91,7 +91,7 @@ impl ChatList {
                                     .flex_none()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .child(chat.last_activity.clone()),
+                                    .child(format_activity(chat.last_activity, chrono::Utc::now())),
                             ),
                     )
                     .child(

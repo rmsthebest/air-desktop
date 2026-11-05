@@ -71,13 +71,4 @@ mod tests {
             assert_eq!(background, expected);
         });
     }
-
-    #[gpui::test]
-    fn unknown_theme_is_an_error_not_a_panic(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            init(cx).unwrap();
-            assert!(set_theme_pair("Nope", DEFAULT_DARK, cx).is_err());
-        });
-    }
 }

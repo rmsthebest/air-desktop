@@ -103,8 +103,7 @@ impl<R> Drop for TokioTask<R> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use gpui::TestAppContext;
@@ -137,16 +136,26 @@ mod tests {
     #[gpui::test]
     async fn dropping_task_aborts_tokio_future(cx: &mut TestAppContext) {
         setup(cx);
-        let finished = Arc::new(AtomicBool::new(false));
+        // The guard lives inside the tokio future; tokio drops it only when
+        // the task is aborted, since the future itself would sleep for an hour.
+        struct Guard(mpsc::Sender<()>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        // Created outside the future so it is dropped even if the abort
+        // lands before the future is first polled.
+        let guard = Guard(dropped_tx);
         let task = cx.update(|cx| {
-            let finished = finished.clone();
             Tokio::spawn(cx, async move {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                finished.store(true, Ordering::SeqCst);
+                let _guard = guard;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
             })
         });
         drop(task);
-        std::thread::sleep(Duration::from_millis(400));
-        assert!(!finished.load(Ordering::SeqCst));
+        // Generous timeout: only reached if abort is broken.
+        assert!(dropped_rx.recv_timeout(Duration::from_secs(10)).is_ok());
     }
 }

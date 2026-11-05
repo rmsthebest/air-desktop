@@ -10,10 +10,16 @@ use gpui_kit::{AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOpt
 
 use crate::ui::Workspace;
 
+/// Air's core logs user, chat and attachment IDs at `info`; keep dependencies
+/// at `warn` so identifiers don't end up in the journal by default.
+/// Override with `RUST_LOG` when debugging.
+const DEFAULT_LOG_FILTER: &str = "warn,air_desktop=info";
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
         )
         .init();
 

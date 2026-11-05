@@ -4,7 +4,7 @@ use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Context, FontWeight, IntoElement, Render, Window, div, px};
 
-use crate::model::{ChatSummary, Message};
+use crate::model::{ChatSummary, Message, format_message_time, starts_group};
 use crate::ui::widgets::avatar;
 
 /// Messages never stretch wider than this, so lines stay readable on wide
@@ -46,7 +46,7 @@ impl Conversation {
         let message = &self.messages[ix];
         // Consecutive messages from one sender form a group: only the first
         // shows the sender name, and the gap between them is tighter.
-        let starts_group = ix == 0 || self.messages[ix - 1].sender != message.sender;
+        let starts_group = starts_group(&self.messages, ix);
 
         let bubble = v_flex()
             .max_w(gpui_kit::relative(0.75))
@@ -72,10 +72,11 @@ impl Conversation {
                     .text_xs()
                     .opacity(0.7)
                     .text_right()
-                    .child(message.time.clone()),
+                    .child(format_message_time(message.sent_at)),
             );
 
         v_flex()
+            .id(message.id.0.clone())
             .w_full()
             .when(starts_group, |row| row.mt_3())
             .when(!starts_group, |row| row.mt_1())
@@ -89,7 +90,7 @@ impl Conversation {
                         .text_xs()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.muted_foreground)
-                        .child(message.sender.clone()),
+                        .child(message.sender_name.clone()),
                 )
             })
             .child(bubble)

@@ -176,15 +176,14 @@ dependencies = [
  "aircommon",
  "aircoreclient",
  "anyhow",
- "directories",
+ "chrono",
  "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -2059,15 +2058,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2de63d600bc7fab91180bc17385f29b342468dc8ef2af09dceba450a293de3da"
 dependencies = [
  "digest 0.11.3",
-]
-
-[[package]]
-name = "directories"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16f5094c54661b38d03bd7e50df373292118db60b585c08a411c6d840017fe7d"
-dependencies = [
- "dirs-sys 0.5.0",
 ]
 
 [[package]]

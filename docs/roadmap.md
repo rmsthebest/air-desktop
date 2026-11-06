@@ -14,7 +14,7 @@ milestones. Each one ends with a review gate (see CLAUDE.md).
     Send files from a picker or by drag and drop. Downloads are automatic,
     as in upstream's app (only from Air's own storage, nothing third-party);
     retrying a failed upload is left for later.
-11. **Settings screen.** A view for theme, appearance, keymap,
+11. **Settings screen** (done). A view for theme, appearance, keymap,
     notifications, display name and usernames, next to the commands.
 12. **Notification actions.** Clicking a notification opens its chat and
     raises the window (D-Bus `ActionInvoked`, Wayland activation token).

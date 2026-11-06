@@ -8,7 +8,7 @@ use gpui_kit::component::{ActiveTheme as _, IconName, Selectable as _, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, App, IntoElement, div, px};
 
-use crate::actions::{FocusChatList, OpenPalette, ShowShortcuts, ToggleAppearance};
+use crate::actions::{FocusChatList, OpenPalette, OpenSettings, ShowShortcuts, ToggleAppearance};
 use crate::session::ConnectionStatus;
 use crate::settings::Appearance;
 use crate::ui::widgets::avatar;
@@ -50,6 +50,12 @@ pub fn nav_rail(appearance: Appearance, account: Option<Account>, cx: &App) -> i
             OpenPalette,
         ))
         .child(div().flex_1())
+        .child(rail_button(
+            "nav-settings",
+            IconName::Settings,
+            "Settings",
+            OpenSettings,
+        ))
         .child(rail_button(
             "nav-appearance",
             appearance_icon,

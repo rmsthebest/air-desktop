@@ -656,9 +656,11 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     ));
 
     // Bob's rename reaches the messages Ada already has from him.
-    let mut profile = bob.own_user_profile().await.unwrap();
-    profile.display_name = "Robert".parse().unwrap();
-    bob.set_own_user_profile(profile).await.unwrap();
+    assert!(refused(
+        super::set_display_name(bob.clone(), " \t ".into()).await
+    ));
+    let renamed = super::set_display_name(bob.clone(), "  Robert ".into()).await;
+    assert_eq!(renamed.unwrap(), "Robert");
     next_message(&mut ada_updates, |m| {
         m.plain_text() == "hi ada" && m.sender_name == "Robert"
     })

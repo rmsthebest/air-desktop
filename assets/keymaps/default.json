@@ -21,6 +21,7 @@
       "secondary-n": "air::AddContact",
       "secondary-shift-n": "air::NewGroup",
       "secondary-o": "air::AttachFile",
+      "secondary-,": "air::OpenSettings",
       "secondary-enter": "air::AcceptRequest",
       "secondary-shift-backspace": "air::DeclineRequest",
       "secondary-shift-t": "air::ToggleAppearance",
@@ -43,6 +44,23 @@
       "down": "air::SelectNext",
       "up": "air::SelectPrev",
       "enter": "air::FocusConversation"
+    }
+  },
+  {
+    "context": "Settings",
+    "bindings": {
+      "down": "air::SelectNext",
+      "up": "air::SelectPrev",
+      "j": "air::SelectNext",
+      "k": "air::SelectPrev",
+      "home": "air::SelectFirst",
+      "end": "air::SelectLast",
+      "right": "air::SettingNext",
+      "left": "air::SettingPrev",
+      "l": "air::SettingNext",
+      "h": "air::SettingPrev",
+      "enter": "air::SettingNext",
+      "escape": "air::CloseSettings"
     }
   },
   {

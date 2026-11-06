@@ -117,6 +117,40 @@ pub fn select_theme(name: &str, window: &mut Window, cx: &mut App) -> anyhow::Re
     saved
 }
 
+/// Uses `name` for its mode (light or dark) and saves it, keeping the
+/// appearance: stepping through themes in the settings changes one half of
+/// the pair, shown at once if that mode is the one on screen.
+pub fn set_theme(name: &str, window: &mut Window, cx: &mut App) -> anyhow::Result<()> {
+    let config = find(name, cx)?;
+    let active = Theme::global(cx);
+    let (light, dark) = if config.mode.is_dark() {
+        (active.light_theme.name.to_string(), config.name.to_string())
+    } else {
+        (config.name.to_string(), active.dark_theme.name.to_string())
+    };
+    set_theme_pair(&light, &dark, cx)?;
+    let saved = SettingsStore::update(cx, |settings| {
+        settings.light_theme = light;
+        settings.dark_theme = dark;
+    });
+    apply_appearance(window, cx);
+    saved
+}
+
+/// Registered theme names by mode, each sorted.
+pub fn by_mode(cx: &App) -> crate::ui::Themes {
+    let mut themes = crate::ui::Themes::default();
+    for (name, config) in ThemeRegistry::global(cx).themes() {
+        match config.mode.is_dark() {
+            true => themes.dark.push(name.to_string()),
+            false => themes.light.push(name.to_string()),
+        }
+    }
+    themes.light.sort();
+    themes.dark.sort();
+    themes
+}
+
 /// Registered theme names, sorted.
 pub fn available(cx: &App) -> Vec<String> {
     let mut themes: Vec<_> = ThemeRegistry::global(cx)

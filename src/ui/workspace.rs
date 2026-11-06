@@ -16,8 +16,8 @@ use crate::actions::{
     self, AcceptRequest, AddContact, AttachFile, DeclineRequest, FindChat, FocusChatList,
     FocusComposer, FocusConversation, FocusMessages, FocusNextPane, InviteToGroup, JumpBack,
     JumpForward, NewGroup, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette,
-    PickTheme, PrevChat, PrevUnreadChat, SelectFirst, SelectLast, ShowShortcuts, ToggleAppearance,
-    ToggleDetails, ToggleHelixMode,
+    OpenSettings, PickTheme, PrevChat, PrevUnreadChat, SelectFirst, SelectLast, ShowShortcuts,
+    ToggleAppearance, ToggleDetails, ToggleHelixMode,
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, Request, UserId, mock};
@@ -34,6 +34,7 @@ use crate::ui::conversation::{Conversation, ConversationEvent};
 use crate::ui::details_pane::details_pane;
 use crate::ui::nav_rail::{Account, nav_rail};
 use crate::ui::palette::{self, Scope};
+use crate::ui::settings_view::{SettingsEvent, SettingsView};
 use crate::ui::{key_context, show_error, show_info, show_refusal, update_settings};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::ButtonVariant;
@@ -56,6 +57,9 @@ pub struct Workspace {
     contact_task: Option<Task<()>>,
     /// The open group's members.
     members: Option<(Entity<Members>, Subscription)>,
+    settings_view: Entity<SettingsView>,
+    /// The settings screen is shown in place of the conversation.
+    settings_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -73,6 +77,7 @@ impl Workspace {
             None => ChatList::new(mock::chats(), LoadState::Loaded, cx),
         });
         let conversation = cx.new(|cx| Conversation::new(window, cx));
+        let settings_view = cx.new(|cx| SettingsView::new(session.clone(), cx));
 
         let mut subscriptions = vec![
             cx.subscribe_in(
@@ -86,6 +91,7 @@ impl Workspace {
                         // After a back/forward step this is the jumplist's current
                         // entry, which `push` ignores.
                         this.jumps.push(id.clone());
+                        this.settings_open = false;
                         let (messages, compose) = match &this.session {
                             Some(session) => (
                                 cx.new(|cx| Messages::open(session, id, cx)),
@@ -135,6 +141,9 @@ impl Workspace {
                     }
                 },
             ),
+            cx.subscribe_in(&settings_view, window, |this, _, event, window, cx| {
+                this.settings_changed(event.clone(), window, cx)
+            }),
             // Redraw the status line and which-key popup as keys are typed.
             cx.observe_pending_input(window, |_, _, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
@@ -167,6 +176,8 @@ impl Workspace {
             command_line: None,
             contact_task: None,
             members: None,
+            settings_view,
+            settings_open: false,
             _subscriptions: subscriptions,
         };
         this.report_attention(window, cx);
@@ -249,6 +260,7 @@ impl Workspace {
 
     fn focus_messages(&mut self, _: &FocusMessages, window: &mut Window, cx: &mut Context<Self>) {
         if self.has_open_chat(cx) {
+            self.hide_settings(cx);
             self.conversation.focus_handle(cx).focus(window, cx);
         }
     }
@@ -258,8 +270,10 @@ impl Workspace {
         let Some(ix) = list.selected_index() else {
             return;
         };
+        let request = list.chats()[ix].request.is_some();
+        self.hide_settings(cx);
         // A contact request's chat has no composer until it is accepted.
-        if list.chats()[ix].request.is_some() {
+        if request {
             self.conversation.focus_handle(cx).focus(window, cx);
         } else {
             self.conversation
@@ -276,6 +290,77 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.focus_composer(&FocusComposer, window, cx);
+    }
+
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = true;
+        self.settings_view.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn hide_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_open {
+            self.settings_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Closes the settings, back to the open chat if there is one.
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hide_settings(cx);
+        if self.has_open_chat(cx) {
+            self.focus_messages(&FocusMessages, window, cx);
+        } else {
+            self.focus_chat_list(&FocusChatList, window, cx);
+        }
+    }
+
+    /// Does what the settings screen asked for, the way the matching
+    /// command does it.
+    fn settings_changed(
+        &mut self,
+        event: SettingsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SettingsEvent::Appearance(appearance) => self.set_appearance(appearance, window, cx),
+            SettingsEvent::Theme(name) => {
+                if let Err(err) = theme::set_theme(&name, window, cx) {
+                    show_error(format!("Couldn't switch theme: {err:#}"), window, cx);
+                }
+            }
+            SettingsEvent::Keymap(mode) => self.set_keymap_mode(mode, window, cx),
+            SettingsEvent::Notifications(level) => {
+                update_settings(window, cx, |settings| settings.notifications = level)
+            }
+            SettingsEvent::EditDisplayName(name) => {
+                self.prompt(&format!("name {name}"), window, cx)
+            }
+            SettingsEvent::AddUsername => self.prompt("username ", window, cx),
+            SettingsEvent::RemoveUsername(username) => {
+                let name = username.to_string();
+                self.confirm(
+                    format!("Remove the username {name}?"),
+                    "Nobody can send you a new contact request through it. \
+                     Your contacts stay."
+                        .into(),
+                    "Remove",
+                    move |this, window, cx| {
+                        let name = name.clone();
+                        this.contact_op(
+                            window,
+                            cx,
+                            move |session, cx| session.remove_username(&name, cx),
+                            |(), _, _, _| {},
+                        );
+                    },
+                    window,
+                    cx,
+                );
+            }
+            SettingsEvent::Close => self.close_settings(window, cx),
+        }
     }
 
     fn focus_next_pane(&mut self, _: &FocusNextPane, window: &mut Window, cx: &mut Context<Self>) {
@@ -599,6 +684,17 @@ impl Workspace {
                 show_info(what.into(), window, cx);
             }
             Command::Shortcuts => palette::show_shortcuts(window, cx),
+            Command::DisplayName(name) => self.contact_op(
+                window,
+                cx,
+                |session, cx| session.set_display_name(&name, cx),
+                |name, this, window, cx| {
+                    if let Some(session) = &this.session {
+                        session.update(cx, |session, cx| session.reload_profile(cx));
+                    }
+                    show_info(format!("Your name is now {name}"), window, cx)
+                },
+            ),
             Command::AddContact(username) => self.send_contact_request(username, window, cx),
             Command::Accept => self.accept_request(&AcceptRequest, window, cx),
             Command::Decline => self.decline_request(&DeclineRequest, window, cx),
@@ -1086,6 +1182,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::add_contact))
             .on_action(cx.listener(Self::new_group))
             .on_action(cx.listener(Self::attach_file))
+            .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::invite_to_group))
             .on_action(cx.listener(Self::accept_request))
             .on_action(cx.listener(Self::decline_request))
@@ -1128,12 +1225,20 @@ impl Render for Workspace {
                                     .size_range(px(CHAT_LIST_MIN)..px(CHAT_LIST_MAX))
                                     .child(self.chat_list.clone()),
                             )
-                            .child(resizable_panel().child(self.conversation.clone()))
+                            .child(resizable_panel().child(if self.settings_open {
+                                self.settings_view.clone().into_any_element()
+                            } else {
+                                self.conversation.clone().into_any_element()
+                            }))
                             .child(
                                 resizable_panel()
                                     .size(px(300.))
                                     .size_range(px(240.)..px(420.))
-                                    .visible(settings.details_open && open_chat.is_some())
+                                    .visible(
+                                        settings.details_open
+                                            && open_chat.is_some()
+                                            && !self.settings_open,
+                                    )
                                     .child(details_pane(
                                         open_chat.as_ref(),
                                         self.members
@@ -1778,6 +1883,44 @@ mod tests {
             // Focus is back where the command was typed.
             assert_eq!(focus(cx), Focus::Messages);
         }
+    }
+
+    #[gpui::test]
+    fn settings_change_from_the_keyboard_and_close_back(cx: &mut TestAppContext) {
+        use crate::ui::settings_view::Row;
+        let (workspace, cx) = setup(cx);
+        let focus = focus_probe(&workspace, cx);
+        let row = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace.settings_view.read(cx).selected_row(cx)
+            })
+        };
+        let notifications =
+            |cx: &mut VisualTestContext| cx.update(|_, cx| SettingsStore::get(cx).notifications);
+        cx.simulate_keystrokes(&format!("{MOD}-,"));
+        cx.run_until_parked();
+        assert_eq!(focus(cx), Focus::Other, "the settings screen has focus");
+        assert!(matches!(row(cx), Some(Row::Appearance(_))));
+        // Letters move here: the screen has no text input to steal from.
+        cx.simulate_keystrokes("down j down down");
+        assert!(matches!(row(cx), Some(Row::Notifications(_))));
+        cx.simulate_keystrokes("right");
+        assert_eq!(notifications(cx), Notifications::Private);
+        cx.simulate_keystrokes("left left");
+        assert_eq!(notifications(cx), Notifications::Off);
+        // Without an account the list ends with the app's settings.
+        cx.simulate_keystrokes("end");
+        assert!(matches!(row(cx), Some(Row::Notifications(_))));
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.settings_open));
+        assert_eq!(focus(cx), Focus::ChatList);
+        // Opening a chat while it is open shows the chat instead.
+        cx.simulate_keystrokes(&format!("{MOD}-,"));
+        cx.simulate_keystrokes(&format!("{MOD}-1"));
+        cx.run_until_parked();
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.settings_open));
     }
 
     #[gpui::test]

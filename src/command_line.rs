@@ -36,6 +36,8 @@ pub enum Command {
     DeleteChat,
     /// Send the file at this path, as typed, to the open chat.
     Attach(String),
+    /// Change the user's display name.
+    DisplayName(String),
 }
 
 /// What arguments complete from.
@@ -157,6 +159,11 @@ const SPECS: &[Spec] = &[
         help: "Send a file (a path) to the open chat",
     },
     Spec {
+        names: &["name"],
+        arg: Arg::Text,
+        help: "Change your display name",
+    },
+    Spec {
         names: &["username"],
         arg: Arg::Text,
         help: "Add a username others can find you by",
@@ -229,6 +236,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "leave" => Command::Leave,
         "delete-chat" => Command::DeleteChat,
         "attach" => Command::Attach(need("a file path")?),
+        "name" => Command::DisplayName(need("a name")?),
         other => unreachable!("spec {other} has no parser"),
     })
 }

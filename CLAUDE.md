@@ -164,6 +164,15 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   text input (they'd steal typing): use `ChatList`/`MessageList`, or
   `Workspace && helix && !Input`.
 - `src/settings.rs` — `<config>/settings.json` (`SettingsStore` global).
+- `src/ui/settings_view.rs` — the settings screen (`OpenSettings`,
+  `ctrl-,` / `space s`), shown in place of the conversation. A list of
+  rows: up/down (j/k) pick, left/right (h/l, enter) step a choice; it
+  only emits `SettingsEvent`s, which the workspace carries out the way
+  the matching command does. Text (display name, a new username) is
+  typed on the command line, prefilled (`:name`, `:username`); removing
+  a username is confirmed. Themes step within their mode and keep the
+  appearance (`theme::set_theme`). Opening a chat or focusing the
+  conversation hides it.
 - Config dir: XDG (`~/.config/air-desktop`), override with
   `AIR_DESKTOP_CONFIG_DIR`. Data dir (account DBs): XDG data dir, override
   with `AIR_DESKTOP_DATA_DIR`; kept 0700, files tightened to 0600 after the

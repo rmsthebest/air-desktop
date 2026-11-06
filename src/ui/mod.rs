@@ -7,10 +7,12 @@ mod markdown_view;
 mod nav_rail;
 mod onboarding;
 mod palette;
+mod settings_view;
 mod widgets;
 mod workspace;
 
 pub use app_root::AppRoot;
+pub use settings_view::Themes;
 pub use workspace::Workspace;
 
 use gpui::{App, KeyContext, Window};

@@ -259,7 +259,20 @@ impl Session {
         }
     }
 
-    fn reload_profile(&mut self, cx: &mut Context<Self>) {
+    /// Changes the user's display name, as their contacts see it.
+    /// Resolves to the name as shown once it is stored and sent; then
+    /// [`Self::reload_profile`] shows it (the core may not report its own
+    /// change).
+    pub fn set_display_name(
+        &self,
+        name: &str,
+        cx: &App,
+    ) -> impl Future<Output = Result<SharedString, String>> + use<> {
+        let (user, name) = (self.user.clone(), name.to_string());
+        contacts::on_tokio(cx, "change your name", set_display_name(user, name))
+    }
+
+    pub(crate) fn reload_profile(&mut self, cx: &mut Context<Self>) {
         let user = self.user.clone();
         let profile = Tokio::spawn(cx, async move { user.own_user_profile().await });
         self.profile_task =
@@ -292,6 +305,18 @@ impl Session {
             overflowed,
         });
     }
+}
+
+/// See [`Session::set_display_name`].
+async fn set_display_name(user: CoreUser, name: String) -> Result<SharedString, contacts::Failure> {
+    let display_name: aircoreclient::DisplayName = name
+        .trim()
+        .parse()
+        .map_err(|_| contacts::Failure::Shown("A name can't be blank".into()))?;
+    let mut profile = user.own_user_profile().await.map_err(anyhow::Error::from)?;
+    profile.display_name = display_name;
+    let profile = user.set_own_user_profile(profile).await?;
+    Ok(crate::model::name_line(profile.display_name.as_ref()))
 }
 
 /// Drains database changes in batches, so a burst costs one UI update

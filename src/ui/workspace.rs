@@ -121,10 +121,13 @@ impl Workspace {
                             conversation.show(chat, messages, compose, window, cx)
                         });
                         this.report_attention(window, cx);
-                        // A chat awaited until listed takes focus now; any
-                        // other opening ends the wait.
+                        // A chat awaited until listed takes focus now, if
+                        // focus is still where the wait left it: the user
+                        // may have gone on to type elsewhere. Any other
+                        // opening ends the wait.
                         if let Some((awaited, focus)) = this.focus_when_opened.take()
                             && &awaited == id
+                            && this.chat_list.focus_handle(cx).is_focused(window)
                         {
                             focus(this, window, cx);
                         }
@@ -2050,6 +2053,65 @@ mod tests {
         });
         assert_eq!(open, Some(added));
         assert_eq!(focus(cx), Focus::Composer);
+    }
+
+    /// Waits for an unlisted chat as an alert does, does `meanwhile`, then
+    /// lists the chat. Returns the chat open after.
+    fn wait_then_list(
+        cx: &mut VisualTestContext,
+        workspace: &Entity<Workspace>,
+        meanwhile: impl FnOnce(&mut VisualTestContext),
+    ) -> Option<ChatId> {
+        let added = ChatId("just-added".into());
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_from_alert(added.clone(), window, cx)
+        });
+        meanwhile(cx);
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, cx| {
+            let mut chats = workspace.chats(cx);
+            let mut new = chats[0].clone();
+            new.id = added;
+            chats.push(new);
+            workspace.update_chat_list(cx, |list, cx| list.set_chats(chats, LoadState::Loaded, cx));
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .conversation
+                .read(cx)
+                .chat()
+                .map(|chat| chat.id.clone())
+        })
+    }
+
+    #[gpui::test]
+    fn a_chat_listed_late_never_takes_focus_from_where_the_user_went(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let focus = focus_probe(&workspace, cx);
+        // Typing a command meanwhile: the chat opens, the command line
+        // keeps focus.
+        let open = wait_then_list(cx, &workspace, |cx| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_command_line(&OpenCommandLine, window, cx)
+            })
+        });
+        assert_eq!(open, Some(ChatId("just-added".into())));
+        assert_eq!(focus(cx), Focus::Other);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.command_line.is_some()));
+    }
+
+    #[gpui::test]
+    fn opening_another_chat_ends_the_wait(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let focus = focus_probe(&workspace, cx);
+        let first = workspace.read_with(cx, |workspace, cx| workspace.chats(cx)[0].id.clone());
+        let open = wait_then_list(cx, &workspace, |cx| {
+            cx.simulate_keystrokes(&format!("{MOD}-1"))
+        });
+        // The chat the user picked stays open, and focus where it was.
+        assert_eq!(open, Some(first));
+        assert_eq!(focus(cx), Focus::ChatList);
     }
 
     #[gpui::test]

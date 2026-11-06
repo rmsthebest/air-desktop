@@ -814,3 +814,22 @@ Fixed (low):
 
 Still deferred (account seam): attention reported for what the settings
 hid while an alert's chat isn't listed, then for the chat once it opens.
+
+## Gate 14d — gate 14c fixes (`eae030f..01522b5`): PASS
+
+Fixed:
+- **A chat listed late took focus from wherever the user went (medium).**
+  The awaited chat takes focus only if the chat list still has it.
+  `a_chat_listed_late_never_takes_focus_from_where_the_user_went` (fails
+  without the check); `opening_another_chat_ends_the_wait`.
+- **The click window ran from handling, not arrival (low).** Replies are
+  stamped when the pump reads them, so a close queued behind slow calls
+  still counts as the click's.
+  `the_close_right_after_a_click_marks_nothing_even_if_handled_late`.
+- The long `private` test no longer repeats the plain click-then-close
+  case; that has its own test now.
+
+Accepted: an `Opened` already queued for another chat ends a wait set
+after it (focus stays on the chat list). Deferred: the command path for a
+contact-request chat focusing its messages (needs a request chat in the
+mock data listed late).

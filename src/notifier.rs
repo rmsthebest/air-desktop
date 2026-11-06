@@ -56,6 +56,8 @@ pub struct Reply {
     pub from: String,
     pub id: u32,
     pub what: Replied,
+    /// When it arrived: it may wait while the notifier is in a call.
+    pub at: tokio::time::Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,7 +377,7 @@ impl<D: Desktop + Send> Notifier<D> {
         match reply.what {
             Replied::Clicked => {
                 if let Some(newest) = chats.iter().map(|(_, shown)| shown.seq).max() {
-                    self.clicked = Some((reply.id, newest, tokio::time::Instant::now()));
+                    self.clicked = Some((reply.id, newest, reply.at));
                 }
                 chats
                     .iter()
@@ -396,7 +398,7 @@ impl<D: Desktop + Send> Notifier<D> {
                 let seen = self
                     .clicked
                     .take_if(|(id, ..)| *id == reply.id)
-                    .filter(|(.., at)| at.elapsed() < CLOSED_BY_CLICK)
+                    .filter(|(.., at)| reply.at.duration_since(*at) < CLOSED_BY_CLICK)
                     .map(|(_, newest, _)| newest);
                 chats
                     .into_iter()
@@ -534,7 +536,12 @@ mod tests {
             notifier.desktop.visible.remove(&id);
         }
         let from = notifier.desktop.server.unwrap().to_string();
-        notifier.replied(Reply { from, id, what })
+        notifier.replied(Reply {
+            from,
+            id,
+            what,
+            at: tokio::time::Instant::now(),
+        })
     }
 
     fn bodies(notifier: &Notifier<Screen>) -> Vec<String> {
@@ -671,6 +678,7 @@ mod tests {
             from: "elsewhere".into(),
             id,
             what: Replied::Dismissed,
+            at: tokio::time::Instant::now(),
         };
         assert!(notifier.replied(stranger).is_empty());
         assert_eq!(
@@ -765,14 +773,6 @@ mod tests {
             user_does(&mut notifier, "New activity", Replied::Clicked),
             [Outcome::Open(second)]
         );
-        assert!(user_does(&mut notifier, "New activity", Replied::Dismissed).is_empty());
-        notifier
-            .handle(Notice::Show(alert_until(1, "secret", 10)), &private)
-            .await;
-        notifier
-            .handle(Notice::Show(alert_until(2, "other", 20)), &private)
-            .await;
-        user_does(&mut notifier, "New activity", Replied::Clicked);
         // Shown in it after the click, before the server's close: the
         // click didn't see it, so that close marks it, and only it.
         notifier
@@ -873,6 +873,7 @@ mod tests {
             from: from.clone(),
             id,
             what,
+            at: tokio::time::Instant::now(),
         };
         replies_tx.send(reply(hi, Replied::Clicked)).unwrap();
         assert_eq!(outcomes.recv().await, Some(Outcome::Open(first)));
@@ -897,6 +898,28 @@ mod tests {
         };
         assert_eq!(left, ["hi"]);
         running.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_close_right_after_a_click_marks_nothing_even_if_handled_late() {
+        let mut notifier = Notifier::new(Screen::default());
+        notifier
+            .handle(
+                Notice::Show(alert_until(1, "hi", 10)),
+                &Attention::default(),
+            )
+            .await;
+        user_does(&mut notifier, "hi", Replied::Clicked);
+        let id = notifier.shown[&alert(1, "").chat].id;
+        let closed = Reply {
+            from: notifier.desktop.server.unwrap().to_string(),
+            id,
+            what: Replied::Dismissed,
+            at: tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        };
+        // Waited while the notifier was stuck in calls.
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        assert!(notifier.replied(closed).is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1106,7 +1129,7 @@ mod linux {
         replies: mpsc::UnboundedSender<super::Reply>,
     ) {
         while let Some(message) = signals.next().await {
-            if let Some(reply) = reply_from(&message)
+            if let Some(reply) = reply_from(&message, tokio::time::Instant::now())
                 && replies.send(reply).is_err()
             {
                 return;
@@ -1239,7 +1262,7 @@ mod linux {
     /// `CloseNotification` call (reason 3) are ours, already accounted for;
     /// and a stale one could name an id the server has since handed out
     /// again.
-    fn reply_from(message: &Message) -> Option<super::Reply> {
+    fn reply_from(message: &Message, at: tokio::time::Instant) -> Option<super::Reply> {
         use super::Replied;
         let header = message.header();
         let from = header.sender()?.to_string();
@@ -1259,7 +1282,7 @@ mod linux {
             }
             _ => return None,
         };
-        Some(super::Reply { from, id, what })
+        Some(super::Reply { from, id, what, at })
     }
 
     /// Escapes the characters the notification markup subset gives meaning.
@@ -1331,14 +1354,16 @@ mod linux {
 
         #[test]
         fn only_clicks_and_the_users_closes_are_replies() {
+            let at = tokio::time::Instant::now();
             let reply = |what| {
                 Some(Reply {
                     from: ":1.5".into(),
                     id: 7,
                     what,
+                    at,
                 })
             };
-            let read = |message: Message| super::reply_from(&message);
+            let read = |message: Message| super::reply_from(&message, at);
             assert_eq!(
                 read(signal("ActionInvoked", &(7u32, "default"))),
                 reply(Replied::Clicked)

@@ -550,3 +550,23 @@ Moved (milestone 9): the gate 9c deferral "reactions keep an old alert
 alive" goes to milestone 12. Upstream advances `notified_until` when the
 user dismisses a notification, which needs the server's
 `NotificationClosed` signal that milestone subscribes to.
+
+## Gate 11 — milestone 9 (`d0ac5d6..baf147a`): PASS
+
+Fixed:
+- **One peer could inflate a count with invisible variants (medium).**
+  Reactors are merged per label as a set: each counts once. Covered in
+  `reactions_are_bounded_and_never_hide_the_users_own`.
+- **The picker outlived its message (low).** A splice that drops the
+  cursor closes it.
+- **Quick toggles raced (low).** The view decides add or retract from what
+  it shows (`set_reaction`); a repeated add is a no-op in the core.
+- **Alerts showed a reaction's whole text (low).** They use
+  `reaction_label`, as the app does.
+- **Quadratic merge (low).** Labels are indexed in a map.
+- Tests: the variation-selector label of ❤️, and the standard keymap's
+  picker keys.
+
+Deferred:
+- A behaviour test for the splice case needs a live message window (the
+  mock one only appends); the rule is one line next to the cursor shift.

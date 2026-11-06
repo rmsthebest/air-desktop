@@ -268,6 +268,8 @@ impl Conversation {
         }
         self.list.splice(old.clone(), count);
         self.cursor = self.cursor.and_then(|ix| shift(ix, &old, count));
+        // Its message gone, the picker goes too.
+        self.reacting &= self.cursor.is_some();
     }
 
     /// The open chat's summary changed; its messages stay as they are.
@@ -536,10 +538,15 @@ impl Conversation {
         else {
             return;
         };
-        let Some(id) = self.reactable(cx).map(|message| message.id.clone()) else {
+        let Some(message) = self.reactable(cx) else {
             return;
         };
-        let Some(toggle) = messages.read(cx).toggle_reaction(&id, emoji, cx) else {
+        let id = message.id.clone();
+        let given = message
+            .reactions
+            .iter()
+            .any(|reaction| reaction.own && reaction.label == crate::model::reaction_label(emoji));
+        let Some(toggle) = messages.read(cx).set_reaction(&id, emoji, !given, cx) else {
             crate::ui::show_refusal("Reactions need an account".into(), window, cx);
             return;
         };

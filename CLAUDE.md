@@ -44,8 +44,10 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     re-emits as list splices. Reactions come with each message (the core
     loads them) and are summarized by `model::reactions`: peer emoji are
     unchecked text, so each is cut to one visible grapheme, look-alikes
-    merge, at most 12 kinds show, the user's own always.
-    `toggle_reaction` adds or retracts (detached, like sends). The picker
+    merge (each reactor counted once per label), at most 12 kinds show,
+    the user's own always; alerts use the same label.
+    `set_reaction` adds or retracts as the view decided (detached, like
+    sends; the core ignores a repeated add). The picker
     (`+`, then 1–6) is a bar under the list, not part of a list item, so
     opening it doesn't re-measure the list. Opens at the first unread message. Marking as
     read is debounced, only for messages shown while the window is active,

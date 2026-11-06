@@ -369,7 +369,9 @@ async fn current_alert(user: &CoreUser, chat: &Chat) -> Option<Alert> {
                     None => None,
                 };
                 let target = target.unwrap_or_else(|| "your message".into());
-                let line = format!("{reactor} reacted {} to {target}", reaction.emoji);
+                // Shown as in the app: one grapheme of the peer's text.
+                let emoji = crate::model::reaction_label(&reaction.emoji);
+                let line = format!("{reactor} reacted {emoji} to {target}");
                 Some(preview_line(&line).to_string())
             }
         };

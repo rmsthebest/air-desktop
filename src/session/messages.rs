@@ -262,22 +262,25 @@ impl Messages {
         }));
     }
 
-    /// Adds `emoji` to the message's reactions, or retracts it if the user
-    /// reacted with it. Resolves to whether it was added. `None` for fixed
-    /// messages (no account). Runs detached, as sends do.
-    pub fn toggle_reaction(
+    /// Adds `emoji` to the message's reactions, or retracts it (`add`
+    /// false). The caller decides from what it shows, so presses in quick
+    /// succession don't race on what is stored; adding twice is a no-op in
+    /// the core. `None` for fixed messages (no account). Runs detached, as
+    /// sends do.
+    pub fn set_reaction(
         &self,
         id: &MessageId,
         emoji: &str,
+        add: bool,
         cx: &App,
-    ) -> Option<impl Future<Output = Result<bool, String>> + use<>> {
+    ) -> Option<impl Future<Output = Result<(), String>> + use<>> {
         let live = self.live.as_ref()?;
         let (user, chat, id) = (live.user.clone(), live.chat, core_message_id(id));
         let emoji = emoji.to_string();
         Some(on_tokio(cx, "react", async move {
             let id =
                 id.ok_or_else(|| Failure::Shown("That message can't take reactions".into()))?;
-            toggle_reaction(&user, chat, id, emoji).await
+            set_reaction(&user, chat, id, emoji, add).await
         }))
     }
 
@@ -974,12 +977,12 @@ impl Worker {
         };
         // A deleted or hidden message's reactions aren't shown either.
         let (reactions, more_reactions) = if matches!(body, MessageBody::Text { .. }) {
-            let me = self.user.user_id();
             crate::model::reactions(
                 message
                     .reactions()
                     .iter()
-                    .map(|(emoji, users)| (emoji.as_str(), users.len(), users.contains(me))),
+                    .map(|(emoji, users)| (emoji.as_str(), users.as_slice())),
+                self.user.user_id(),
             )
         } else {
             (Vec::new(), 0)
@@ -1016,28 +1019,25 @@ impl Worker {
     }
 }
 
-/// See [`Messages::toggle_reaction`].
-pub(super) async fn toggle_reaction(
+/// See [`Messages::set_reaction`].
+pub(super) async fn set_reaction(
     user: &CoreUser,
     chat: CoreChatId,
     message: CoreMessageId,
     emoji: String,
-) -> Result<bool, Failure> {
+    add: bool,
+) -> Result<(), Failure> {
     // The core finds the message by id alone; only this chat's are ours.
     let found = user.message(message).await?;
     if found.as_ref().is_none_or(|found| found.chat_id() != chat) {
         return Err(Failure::Shown("That message is gone".into()));
     }
-    let reactions = user.message_reactions(message).await?;
-    let own = reactions
-        .get(&emoji)
-        .is_some_and(|users| users.contains(user.user_id()));
-    if own {
-        user.delete_reaction(chat, message, emoji).await?;
-    } else {
+    if add {
         user.send_reaction(chat, message, emoji).await?;
+    } else {
+        user.delete_reaction(chat, message, emoji).await?;
     }
-    Ok(!own)
+    Ok(())
 }
 
 #[cfg(test)]

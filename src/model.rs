@@ -6,6 +6,7 @@
 //! Identity always comes from IDs. Display names are peer-controlled and are
 //! only ever shown, never compared.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike as _, Local, Utc};
@@ -203,25 +204,34 @@ pub fn reaction_label(emoji: &str) -> SharedString {
     if label.is_empty() { "?".into() } else { label }
 }
 
-/// What a message's reactions show: `(emoji, reactors, user among them)`,
-/// in order of first appearance. Emoji that look the same once labelled
-/// are counted together. At most [`MAX_REACTIONS`] kinds, but always the
-/// user's own (so they can see what they would retract); returns how many
-/// kinds were left out.
-pub fn reactions<'a>(
-    raw: impl IntoIterator<Item = (&'a str, usize, bool)>,
+/// What a message's reactions show, from `(emoji, reactors)` in order of
+/// first appearance; `me` is the user. Emoji that look the same once
+/// labelled are counted together, each reactor once (a peer could react
+/// with many invisible variants of one emoji). At most [`MAX_REACTIONS`]
+/// kinds, but always the user's own (so they can see what they would
+/// retract); returns how many kinds were left out.
+pub fn reactions<'a, U: Eq + std::hash::Hash + 'a>(
+    raw: impl IntoIterator<Item = (&'a str, &'a [U])>,
+    me: &U,
 ) -> (Vec<Reaction>, usize) {
-    let mut merged: Vec<Reaction> = Vec::new();
-    for (emoji, count, own) in raw {
+    let mut index: HashMap<SharedString, usize> = HashMap::new();
+    let mut merged: Vec<(SharedString, HashSet<&'a U>)> = Vec::new();
+    for (emoji, users) in raw {
         let label = reaction_label(emoji);
-        match merged.iter_mut().find(|reaction| reaction.label == label) {
-            Some(reaction) => {
-                reaction.count += count;
-                reaction.own |= own;
-            }
-            None => merged.push(Reaction { label, count, own }),
-        }
+        let ix = *index.entry(label.clone()).or_insert_with(|| {
+            merged.push((label, HashSet::new()));
+            merged.len() - 1
+        });
+        merged[ix].1.extend(users);
     }
+    let merged: Vec<Reaction> = merged
+        .into_iter()
+        .map(|(label, users)| Reaction {
+            label,
+            count: users.len(),
+            own: users.contains(me),
+        })
+        .collect();
     let total = merged.len();
     let mut shown = Vec::new();
     for (ix, reaction) in merged.into_iter().enumerate() {
@@ -597,7 +607,7 @@ pub mod mock {
             msg(true, "Yes, it is so much nicer on a big screen.", 9),
             msg(true, "And everything is reachable from the keyboard.", 9),
             Message {
-                reactions: reactions([("👍", 2, true), ("😂", 1, false)]).0,
+                reactions: reactions([("👍", &["me", "peer"][..]), ("😂", &["peer"][..])], &"me").0,
                 ..msg(false, "Ctrl+K to jump between chats is my favourite.", 7)
             },
             msg(false, "The engine can compose music too.", 3),
@@ -778,17 +788,22 @@ mod tests {
         let many: Vec<String> = (0..40)
             .map(|n| char::from_u32(0x1F600 + n).unwrap().to_string())
             .collect();
-        let mut raw: Vec<(&str, usize, bool)> =
-            many.iter().map(|e| (e.as_str(), 1, false)).collect();
-        // Looks like 👍 once invisible characters go: counted with it.
-        raw.insert(0, ("👍", 2, false));
-        raw.insert(1, ("\u{200B}👍\u{202E}", 1, true));
+        const ME: &str = "me";
+        const PEER: &str = "peer";
+        const OTHER: &str = "other";
+        let mut raw: Vec<(&str, &[&str])> =
+            many.iter().map(|e| (e.as_str(), &[PEER][..])).collect();
+        // Look like 👍 once invisible characters go: counted with it, and
+        // the peer reacting with three variants counts once.
+        raw.insert(0, ("👍", &[PEER, OTHER][..]));
+        raw.insert(1, ("\u{200B}👍\u{202E}", &[ME, PEER][..]));
+        raw.insert(2, ("👍\u{E0001}", &[PEER][..]));
         // The user's, but far down the list.
-        raw.push(("🙏", 1, true));
+        raw.push(("🙏", &[ME][..]));
         // Text instead of an emoji, and nothing visible.
-        raw.insert(2, ("not an emoji at all", 1, false));
-        raw.insert(3, ("\u{200B}", 1, false));
-        let (shown, more) = reactions(raw);
+        raw.insert(3, ("not an emoji at all", &[PEER][..]));
+        raw.insert(4, ("\u{200B}", &[PEER][..]));
+        let (shown, more) = reactions(raw, &ME);
         assert_eq!(
             shown[0],
             Reaction {
@@ -797,6 +812,8 @@ mod tests {
                 own: true
             }
         );
+        // The picker's emoji keep their variation selector.
+        assert_eq!(reaction_label("❤️").as_ref(), QUICK_REACTIONS[1]);
         assert_eq!(shown[1].label.as_ref(), "n…");
         assert_eq!(shown[2].label.as_ref(), "?");
         assert_eq!(shown.len(), MAX_REACTIONS + 1);

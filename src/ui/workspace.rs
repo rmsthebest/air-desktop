@@ -1685,6 +1685,15 @@ mod tests {
         cx.simulate_keystrokes("1");
         cx.run_until_parked();
         assert_eq!(told(cx), before + 1);
+        // The standard keymap: same keys, escape bound in its own layer.
+        cx.update(|window, cx| {
+            SettingsStore::update(cx, |s| s.keymap_mode = KeymapMode::Standard).unwrap();
+            window.refresh();
+        });
+        cx.simulate_keystrokes("up +");
+        assert!(reacting(cx));
+        cx.simulate_keystrokes("escape");
+        assert!(!reacting(cx));
     }
 
     /// The newest message marked as read, and the open chat's newest.

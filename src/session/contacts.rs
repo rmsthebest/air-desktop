@@ -26,6 +26,7 @@ use tokio_stream::StreamExt as _;
 use tracing::{error, info, warn};
 
 use super::Session;
+use super::alerts::Alerts;
 use super::chats::model_id;
 use super::messages::core_chat_id;
 use super::queue::HEALTHY_UPTIME;
@@ -227,10 +228,13 @@ fn parse_username(input: &str) -> Result<Username, Failure> {
 /// Keeps one listener per stored username, restarting a username's when its
 /// record changes, and reports the usernames. Runs until dropped (the
 /// session aborts it); dropping it stops the listeners too.
-pub(super) async fn run(user: CoreUser, report: impl Fn(Vec<SharedString>) + Send) {
+pub(super) async fn run(user: CoreUser, alerts: Alerts, report: impl Fn(Vec<SharedString>) + Send) {
     // Subscribe before the first load, so no change is missed.
     let mut notifications = user.db_notifications();
-    let mut listeners = Listeners::default();
+    let mut listeners = Listeners {
+        alerts,
+        running: HashMap::new(),
+    };
     listeners.reconcile(&user, &report, &HashSet::new()).await;
     while let Some(notification) = notifications.next().await {
         let changed: HashSet<Username> = notification
@@ -247,8 +251,10 @@ pub(super) async fn run(user: CoreUser, report: impl Fn(Vec<SharedString>) + Sen
     }
 }
 
-#[derive(Default)]
-struct Listeners(HashMap<Username, Listener>);
+struct Listeners {
+    alerts: Alerts,
+    running: HashMap<Username, Listener>,
+}
 
 /// Aborts the listener task when dropped.
 struct Listener(JoinHandle<()>);
@@ -279,14 +285,14 @@ impl Listeners {
                 .map(|record| record.username.plaintext().to_string().into())
                 .collect(),
         );
-        self.0
+        self.running
             .retain(|username, _| records.iter().any(|record| &record.username == username));
         for record in records {
-            if changed.contains(&record.username) || !self.0.contains_key(&record.username) {
+            if changed.contains(&record.username) || !self.running.contains_key(&record.username) {
                 let username = record.username.clone();
-                let task = tokio::spawn(listen(user.clone(), record));
+                let task = tokio::spawn(listen(user.clone(), self.alerts.clone(), record));
                 // Replacing a listener drops (aborts) the old one.
-                self.0.insert(username, Listener(task));
+                self.running.insert(username, Listener(task));
             }
         }
     }
@@ -294,7 +300,7 @@ impl Listeners {
 
 /// Listens to one username's queue, reconnecting with backoff as upstream's
 /// background stream task does.
-async fn listen(user: CoreUser, record: UsernameRecord) {
+async fn listen(user: CoreUser, alerts: Alerts, record: UsernameRecord) {
     let mut backoff = FibonacciBackoff::default();
     loop {
         let started = Instant::now();
@@ -304,7 +310,7 @@ async fn listen(user: CoreUser, record: UsernameRecord) {
                 while let Some(message) = stream.next().await {
                     // `None` marks the end of the queued messages.
                     let Some(message) = message else { continue };
-                    if let Some(id) = handle(&user, &record.username, message).await {
+                    if let Some(id) = handle(&user, &alerts, &record.username, message).await {
                         responder.ack(id).await;
                     }
                 }
@@ -327,20 +333,25 @@ async fn listen(user: CoreUser, record: UsernameRecord) {
 /// `None` to leave the message queued.
 async fn handle(
     user: &CoreUser,
+    alerts: &Alerts,
     username: &Username,
     message: UsernameQueueMessage,
 ) -> Option<uuid::Uuid> {
     let id = message.message_id.map(uuid::Uuid::from);
     let created_at = message.created_at.map(TimeStamp::from);
-    if let Err(err) = user
+    match user
         .process_username_queue_message(username.clone(), message)
         .await
     {
-        error!("failed to process a contact request: {err:#}");
-        // As upstream: a request for key material that hasn't arrived from
-        // a sibling device yet is kept for a while.
-        if keep_failed_username_message(&err, created_at) {
-            return None;
+        Ok(Some(stored)) => alerts.contact_request(user, stored).await,
+        Ok(None) => {}
+        Err(err) => {
+            error!("failed to process a contact request: {err:#}");
+            // As upstream: a request for key material that hasn't arrived
+            // from a sibling device yet is kept for a while.
+            if keep_failed_username_message(&err, created_at) {
+                return None;
+            }
         }
     }
     if id.is_none() {

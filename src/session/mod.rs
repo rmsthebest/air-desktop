@@ -3,6 +3,7 @@
 //! state from here and never touch `aircoreclient` themselves.
 
 pub mod account;
+pub mod alerts;
 pub mod chats;
 pub mod composer;
 mod contacts;
@@ -21,7 +22,7 @@ use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::{DbEntityId, DbNotification};
 use chrono::{DateTime, Utc};
 use gpui::{EventEmitter, SharedString};
-use gpui_kit::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
+use gpui_kit::{App, AppContext as _, AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt as _;
 use tracing::error;
@@ -38,7 +39,10 @@ pub(crate) async fn display_name(user: &CoreUser, id: &CoreUserId) -> SharedStri
     crate::model::name_line(profile.display_name.as_ref())
 }
 
+use crate::model::ChatId;
 use crate::runtime::{Tokio, TokioTask};
+use crate::settings::SettingsStore;
+use alerts::{Alerts, Attention};
 use queue::QueueEvent;
 
 /// Database changes buffered for the UI. Peers control how many arrive, so
@@ -70,6 +74,11 @@ pub struct Session {
     profile_task: Option<Task<()>>,
     drafts: composer::DraftQueue,
     usernames: Vec<SharedString>,
+    /// What the user is looking at, read by the alerts.
+    attention: watch::Sender<Attention>,
+    alerts: Alerts,
+    _notifier: TokioTask<()>,
+    _settings: Subscription,
     _queue: TokioTask<()>,
     _usernames: TokioTask<()>,
     _drafts: TokioTask<()>,
@@ -87,9 +96,26 @@ impl Session {
                 version_expires: None,
             };
             let (state_tx, state_rx) = watch::channel(initial);
+
+            let (notices_tx, notices_rx) = mpsc::channel(alerts::NOTICES_BUFFER);
+            let (attention, attention_rx) = watch::channel(Attention {
+                content: SettingsStore::get(cx).notifications,
+                ..Attention::default()
+            });
+            let alerts = Alerts::new(attention_rx, notices_tx);
+            let notifier = Tokio::spawn(cx, crate::notifier::run(notices_rx));
+            let settings = cx.observe_global::<SettingsStore>(|this: &mut Self, cx| {
+                let content = SettingsStore::get(cx).notifications;
+                this.attention.send_if_modified(|attention| {
+                    let changed = attention.content != content;
+                    attention.content = content;
+                    changed
+                });
+            });
+
             let queue = Tokio::spawn(
                 cx,
-                queue::run(user.clone(), move |event| {
+                queue::run(user.clone(), alerts.clone(), move |event| {
                     state_tx.send_modify(|state| match event {
                         QueueEvent::Status(status) => state.status = status,
                         QueueEvent::VersionExpires(at) => state.version_expires = at,
@@ -119,7 +145,7 @@ impl Session {
             let (usernames_tx, mut usernames_rx) = watch::channel(Vec::new());
             let usernames = Tokio::spawn(
                 cx,
-                contacts::run(user.clone(), move |usernames| {
+                contacts::run(user.clone(), alerts.clone(), move |usernames| {
                     usernames_tx.send_if_modified(|old| {
                         let changed = *old != usernames;
                         *old = usernames;
@@ -152,6 +178,10 @@ impl Session {
                 _drafts: drafts_task,
                 usernames: Vec::new(),
                 _usernames: usernames,
+                attention,
+                alerts,
+                _notifier: notifier,
+                _settings: settings,
                 display_name: SharedString::default(),
                 queue_state: initial,
                 profile_task: None,
@@ -184,6 +214,22 @@ impl Session {
     /// When the server stops accepting this version, if it announced it.
     pub fn version_expires(&self) -> Option<DateTime<Utc>> {
         self.queue_state.version_expires
+    }
+
+    /// Tells the alerts what the user is looking at: the open chat, and
+    /// whether the window is active. Looking at a chat dismisses its alert.
+    pub fn set_attention(&mut self, window_active: bool, open_chat: Option<&ChatId>) {
+        let open_chat = open_chat.map(messages::core_chat_id);
+        let changed = self.attention.send_if_modified(|attention| {
+            let changed =
+                (attention.window_active, attention.open_chat) != (window_active, open_chat);
+            attention.window_active = window_active;
+            attention.open_chat = open_chat;
+            changed
+        });
+        if let (true, true, Some(chat)) = (changed, window_active, open_chat) {
+            self.alerts.dismiss(chat);
+        }
     }
 
     fn reload_profile(&mut self, cx: &mut Context<Self>) {

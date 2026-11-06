@@ -11,15 +11,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::account::{self, SignUp, SignUpError};
+use super::alerts::{self, Alert, Alerts, Attention, Notice};
 use super::chats::{self, Update};
 use super::contacts::{self, Failure};
 use super::pending::Pending;
 use super::queue::{self, ConnectionStatus, QueueEvent};
 use super::{composer, messages};
 use crate::model::{Message, MessageStatus, Quote};
+use crate::settings::Notifications;
 use aircoreclient::ChatType;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::clients::store::{ClientRecord, ClientRecordState};
@@ -76,7 +78,8 @@ async fn e2e_sign_up_connect_and_reload() {
 
     // The queue listener connects and reports it.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let listener = tokio::spawn(queue::run(user.clone(), move |status| {
+    let (alerts, _attention, _notices) = alerts();
+    let listener = tokio::spawn(queue::run(user.clone(), alerts, move |status| {
         let _ = tx.send(status);
     }));
     let connected = tokio::time::timeout(Duration::from_secs(20), async {
@@ -366,13 +369,22 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     let dir = tempfile::tempdir().unwrap();
     let ada = new_account(dir.path(), "Ada Lovelace", ada_code).await;
     let bob = new_account(dir.path(), "Bob", bob_code).await;
-    let _queues = [listen_queue(&ada).await, listen_queue(&bob).await];
+    let (ada_alerts, _, mut ada_notices) = alerts();
+    let (bob_alerts, bob_attention, mut bob_notices) = alerts();
+    let _queues = [
+        listen_queue(&ada, ada_alerts.clone()).await,
+        listen_queue(&bob, bob_alerts).await,
+    ];
 
     // Ada's username listener reports her usernames as they change.
     let (names_tx, mut names) = mpsc::unbounded_channel();
-    let _ada_usernames = Aborting(tokio::spawn(contacts::run(ada.clone(), move |usernames| {
-        let _ = names_tx.send(usernames);
-    })));
+    let _ada_usernames = Aborting(tokio::spawn(contacts::run(
+        ada.clone(),
+        ada_alerts,
+        move |usernames| {
+            let _ = names_tx.send(usernames);
+        },
+    )));
     assert!(next(&mut names).await.is_empty());
     let name = format!("ada-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     // A new account's privacy pass tokens arrive in the background; until
@@ -434,6 +446,10 @@ async fn e2e_two_users_connect_by_username_and_talk() {
         None
     })
     .await;
+    // The request alerted Ada, naming who asked.
+    let alert = next_alert(&mut ada_notices, |alert| alert.chat == request).await;
+    assert_eq!(alert.title, "New contact request from Bob");
+
     let ada_chat = contacts::accept_request(ada.clone(), request)
         .await
         .unwrap();
@@ -464,6 +480,39 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
     let got = next_message(&mut bob_updates, |m| m.plain_text() == "hi bob").await;
     assert_eq!(got.sender_name, "Ada Lovelace");
+    let alert = next_alert(&mut bob_notices, |alert| alert.body == "hi bob").await;
+    assert_eq!(
+        (alert.chat, alert.title.as_str()),
+        (bob_chat, "Ada Lovelace")
+    );
+
+    // The chat Bob is looking at doesn't alert; once he looks away, it does.
+    let looking = |open_chat| Attention {
+        window_active: true,
+        open_chat,
+        content: Notifications::Full,
+    };
+    bob_attention.send_replace(looking(Some(bob_chat)));
+    // Alerts are built after a message is stored, so the attention can't
+    // change right after "quiet" shows. Bob's listener handles one queue
+    // event at a time: once "barrier" shows, "quiet" was either handled in
+    // an earlier event, or shares barrier's, where only the newest message
+    // of a chat is put into words. Either way "quiet" can't alert, though
+    // "barrier" may.
+    for text in ["quiet", "barrier", "loud"] {
+        let sent = composer::send(&ada, ada_chat, text.into(), None).await;
+        assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+        next_message(&mut bob_updates, |m| m.plain_text() == text).await;
+        if text == "barrier" {
+            bob_attention.send_replace(looking(None));
+        }
+    }
+    let alert = next_alert(&mut bob_notices, |alert| {
+        assert_ne!(alert.body, "quiet", "the open chat alerted");
+        alert.body == "loud"
+    })
+    .await;
+    assert_eq!(alert.chat, bob_chat);
 
     // Bob's rename reaches the messages Ada already has from him.
     let mut profile = bob.own_user_profile().await.unwrap();
@@ -494,13 +543,43 @@ async fn new_account(dir: &std::path::Path, name: &str, code: &str) -> CoreUser 
 }
 
 /// Runs the queue listener until dropped, once it is connected.
-async fn listen_queue(user: &CoreUser) -> Aborting {
+async fn listen_queue(user: &CoreUser, alerts: Alerts) -> Aborting {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let listener = Aborting(tokio::spawn(queue::run(user.clone(), move |event| {
-        let _ = tx.send(event);
-    })));
+    let listener = Aborting(tokio::spawn(queue::run(
+        user.clone(),
+        alerts,
+        move |event| {
+            let _ = tx.send(event);
+        },
+    )));
     while next(&mut rx).await != QueueEvent::Status(ConnectionStatus::Connected) {}
     listener
+}
+
+/// Alerts as the session sets them up, minus the desktop notifier.
+fn alerts() -> (Alerts, watch::Sender<Attention>, mpsc::Receiver<Notice>) {
+    let (attention, attention_rx) = watch::channel(Attention::default());
+    let (notices_tx, notices) = mpsc::channel(alerts::NOTICES_BUFFER);
+    (Alerts::new(attention_rx, notices_tx), attention, notices)
+}
+
+/// The next alert shown that matches, skipping others and dismissals.
+async fn next_alert(
+    notices: &mut mpsc::Receiver<Notice>,
+    matches: impl Fn(&Alert) -> bool,
+) -> Alert {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(notice) = notices.recv().await {
+            if let Notice::Show(alert) = notice
+                && matches(&alert)
+            {
+                return alert;
+            }
+        }
+        panic!("the alerts stopped")
+    })
+    .await
+    .expect("no matching alert within 20s")
 }
 
 /// A message window on `chat` that follows the user's changes.

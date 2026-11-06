@@ -6,6 +6,7 @@ mod command_line;
 mod keymap;
 mod markdown;
 mod model;
+mod notifier;
 mod paths;
 mod runtime;
 mod session;

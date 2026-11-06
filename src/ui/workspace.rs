@@ -22,7 +22,7 @@ use crate::session::Session;
 use crate::session::chats::{Chats, LoadState};
 use crate::session::composer::Composer;
 use crate::session::messages::Messages;
-use crate::settings::{Appearance, KeymapMode, SettingsStore};
+use crate::settings::{Appearance, KeymapMode, Notifications, SettingsStore};
 use crate::theme;
 use crate::ui::chat_list::{ChatList, ChatListEvent};
 use crate::ui::command_line::{CommandLine, CommandLineEvent};
@@ -91,6 +91,7 @@ impl Workspace {
                         this.conversation.update(cx, |conversation, cx| {
                             conversation.show(chat, messages, compose, window, cx)
                         });
+                        this.report_attention(window, cx);
                         cx.notify();
                     }
                     ChatListEvent::Updated(chat) => {
@@ -102,6 +103,7 @@ impl Workspace {
                     ChatListEvent::Closed => {
                         this.conversation
                             .update(cx, |conversation, cx| conversation.close(window, cx));
+                        this.report_attention(window, cx);
                         cx.notify();
                     }
                 },
@@ -115,6 +117,9 @@ impl Workspace {
             ),
             // Redraw the status line and which-key popup as keys are typed.
             cx.observe_pending_input(window, |_, _, cx| cx.notify()),
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.report_attention(window, cx)
+            }),
         ];
         if let Some(session) = &session {
             // Account name and connection status are shown in the rail.
@@ -132,7 +137,7 @@ impl Workspace {
         }
         chat_list.focus_handle(cx).focus(window, cx);
 
-        Self {
+        let this = Self {
             session,
             _chats: chats,
             chat_list,
@@ -142,7 +147,23 @@ impl Workspace {
             command_line: None,
             contact_task: None,
             _subscriptions: subscriptions,
-        }
+        };
+        this.report_attention(window, cx);
+        this
+    }
+
+    /// Lets the session know what is on screen, for desktop notifications.
+    fn report_attention(&self, window: &Window, cx: &mut App) {
+        let Some(session) = &self.session else { return };
+        let active = window.is_window_active();
+        let open = self
+            .conversation
+            .read(cx)
+            .chat()
+            .map(|chat| chat.id.clone());
+        session.update(cx, |session, _| {
+            session.set_attention(active, open.as_ref())
+        });
     }
 
     pub fn chats(&self, cx: &App) -> Vec<ChatSummary> {
@@ -390,6 +411,15 @@ impl Workspace {
             Command::Appearance(appearance) => self.set_appearance(appearance, window, cx),
             Command::ToggleDetails => self.toggle_details(&ToggleDetails, window, cx),
             Command::Keymap(mode) => self.set_keymap_mode(mode, window, cx),
+            Command::Notifications(level) => {
+                update_settings(window, cx, |settings| settings.notifications = level);
+                let what = match level {
+                    Notifications::Full => "Notifications show who wrote and what",
+                    Notifications::Private => "Notifications no longer show names or text",
+                    Notifications::Off => "Notifications are off",
+                };
+                show_info(what.into(), window, cx);
+            }
             Command::Shortcuts => palette::show_shortcuts(window, cx),
             Command::AddContact(username) => self.send_contact_request(username, window, cx),
             Command::Accept => self.accept_request(&AcceptRequest, window, cx),

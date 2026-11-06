@@ -41,6 +41,19 @@ pub enum KeymapMode {
     Helix,
 }
 
+/// What desktop notifications show. Peers choose names and text, and a
+/// notification can appear over a shared screen, so this is the user's call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Notifications {
+    /// The chat's name and the message.
+    #[default]
+    Full,
+    /// That something arrived, not where from or what.
+    Private,
+    Off,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -50,6 +63,7 @@ pub struct Settings {
     pub dark_theme: String,
     pub details_open: bool,
     pub chat_list_width: f32,
+    pub notifications: Notifications,
 }
 
 impl Default for Settings {
@@ -61,6 +75,7 @@ impl Default for Settings {
             dark_theme: theme::DEFAULT_DARK.into(),
             details_open: true,
             chat_list_width: 320.,
+            notifications: Notifications::Full,
         }
     }
 }

@@ -59,6 +59,18 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     privacy-pass tokens arrive in the background, so the first username
     or contact request can fail and succeed on retry.
   - `pending.rs`: the merged change set both workers wake on.
+  - `alerts.rs`: desktop notifications ("alerts"; database notifications
+    are the core's). Port of upstream `notifications/` + `NotificationPolicy`:
+    the queue and username listeners hand over what processing stored; at
+    most one alert per chat (newest wins), sibling-suppressed and muted
+    chats skipped. `Attention` (window active, open chat, `notifications`
+    setting) decides what is shown and the suppression reported to the
+    user's other devices (re-reported when it changes). The workspace
+    reports attention on chat open/close and window activation.
+- `src/notifier.rs` — shows alerts via `org.freedesktop.Notifications`
+  (zbus 5 on async-io, gpui's own copy). Replaces a chat's notification
+  instead of stacking, closes it on dismissal, escapes bodies when the
+  server renders markup. No-op off Linux.
 - `src/markdown.rs` — bounded message markdown parse (size/depth caps; only
   http/https/mailto become links; images and HTML stay inert text).
   `ui/markdown_view.rs` renders it; links always open through a confirm

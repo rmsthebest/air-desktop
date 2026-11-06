@@ -5,17 +5,23 @@
 //! Processing a QS event stores its effects in the database; the UI learns
 //! about them from `CoreUser::db_notifications`, not from here. Processing
 //! the queue's Empty sentinel also starts the core's outbound service.
+//! What processing stored is also handed to [`Alerts`], and the chat the
+//! user is looking at is reported to their other devices.
 
 use std::time::Duration;
 
 use aircommon::messages::client_state::NotificationSuppression;
 use aircommon::utils::FibonacciBackoff;
 use aircoreclient::clients::process::qs_stream::QsProcessEventResult;
-use aircoreclient::clients::{CoreUser, ListenResponse, SiblingClientStates, listen_response};
+use aircoreclient::clients::{
+    CoreUser, ListenResponse, QsListenResponder, SiblingClientStates, listen_response,
+};
 use chrono::{DateTime, Utc};
 use tokio::time::Instant;
 use tokio_stream::StreamExt as _;
 use tracing::{error, info, warn};
+
+use super::alerts::Alerts;
 
 /// A stream that stayed up this long was healthy: reconnect at once and
 /// reset the backoff. Same as upstream.
@@ -70,7 +76,7 @@ impl Reconnect {
 }
 
 /// Runs until dropped (the session aborts it), reconnecting with backoff.
-pub async fn run(user: CoreUser, report: impl Fn(QueueEvent) + Send) {
+pub async fn run(user: CoreUser, mut alerts: Alerts, report: impl Fn(QueueEvent) + Send) {
     let mut reconnect = Reconnect::default();
     let mut unsupported = false;
     loop {
@@ -79,7 +85,7 @@ pub async fn run(user: CoreUser, report: impl Fn(QueueEvent) + Send) {
         if !unsupported {
             report(QueueEvent::Status(ConnectionStatus::Connecting));
         }
-        let ended = listen_once(&user, &report).await;
+        let ended = listen_once(&user, &mut alerts, &report).await;
         unsupported = ended == Ended::Unsupported;
         let delay = reconnect.delay(&ended);
         if !delay.is_zero() {
@@ -89,7 +95,11 @@ pub async fn run(user: CoreUser, report: impl Fn(QueueEvent) + Send) {
     }
 }
 
-async fn listen_once(user: &CoreUser, report: &(impl Fn(QueueEvent) + Send)) -> Ended {
+async fn listen_once(
+    user: &CoreUser,
+    alerts: &mut Alerts,
+    report: &(impl Fn(QueueEvent) + Send),
+) -> Ended {
     let status = |status| report(QueueEvent::Status(status));
     let (stream, responder) = match user.listen_queue().await {
         Ok(listening) => listening,
@@ -121,26 +131,36 @@ async fn listen_once(user: &CoreUser, report: &(impl Fn(QueueEvent) + Send)) -> 
     let started = Instant::now();
     status(ConnectionStatus::Connected);
 
-    // Report a client state on every stream, as upstream does even when
-    // nothing is suppressed, so the server can't tell clients apart by it.
-    // Desktop notifications don't suppress siblings' yet (milestone 7).
-    match user.encrypt_client_state(NotificationSuppression::None) {
-        Ok(state) => responder.report_client_state(state).await,
-        Err(err) => error!("failed to encrypt client state: {err:#}"),
-    }
-    user.replace_qs_listen_responder(responder).await;
+    // Report a client state on every stream, and again when it changes.
+    // As upstream, also when nothing is suppressed, so the server can't
+    // tell clients apart by it.
+    let mut reported = alerts.suppression();
+    report_client_state(user, &responder, reported).await;
+    user.replace_qs_listen_responder(responder.clone()).await;
 
     let mut stream = std::pin::pin!(stream);
-    while let Some(event) = stream.next().await {
-        let event = match event {
-            Ok(event) => event,
-            Err(err) => {
-                warn!("queue stream closed: {err}");
-                break;
+    loop {
+        tokio::select! {
+            event = stream.next() => {
+                let event = match event {
+                    Some(Ok(event)) => event,
+                    Some(Err(err)) => {
+                        warn!("queue stream closed: {err}");
+                        break;
+                    }
+                    None => break,
+                };
+                if !handle_event(user, &mut siblings, alerts, report, event).await {
+                    break;
+                }
             }
-        };
-        if !handle_event(user, &mut siblings, report, event).await {
-            break;
+            () = alerts.attention_changed() => {
+                let suppression = alerts.suppression();
+                if suppression != reported {
+                    reported = suppression;
+                    report_client_state(user, &responder, reported).await;
+                }
+            }
         }
     }
     status(ConnectionStatus::Offline);
@@ -149,10 +169,22 @@ async fn listen_once(user: &CoreUser, report: &(impl Fn(QueueEvent) + Send)) -> 
     }
 }
 
+async fn report_client_state(
+    user: &CoreUser,
+    responder: &QsListenResponder,
+    suppression: NotificationSuppression,
+) {
+    match user.encrypt_client_state(suppression) {
+        Ok(state) => responder.report_client_state(state).await,
+        Err(err) => error!("failed to encrypt client state: {err:#}"),
+    }
+}
+
 /// Returns whether to keep reading the stream.
 async fn handle_event(
     user: &CoreUser,
     siblings: &mut SiblingClientStates,
+    alerts: &Alerts,
     report: &(impl Fn(QueueEvent) + Send),
     event: ListenResponse,
 ) -> bool {
@@ -178,9 +210,17 @@ async fn handle_event(
         _ => {}
     }
     match user.process_qs_event(event).await {
+        Ok(QsProcessEventResult::FullyProcessed { processed }) => {
+            alerts.processed(user, &processed, siblings).await;
+            true
+        }
         // A partially processed batch leaves a gap in the sequence: drop the
         // stream and resume from the stored position on reconnect.
-        Ok(result) => !matches!(result, QsProcessEventResult::PartiallyProcessed { .. }),
+        Ok(QsProcessEventResult::PartiallyProcessed { processed, .. }) => {
+            alerts.processed(user, &processed, siblings).await;
+            false
+        }
+        Ok(QsProcessEventResult::Accumulated | QsProcessEventResult::Ignored) => true,
         Err(err) => {
             error!("failed to process queue event: {err:#}");
             false

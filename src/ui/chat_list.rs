@@ -1,6 +1,7 @@
 //! Middle-left pane: the list of chats. Virtualized: only visible rows are
 //! built, so large accounts cost the same as small ones.
 
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -8,7 +9,7 @@ use gpui_kit::{
     ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 
-use crate::actions::{SelectNext, SelectPrev};
+use crate::actions::{AddContact, SelectNext, SelectPrev};
 use crate::model::{
     ChatId, ChatSummary, PreviewKind, Request, format_activity, next_unread, step_index,
 };
@@ -249,19 +250,28 @@ impl ChatList {
         div().px_2().pb_0p5().child(row).into_any_element()
     }
 
-    fn render_placeholder(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    fn render_placeholder(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let message: SharedString = match &self.state {
             LoadState::Loading => "Loading chats…".into(),
             LoadState::Failed(err) => format!("Couldn't load your chats: {err}").into(),
             LoadState::Loaded if self.chats.is_empty() => "No chats yet".into(),
             LoadState::Loaded => return None,
         };
+        // An empty list says how to start a chat, with the live binding.
+        let hint = (self.state == LoadState::Loaded && self.chats.is_empty()).then(|| {
+            h_flex()
+                .gap_1()
+                .child("Add a contact by username")
+                .children(Kbd::binding_for_action(&AddContact, None, window))
+        });
         Some(
-            div()
+            v_flex()
                 .p_4()
+                .gap_2()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child(message)
+                .children(hint)
                 .into_any_element(),
         )
     }
@@ -314,7 +324,7 @@ impl Render for ChatList {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Chats"),
             )
-            .children(self.render_placeholder(cx))
+            .children(self.render_placeholder(window, cx))
             .child(list)
     }
 }

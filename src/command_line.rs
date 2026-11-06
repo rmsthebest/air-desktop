@@ -1,7 +1,7 @@
 //! Helix-style `:` commands: parsing and completion. Pure, so it is tested
 //! without a UI; the workspace executes the parsed [`Command`].
 
-use crate::settings::{Appearance, KeymapMode};
+use crate::settings::{Appearance, KeymapMode, Notifications};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -13,6 +13,7 @@ pub enum Command {
     Appearance(Appearance),
     ToggleDetails,
     Keymap(KeymapMode),
+    Notifications(Notifications),
     Shortcuts,
     /// Send a contact request to a username, as typed.
     AddContact(String),
@@ -31,6 +32,7 @@ enum Arg {
     Chat,
     Appearance,
     Keymap,
+    Notifications,
     /// Free text, not completed (e.g. a username).
     Text,
 }
@@ -71,6 +73,11 @@ const SPECS: &[Spec] = &[
         names: &["keymap"],
         arg: Arg::Keymap,
         help: "standard or helix",
+    },
+    Spec {
+        names: &["notifications"],
+        arg: Arg::Notifications,
+        help: "full, private (no names or text) or off",
     },
     Spec {
         names: &["contact", "add"],
@@ -141,6 +148,12 @@ pub fn parse(input: &str) -> Result<Command, String> {
             "helix" => KeymapMode::Helix,
             _ => return Err(":keymap takes standard or helix".into()),
         }),
+        "notifications" => Command::Notifications(match normalize(arg).as_str() {
+            "full" => Notifications::Full,
+            "private" => Notifications::Private,
+            "off" => Notifications::Off,
+            _ => return Err(":notifications takes full, private or off".into()),
+        }),
         "help" => Command::Shortcuts,
         "contact" => Command::AddContact(need("a username")?),
         "accept" => Command::Accept,
@@ -172,6 +185,7 @@ pub fn complete(input: &str, themes: &[String], chats: &[String]) -> Vec<(String
         Arg::Chat => chats.to_vec(),
         Arg::Appearance => ["system", "light", "dark"].map(String::from).to_vec(),
         Arg::Keymap => ["standard", "helix"].map(String::from).to_vec(),
+        Arg::Notifications => ["full", "private", "off"].map(String::from).to_vec(),
     };
     let arg = normalize(arg.trim_start());
     candidates
@@ -273,6 +287,7 @@ mod tests {
             ":q now",
             ":appearance purple",
             ":keymap emacs",
+            ":notifications loud",
             ":contact",
             ":accept now",
         ] {
@@ -305,6 +320,7 @@ mod tests {
                     Arg::None => name.to_string(),
                     Arg::Appearance => format!("{name} dark"),
                     Arg::Keymap => format!("{name} helix"),
+                    Arg::Notifications => format!("{name} private"),
                     Arg::Theme | Arg::Chat | Arg::Text => format!("{name} x"),
                 };
                 assert!(parse(&line).is_ok(), "{line:?} should parse");

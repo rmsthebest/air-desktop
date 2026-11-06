@@ -797,3 +797,20 @@ Fixed (low):
   reports what the settings hid and focuses the chat list until the chat
   opens. Test: `an_alert_for_a_chat_not_yet_listed_opens_it_once_listed`.
 - `desktop_notify_and_close` checks the close reply itself.
+
+## Gate 14c — gate 14b fixes (`7abe130..eae030f`): PASS
+
+Fixed (low):
+- Only a close within 2 s of a click is taken as the server's: a server
+  that keeps clicked notifications leaves the later dismissal to the
+  user, which marks everything shown. Tests: a click then the close marks
+  nothing; `a_clicked_notification_kept_on_screen_is_the_users_to_dismiss`.
+- Commands that open a chat not yet listed (`:contact`, accept, `:group`)
+  focus the chat list while waiting, as alerts do; both focus the chat
+  once it opens (`open_then_focus`). The alert test checks the final focus.
+- Correction to gate 14b's reasoning: our own closes (reason 3) never
+  reach the channel. What a dropped reply could lose is a click, or a
+  user's close.
+
+Still deferred (account seam): attention reported for what the settings
+hid while an alert's chat isn't listed, then for the chat once it opens.

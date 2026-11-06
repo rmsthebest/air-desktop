@@ -60,8 +60,13 @@ pub struct Workspace {
     settings_view: Entity<SettingsView>,
     /// The settings screen is shown in place of the conversation.
     settings_open: bool,
+    /// A chat opened before it was listed, and how to focus it once it is.
+    focus_when_opened: Option<(ChatId, FocusChat)>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// Focuses the open chat one way or another.
+type FocusChat = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
 
 impl Workspace {
     pub fn new(
@@ -116,6 +121,13 @@ impl Workspace {
                             conversation.show(chat, messages, compose, window, cx)
                         });
                         this.report_attention(window, cx);
+                        // A chat awaited until listed takes focus now; any
+                        // other opening ends the wait.
+                        if let Some((awaited, focus)) = this.focus_when_opened.take()
+                            && &awaited == id
+                        {
+                            focus(this, window, cx);
+                        }
                         cx.notify();
                     }
                     ChatListEvent::Updated(chat) => {
@@ -187,6 +199,7 @@ impl Workspace {
             members: None,
             settings_view,
             settings_open: false,
+            focus_when_opened: None,
             _subscriptions: subscriptions,
         };
         this.report_attention(window, cx);
@@ -242,12 +255,9 @@ impl Workspace {
     /// Opens a chat and focuses it, as when picking one from the palette:
     /// the message list in Helix mode (normal mode), else the composer.
     pub fn jump_to_chat(&mut self, id: ChatId, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_when_opened = None;
         self.chat_list.update(cx, |list, cx| list.open(id, cx));
-        if Self::helix(cx) {
-            self.focus_messages(&FocusMessages, window, cx);
-        } else {
-            self.focus_composer(&FocusComposer, window, cx);
-        }
+        self.focus_jumped(window, cx);
     }
 
     /// A click on a chat's desktop notification: the window comes up
@@ -262,17 +272,7 @@ impl Workspace {
         };
         let was_hidden = self.unhide_settings(cx);
         // A chat just added may not be listed yet: it opens once it is.
-        self.chat_list
-            .update(cx, |list, cx| list.open_when_listed(chat, cx));
-        if !listed {
-            // Until then the list waits for keys, not another chat's
-            // composer.
-            self.focus_chat_list(&FocusChatList, window, cx);
-        } else if Self::helix(cx) {
-            self.focus_messages(&FocusMessages, window, cx);
-        } else {
-            self.focus_composer(&FocusComposer, window, cx);
-        }
+        self.open_then_focus(chat, Self::focus_jumped, window, cx);
         // When the chat opens now, `Opened` reports it; reporting before
         // would name the chat that was open. Otherwise what the settings
         // hid is on screen again, and is reported here.
@@ -1030,9 +1030,45 @@ impl Workspace {
 
     /// Opens `chat` now, or once the chat list has loaded it.
     fn open_when_listed(&mut self, chat: ChatId, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_then_focus(chat, Self::focus_composer_now, window, cx);
+    }
+
+    /// Opens `chat` and focuses it with `focus`, now or once it is listed.
+    /// Until then the chat list has focus: typing mustn't land in the
+    /// composer of the chat open before.
+    fn open_then_focus(
+        &mut self,
+        chat: ChatId,
+        focus: FocusChat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let listed = self.chat_list.read(cx).chat(&chat).is_some();
+        if listed {
+            self.focus_when_opened = None;
+        } else {
+            self.focus_when_opened = Some((chat.clone(), focus));
+        }
         self.chat_list
             .update(cx, |list, cx| list.open_when_listed(chat, cx));
-        self.focus_conversation(&FocusConversation, window, cx);
+        if listed {
+            focus(self, window, cx);
+        } else {
+            self.focus_chat_list(&FocusChatList, window, cx);
+        }
+    }
+
+    fn focus_composer_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_composer(&FocusComposer, window, cx);
+    }
+
+    /// As after a jump: the message list in Helix mode, else the composer.
+    fn focus_jumped(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if Self::helix(cx) {
+            self.focus_messages(&FocusMessages, window, cx);
+        } else {
+            self.focus_composer(&FocusComposer, window, cx);
+        }
     }
 
     fn render_status_line(&self, window: &Window, cx: &App) -> AnyElement {
@@ -2013,6 +2049,7 @@ mod tests {
                 .map(|chat| chat.id.clone())
         });
         assert_eq!(open, Some(added));
+        assert_eq!(focus(cx), Focus::Composer);
     }
 
     #[gpui::test]

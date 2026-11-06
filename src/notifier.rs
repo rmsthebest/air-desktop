@@ -128,6 +128,10 @@ async fn sleep_until(at: Option<tokio::time::Instant>) {
     }
 }
 
+/// How soon after a click its notification's close counts as the
+/// server's, not the user's.
+const CLOSED_BY_CLICK: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long a failed close waits before it is tried again.
 const RETRY_CLOSE: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -162,9 +166,11 @@ struct Notifier<D> {
     /// The notification last clicked. Servers close it right after, as if
     /// dismissed; that close marks nothing: a click opens one chat, and
     /// the others of a shared one still have activity to alert.
-    /// With the newest `seq` it showed then: what was shown in it after
-    /// the click is still the user's to dismiss.
-    clicked: Option<(u32, u64)>,
+    /// With the newest `seq` it showed then (what was shown in it after
+    /// the click is still the user's to dismiss) and when. Only a close
+    /// right after the click is the server's: a server that keeps clicked
+    /// notifications leaves a later dismissal to the user.
+    clicked: Option<(u32, u64, tokio::time::Instant)>,
 }
 
 impl<D: Desktop + Send> Notifier<D> {
@@ -369,7 +375,7 @@ impl<D: Desktop + Send> Notifier<D> {
         match reply.what {
             Replied::Clicked => {
                 if let Some(newest) = chats.iter().map(|(_, shown)| shown.seq).max() {
-                    self.clicked = Some((reply.id, newest));
+                    self.clicked = Some((reply.id, newest, tokio::time::Instant::now()));
                 }
                 chats
                     .iter()
@@ -389,8 +395,9 @@ impl<D: Desktop + Send> Notifier<D> {
                 }
                 let seen = self
                     .clicked
-                    .take_if(|(id, _)| *id == reply.id)
-                    .map(|(_, newest)| newest);
+                    .take_if(|(id, ..)| *id == reply.id)
+                    .filter(|(.., at)| at.elapsed() < CLOSED_BY_CLICK)
+                    .map(|(_, newest, _)| newest);
                 chats
                     .into_iter()
                     .filter(|(_, shown)| seen.is_none_or(|newest| shown.seq > newest))
@@ -758,6 +765,14 @@ mod tests {
             user_does(&mut notifier, "New activity", Replied::Clicked),
             [Outcome::Open(second)]
         );
+        assert!(user_does(&mut notifier, "New activity", Replied::Dismissed).is_empty());
+        notifier
+            .handle(Notice::Show(alert_until(1, "secret", 10)), &private)
+            .await;
+        notifier
+            .handle(Notice::Show(alert_until(2, "other", 20)), &private)
+            .await;
+        user_does(&mut notifier, "New activity", Replied::Clicked);
         // Shown in it after the click, before the server's close: the
         // click didn't see it, so that close marks it, and only it.
         notifier
@@ -882,6 +897,24 @@ mod tests {
         };
         assert_eq!(left, ["hi"]);
         running.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_clicked_notification_kept_on_screen_is_the_users_to_dismiss() {
+        let mut notifier = Notifier::new(Screen::default());
+        let full = Attention::default();
+        notifier
+            .handle(Notice::Show(alert_until(1, "hi", 10)), &full)
+            .await;
+        user_does(&mut notifier, "hi", Replied::Clicked);
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        assert_eq!(
+            user_does(&mut notifier, "hi", Replied::Dismissed),
+            [Outcome::Dismissed {
+                chat: alert(1, "").chat,
+                until: DateTime::from_timestamp(10, 0).unwrap(),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -1066,8 +1099,8 @@ mod linux {
     /// about every app's notifications, and about our own closes.
     ///
     /// Unbounded: they wait only while the notifier is in a call, which
-    /// times out, and dropping one could lose the close of ours that keeps
-    /// a reused id from being rewritten.
+    /// times out, and dropping one could lose a click, or a user's close
+    /// that keeps a reused id from being rewritten.
     async fn pump(
         mut signals: SignalStream<'static>,
         replies: mpsc::UnboundedSender<super::Reply>,

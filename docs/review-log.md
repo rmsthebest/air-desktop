@@ -492,3 +492,19 @@ Deferred:
   reconnects to a restarted daemon right after the lookup failed can still
   replace another app's notification. With milestone 12's
   `NotificationClosed` tracking.
+
+## Gate 10b — gate 10 fixes (`11ba89c..03ce28e`): BLOCK
+
+Fixed:
+- **Members sharing a uuid collapsed into one (high).** Model ids dropped
+  the domain, so `:kick #tag` on a member who registered another's uuid on
+  their own domain removed the other. Each row now keeps its core id
+  alongside (same order), and its model id is the hash of the whole id.
+  `members_sharing_a_uuid_stay_apart`; tag growth in
+  `tags_grow_until_unique`.
+- **`load_chat`'s doc moved onto the test helper (low).** Moved back.
+- **`:kick` completion offered only names (low).** Alike names complete as
+  `Name #tag`, which removal accepts.
+- **`:kick` without members said nothing, or "No member matches" while
+  loading (low).** Refused as "That needs an account" / "Still loading
+  the members".

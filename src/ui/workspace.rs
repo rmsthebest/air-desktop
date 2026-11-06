@@ -382,11 +382,9 @@ impl Workspace {
                 .collect(),
             members: self
                 .members
-                .iter()
-                .flat_map(|(members, _)| members.read(cx).members())
-                .filter(|member| !member.own)
-                .map(|member| member.name.to_string())
-                .collect(),
+                .as_ref()
+                .map(|(members, _)| removal_candidates(members.read(cx).members()))
+                .unwrap_or_default(),
         };
         let previous_focus = window.focused(cx);
         let view = cx.new(|cx| CommandLine::new(candidates, initial, window, cx));
@@ -497,6 +495,7 @@ impl Workspace {
                     return;
                 }
                 let Some((members, _)) = &self.members else {
+                    show_refusal("That needs an account".into(), window, cx);
                     return;
                 };
                 let members = members.clone();
@@ -833,6 +832,25 @@ fn which_key_rows(window: &Window, os: OperatingSystem) -> Vec<(String, String)>
     rows.sort();
     rows.dedup();
     rows
+}
+
+/// What `:kick` completes: names, or `Name #tag` where names are alike.
+fn removal_candidates(members: &[crate::model::Member]) -> Vec<String> {
+    let others: Vec<_> = members.iter().filter(|member| !member.own).collect();
+    others
+        .iter()
+        .map(|member| {
+            let alike = others
+                .iter()
+                .filter(|other| other.name == member.name)
+                .count();
+            if alike > 1 {
+                format!("{} #{}", member.name, member.tag)
+            } else {
+                member.name.to_string()
+            }
+        })
+        .collect()
 }
 
 fn format_keystrokes(keystrokes: &[Keystroke], os: OperatingSystem) -> String {

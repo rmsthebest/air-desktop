@@ -7,8 +7,6 @@
 //! `contacts::on_tokio`): the core's jobs clean up after themselves, so
 //! closing a view mustn't stop them midway.
 
-use std::collections::HashMap;
-
 use aircommon::identifiers::UserId as CoreUserId;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::DbEntityId;
@@ -227,8 +225,8 @@ pub struct Members {
     user: CoreUser,
     chat: CoreChatId,
     members: Vec<Member>,
-    /// The core's ids behind the members shown (model ids drop the domain).
-    ids: HashMap<UserId, CoreUserId>,
+    /// The core's id of each member, in the same order.
+    core_ids: Vec<CoreUserId>,
     loaded: bool,
     /// The latest load; a newer one replaces (cancels) it.
     load: Option<Task<()>>,
@@ -249,7 +247,7 @@ impl Members {
                 let touched = notifications.iter().any(|notification| {
                     notification.ops.keys().any(|entity| match entity {
                         DbEntityId::Chat(id) => *id == chat,
-                        DbEntityId::User(user) => this.ids.values().any(|id| id == user),
+                        DbEntityId::User(user) => this.core_ids.contains(user),
                         _ => false,
                     })
                 });
@@ -262,7 +260,7 @@ impl Members {
             user: session.read(cx).user().clone(),
             chat,
             members: Vec::new(),
-            ids: HashMap::new(),
+            core_ids: Vec::new(),
             loaded: false,
             load: None,
             _changes: changes,
@@ -286,11 +284,12 @@ impl Members {
         query: &str,
         cx: &App,
     ) -> impl Future<Output = Result<SharedString, String>> + use<> {
-        let target = resolve_removal(&self.members, query).and_then(|member| {
-            let id = self.ids.get(&member.id).cloned();
-            id.map(|id| (member.name.clone(), id))
-                .ok_or_else(|| "That member is gone".to_string())
-        });
+        let target = if self.loaded {
+            resolve_removal(&self.members, query)
+                .map(|ix| (self.members[ix].name.clone(), self.core_ids[ix].clone()))
+        } else {
+            Err("Still loading the members".to_string())
+        };
         let (user, chat) = (self.user.clone(), self.chat);
         on_tokio(cx, "remove the member", async move {
             let (name, id) = target.map_err(Failure::Shown)?;
@@ -307,7 +306,7 @@ impl Members {
             let loaded = load.await;
             _ = this.update(cx, |this, cx| {
                 match loaded {
-                    Ok(Some(loaded)) => (this.members, this.ids) = loaded.into_iter().unzip(),
+                    Ok(Some(loaded)) => (this.members, this.core_ids) = loaded.into_iter().unzip(),
                     // The chat is gone; the workspace closes it.
                     Ok(None) => {}
                     Err(err) => error!("failed to load group members: {err:#}"),
@@ -319,23 +318,33 @@ impl Members {
     }
 }
 
-/// The member `query` names, if the user may remove them: by name (see
-/// [`matches_name`]), or by `#tag` when names are alike. Never the user.
-fn resolve_removal<'a>(members: &'a [Member], query: &str) -> Result<&'a Member, String> {
-    let others: Vec<_> = members.iter().filter(|member| !member.own).collect();
-    let member = if let Some(tag) = query.trim().strip_prefix('#') {
+/// Which member `query` names (their index), if the user may remove them:
+/// by name (see [`matches_name`]), or by `#tag` as the last word (`#tag`
+/// or `Name #tag`, as completion offers when names are alike). Never the
+/// user.
+fn resolve_removal(members: &[Member], query: &str) -> Result<usize, String> {
+    let others: Vec<_> = (0..members.len()).filter(|&ix| !members[ix].own).collect();
+    let tag = query
+        .split_whitespace()
+        .next_back()
+        .and_then(|word| word.strip_prefix('#'));
+    let ix = if let Some(tag) = tag {
         let tag = tag.to_lowercase();
-        let mut tagged = others.iter().filter(|member| member.tag.as_ref() == tag);
+        let mut tagged = others
+            .iter()
+            .copied()
+            .filter(|&ix| members[ix].tag.as_ref() == tag);
         match (tagged.next(), tagged.next()) {
-            (Some(member), None) => member,
+            (Some(ix), None) => ix,
             (None, _) => return Err(format!("No member is tagged #{tag}")),
             (Some(_), Some(_)) => return Err(format!("Several members are tagged #{tag}")),
         }
     } else {
-        match matches_name(query, others.iter().map(|member| member.name.as_ref())) {
+        match matches_name(query, others.iter().map(|&ix| members[ix].name.as_ref())) {
             NameMatch::One(name) => others
                 .iter()
-                .find(|member| member.name.as_ref() == name)
+                .copied()
+                .find(|&ix| members[ix].name.as_ref() == name)
                 .ok_or_else(|| "That member is gone".to_string())?,
             NameMatch::None => return Err(format!("No member matches {query:?}")),
             NameMatch::Ambiguous(n) => {
@@ -345,17 +354,17 @@ fn resolve_removal<'a>(members: &'a [Member], query: &str) -> Result<&'a Member,
             }
         }
     };
-    if !member.can_remove {
-        return Err(format!("You can't remove {} from this group", member.name));
+    if !members[ix].can_remove {
+        return Err(format!(
+            "You can't remove {} from this group",
+            members[ix].name
+        ));
     }
-    Ok(member)
+    Ok(ix)
 }
 
 /// The group's members, the user first, then by name. `None` without a chat.
-pub(super) async fn load(
-    user: &CoreUser,
-    chat: CoreChatId,
-) -> Option<Vec<(Member, (UserId, CoreUserId))>> {
+pub(super) async fn load(user: &CoreUser, chat: CoreChatId) -> Option<Vec<(Member, CoreUserId)>> {
     let active = user
         .chat(&chat)
         .await
@@ -370,9 +379,8 @@ pub(super) async fn load(
     let mut members = Vec::with_capacity(participants.len());
     for id in participants {
         let own = &id == user.user_id();
-        let model = UserId(id.uuid().to_string().into());
         let member = Member {
-            id: model.clone(),
+            id: UserId(SharedString::default()),
             name: super::display_name(user, &id).await,
             own,
             removing: removing.contains(&id),
@@ -383,20 +391,27 @@ pub(super) async fn load(
                     .as_ref()
                     .is_some_and(|(us, state)| can_remove(us, state, &id)),
         };
-        members.push((member, (model, id)));
+        members.push((member, id));
     }
-    let hashes: Vec<String> = members.iter().map(|(_, (_, id))| id_hash(id)).collect();
-    let len = (TAG_LEN..64)
-        .find(|&len| {
-            let tags: std::collections::HashSet<_> = hashes.iter().map(|h| &h[..len]).collect();
-            tags.len() == hashes.len()
-        })
-        .unwrap_or(64);
-    for ((member, _), hash) in members.iter_mut().zip(&hashes) {
-        member.tag = hash[..len].to_string().into();
-    }
+    identify(&mut members);
     members.sort_by(|(a, _), (b, _)| (!a.own, &a.name).cmp(&(!b.own, &b.name)));
     Some(members)
+}
+
+/// Gives each member their ids from the whole user id: the model id (its
+/// hash) and the shortest tag, from [`TAG_LEN`] digits up, that no other
+/// member's shares.
+fn identify(members: &mut [(Member, CoreUserId)]) {
+    let hashes: Vec<String> = members.iter().map(|(_, id)| id_hash(id)).collect();
+    let unique = |len: usize| {
+        let tags: std::collections::HashSet<_> = hashes.iter().map(|hash| &hash[..len]).collect();
+        tags.len() == hashes.len()
+    };
+    let len = (TAG_LEN..64).find(|&len| unique(len)).unwrap_or(64);
+    for ((member, _), hash) in members.iter_mut().zip(hashes) {
+        member.tag = hash[..len].to_string().into();
+        member.id = UserId(hash.into());
+    }
 }
 
 /// Hex SHA-256 of the user id's wire form (uuid and domain).
@@ -451,9 +466,12 @@ mod tests {
             member("Grace", "5e6f7a8b", false, true),
             member("Alan", "9c0d1e2f", false, false),
         ];
-        let removed = |query| resolve_removal(&members, query).map(|m| m.tag.to_string());
+        let removed =
+            |query| resolve_removal(&members, query).map(|ix| members[ix].tag.to_string());
         assert!(removed("grace").is_err(), "never guessed");
         assert_eq!(removed("#5E6F7A8B").as_deref(), Ok("5e6f7a8b"));
+        // As completion offers it.
+        assert_eq!(removed("Grace #1a2b3c4d").as_deref(), Ok("1a2b3c4d"));
         // Not the user, nor those the policy protects.
         assert!(removed("you").is_err());
         assert!(removed("#00000000").is_err());
@@ -463,6 +481,39 @@ mod tests {
         let mut twins = members.clone();
         twins[2].tag = twins[1].tag.clone();
         assert!(resolve_removal(&twins, "#1a2b3c4d").is_err());
+    }
+
+    #[test]
+    fn members_sharing_a_uuid_stay_apart() {
+        let uuid = uuid::Uuid::new_v4();
+        let grace = CoreUserId::new(uuid, "example.com".parse().unwrap());
+        let mallory = CoreUserId::new(uuid, "example.net".parse().unwrap());
+        let mut members: Vec<_> = [&grace, &mallory]
+            .into_iter()
+            .map(|id| (member("Grace", "", false, true), id.clone()))
+            .collect();
+        identify(&mut members);
+        let (rows, ids): (Vec<_>, Vec<_>) = members.into_iter().unzip();
+        assert_ne!(rows[0].id, rows[1].id);
+        let ix = resolve_removal(&rows, &format!("#{}", rows[1].tag)).unwrap();
+        assert_eq!(ids[ix], mallory);
+    }
+
+    #[test]
+    fn tags_grow_until_unique() {
+        let mut members: Vec<_> = (0..300)
+            .map(|_| {
+                let id = CoreUserId::random("example.com".parse().unwrap());
+                (member("", "", false, true), id)
+            })
+            .collect();
+        identify(&mut members);
+        let tags: std::collections::HashSet<_> = members
+            .iter()
+            .map(|(member, _)| member.tag.clone())
+            .collect();
+        assert_eq!(tags.len(), members.len());
+        assert!(tags.iter().all(|tag| tag.len() >= TAG_LEN));
     }
 
     #[test]

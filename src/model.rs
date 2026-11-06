@@ -26,6 +26,8 @@ pub struct MessageId(pub SharedString);
 /// A member of a group, as the details pane lists them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Member {
+    /// From the whole user id (uuid and domain): ids that share a uuid
+    /// stay apart.
     pub id: UserId,
     /// One bounded line; "You" for the user.
     pub name: SharedString,

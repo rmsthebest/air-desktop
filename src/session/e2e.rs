@@ -608,7 +608,7 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     .await;
 
     // Ada removes Bob: his group ends, and he can only delete it.
-    let (_, (_, bob_id)) = groups::load(&ada, group)
+    let (_, bob_id) = groups::load(&ada, group)
         .await
         .unwrap()
         .into_iter()

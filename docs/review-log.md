@@ -395,3 +395,25 @@ held only when nothing else in the chat was unread. Fixed now:
 
 Not added: a pure unit test of the quiet/alerting split. It needs a
 `CoreUser`, and the e2e delete steps cover it.
+
+## Gate 9c — gate 9b fixes (`59cd278..1b72cef`): PASS
+
+Fixed (both medium; each reopened stale text on screen):
+- **A full queue dropped the refresh that removes deleted text.**
+  `NoticeQueue` no longer has a cap. It keeps each chat's latest alert
+  (a show stays a show when rewritten) and its dismissal, so it is
+  bounded by the chats. Covered in
+  `the_queue_keeps_each_chats_latest_notices_in_order`.
+- **A D-Bus failure lost the ids of notifications still on screen.** A
+  failed show keeps the chat's id. A refresh that can't be shown (failed,
+  or no longer allowed) closes the old one. Close reconnects, and an id is
+  forgotten only once the server closed it or doesn't know it. Covered in
+  `stale_text_goes_even_after_the_desktop_failed`, which also covers a
+  refresh under `off`. The fake screen records whether a rewrite was quiet.
+
+Deferred:
+- **Reactions keep an old alert alive (low).** Reactions are gated only by
+  `notified_until`, which desktop doesn't advance, so a quiet rebuild can
+  fall back to an old reaction. Upstream desktop has the same limit. The
+  fix belongs with milestone 9 (reactions): advance `notified_until` once
+  an alert is shown, without losing the fallback for deletes.

@@ -26,7 +26,8 @@ pub trait Desktop {
         alert: &Alert,
         quiet: bool,
     ) -> impl Future<Output = Option<u32>> + Send;
-    fn close(&mut self, id: u32) -> impl Future<Output = ()> + Send;
+    /// Whether notification `id` is gone (closed now, or already).
+    fn close(&mut self, id: u32) -> impl Future<Output = bool> + Send;
 }
 
 /// The platform's notifications.
@@ -75,30 +76,46 @@ impl<D: Desktop + Send> Notifier<D> {
                     return;
                 }
                 let chat = alert.chat;
-                match attention.shown(alert) {
+                let rewritten = match attention.shown(alert) {
                     Some(alert) => self.show(alert, true).await,
-                    None => self.dismiss(Dismiss::Chat(chat)).await,
+                    None => false,
+                };
+                // What is on screen is stale: if it can't be rewritten, it
+                // goes.
+                if !rewritten {
+                    self.dismiss(Dismiss::Chat(chat)).await;
                 }
             }
             Notice::Dismiss(dismiss) => self.dismiss(dismiss).await,
         }
     }
 
-    async fn show(&mut self, alert: Alert, quiet: bool) {
+    /// Returns whether it was shown. On failure, whatever the chat had on
+    /// screen is still there and still tracked.
+    async fn show(&mut self, alert: Alert, quiet: bool) -> bool {
         let replaces = self.shown.get(&alert.chat).copied().unwrap_or(0);
         match self.desktop.notify(replaces, &alert, quiet).await {
-            Some(id) => self.shown.insert(alert.chat, id),
-            None => self.shown.remove(&alert.chat),
-        };
+            Some(id) => {
+                self.shown.insert(alert.chat, id);
+                true
+            }
+            None => false,
+        }
     }
 
+    /// Forgets a notification only once it is gone, so a failed close is
+    /// tried again by the next dismissal.
     async fn dismiss(&mut self, dismiss: Dismiss) {
-        let ids: Vec<u32> = match dismiss {
-            Dismiss::Chat(chat) => self.shown.remove(&chat).into_iter().collect(),
-            Dismiss::All => self.shown.drain().map(|(_, id)| id).collect(),
+        let chats: Vec<ChatId> = match dismiss {
+            Dismiss::Chat(chat) => vec![chat],
+            Dismiss::All => self.shown.keys().copied().collect(),
         };
-        for id in ids {
-            self.desktop.close(id).await;
+        for chat in chats {
+            if let Some(&id) = self.shown.get(&chat)
+                && self.desktop.close(id).await
+            {
+                self.shown.remove(&chat);
+            }
         }
     }
 }
@@ -111,7 +128,9 @@ impl Desktop for Unsupported {
     async fn notify(&mut self, _: u32, _: &Alert, _: bool) -> Option<u32> {
         None
     }
-    async fn close(&mut self, _: u32) {}
+    async fn close(&mut self, _: u32) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -119,26 +138,34 @@ mod tests {
     use super::*;
     use crate::settings::Notifications;
 
-    /// What a desktop shows, by id.
+    /// What a desktop shows, by id. Calls fail while `down`.
     #[derive(Default)]
     struct Screen {
         next_id: u32,
-        visible: HashMap<u32, Alert>,
+        visible: HashMap<u32, (Alert, bool)>,
+        down: bool,
     }
 
     impl Desktop for Screen {
-        async fn notify(&mut self, replaces: u32, alert: &Alert, _: bool) -> Option<u32> {
+        async fn notify(&mut self, replaces: u32, alert: &Alert, quiet: bool) -> Option<u32> {
+            if self.down {
+                return None;
+            }
             let id = if self.visible.contains_key(&replaces) {
                 replaces
             } else {
                 self.next_id += 1;
                 self.next_id
             };
-            self.visible.insert(id, alert.clone());
+            self.visible.insert(id, (alert.clone(), quiet));
             Some(id)
         }
-        async fn close(&mut self, id: u32) {
+        async fn close(&mut self, id: u32) -> bool {
+            if self.down {
+                return false;
+            }
             self.visible.remove(&id);
+            true
         }
     }
 
@@ -155,7 +182,7 @@ mod tests {
             .desktop
             .visible
             .values()
-            .map(|alert| alert.body.clone())
+            .map(|(alert, _)| alert.body.clone())
             .collect();
         bodies.sort();
         bodies
@@ -180,6 +207,14 @@ mod tests {
             notifier.handle(notice, &full).await;
         }
         assert_eq!(bodies(&notifier), ["hello!"]);
+        // The rewrite didn't draw attention again.
+        assert!(
+            notifier
+                .desktop
+                .visible
+                .values()
+                .all(|(a, quiet)| *quiet == (a.body == "hello!"))
+        );
 
         // An alert built under "full" but shown after the switch to
         // "private" reveals nothing.
@@ -194,6 +229,42 @@ mod tests {
             .handle(Notice::Show(alert(4, "the secret")), &private)
             .await;
         assert_eq!(bodies(&notifier), ["New activity"]);
+    }
+
+    #[tokio::test]
+    async fn stale_text_goes_even_after_the_desktop_failed() {
+        let mut notifier = Notifier {
+            desktop: Screen::default(),
+            shown: HashMap::new(),
+        };
+        let full = Attention::default();
+        notifier
+            .handle(Notice::Show(alert(1, "secret")), &full)
+            .await;
+
+        // The rewrite after a delete fails, and so does closing: the stale
+        // notification stays tracked, and the next dismissal closes it.
+        notifier.desktop.down = true;
+        notifier
+            .handle(Notice::Refresh(alert(1, "older")), &full)
+            .await;
+        assert_eq!(bodies(&notifier), ["secret"]);
+        notifier.desktop.down = false;
+        notifier
+            .handle(Notice::Dismiss(Dismiss::Chat(alert(1, "").chat)), &full)
+            .await;
+        assert!(bodies(&notifier).is_empty());
+
+        // A rewrite the user may no longer see (setting off) closes it.
+        notifier.handle(Notice::Show(alert(2, "hi")), &full).await;
+        let off = Attention {
+            content: Notifications::Off,
+            ..full
+        };
+        notifier
+            .handle(Notice::Refresh(alert(2, "hi!")), &off)
+            .await;
+        assert!(bodies(&notifier).is_empty());
     }
 }
 
@@ -257,10 +328,18 @@ mod linux {
                 .ok()
         }
 
-        async fn close(&mut self, id: u32) {
-            if let Some(bus) = &self.bus {
-                // Fails if it is already gone, which is fine.
-                _ = bus.close(id).await;
+        async fn close(&mut self, id: u32) -> bool {
+            let Some(bus) = self.bus().await else {
+                return false;
+            };
+            match bus.close(id).await {
+                // An error reply means the server doesn't know the id: gone.
+                Ok(()) | Err(zbus::Error::MethodError(..)) => true,
+                Err(err) => {
+                    warn!("failed to close a desktop notification: {err}");
+                    self.bus = None;
+                    false
+                }
             }
         }
     }

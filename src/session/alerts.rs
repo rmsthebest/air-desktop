@@ -11,8 +11,8 @@
 //! remote delete rewrites or takes down an alert already shown.
 //!
 //! Alerts and dismissals reach the notifier (`crate::notifier`) in order,
-//! through a [`NoticeQueue`] that holds a bounded number of alerts and drops
-//! the ones a later dismissal makes stale. There is one alert per chat; a
+//! through a [`NoticeQueue`] that keeps only the latest notices of each
+//! chat, so it is bounded by the chats and never drops one. There is one alert per chat; a
 //! newer one replaces it, so a busy chat can't flood the desktop.
 
 use std::collections::VecDeque;
@@ -23,15 +23,11 @@ use aircoreclient::clients::process::process_qs::{NewChat, ProcessedQsMessages};
 use aircoreclient::clients::{CoreUser, SiblingClientStates};
 use aircoreclient::{Chat, ChatId, ChatMessage, ChatNotificationEntry, ChatType, StoredRequest};
 use tokio::sync::{Notify, watch};
-use tracing::{error, warn};
+use tracing::error;
 
 use super::preview;
 use crate::model::{Prefix, name_line, preview_line};
 use crate::settings::Notifications;
-
-/// Alerts waiting for the notifier. Peers decide how many arrive; beyond
-/// this they are dropped. Dismissals are never dropped.
-pub(crate) const ALERTS_BUFFER: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alert {
@@ -125,9 +121,12 @@ pub fn attend(attention: &mut Attention, next: Attention) -> Option<Dismiss> {
     }
 }
 
-/// Notices on their way to the notifier, in order. At most
-/// [`ALERTS_BUFFER`] alerts wait. A dismissal is always taken and drops the
-/// waiting notices it makes stale, so dismissals stay bounded by the chats.
+/// Notices on their way to the notifier, in order, at most two per chat:
+/// a dismissal and the alert after it. A newer alert replaces a waiting one
+/// of its chat (a show stays a show), a dismissal drops the chat's waiting
+/// notices, and dismissing all drops everything waiting. Peers can't grow
+/// it beyond the user's chats, so nothing needs to be dropped: dropping a
+/// refresh or dismissal would leave stale text on screen.
 #[derive(Default)]
 pub struct NoticeQueue {
     queue: Mutex<VecDeque<Notice>>,
@@ -138,22 +137,28 @@ impl NoticeQueue {
     pub fn push(&self, notice: Notice) {
         {
             let mut queue = self.queue.lock().unwrap_or_else(|err| err.into_inner());
-            match &notice {
-                Notice::Show(_) | Notice::Refresh(_) => {
-                    let alerts = queue
-                        .iter()
-                        .filter(|queued| !matches!(queued, Notice::Dismiss(_)))
-                        .count();
-                    if alerts >= ALERTS_BUFFER {
-                        warn!("too many alerts; dropping one");
-                        return;
+            let notice = match notice {
+                Notice::Refresh(alert) => {
+                    let was_shown = take_alert(&mut queue, alert.chat);
+                    if was_shown {
+                        Notice::Show(alert)
+                    } else {
+                        Notice::Refresh(alert)
                     }
                 }
-                Notice::Dismiss(Dismiss::Chat(chat)) => {
-                    queue.retain(|queued| queued.chat() != Some(*chat));
+                Notice::Show(alert) => {
+                    take_alert(&mut queue, alert.chat);
+                    Notice::Show(alert)
                 }
-                Notice::Dismiss(Dismiss::All) => queue.clear(),
-            }
+                Notice::Dismiss(Dismiss::Chat(chat)) => {
+                    queue.retain(|queued| queued.chat() != Some(chat));
+                    Notice::Dismiss(Dismiss::Chat(chat))
+                }
+                Notice::Dismiss(Dismiss::All) => {
+                    queue.clear();
+                    Notice::Dismiss(Dismiss::All)
+                }
+            };
             queue.push_back(notice);
         }
         self.ready.notify_one();
@@ -174,6 +179,18 @@ impl NoticeQueue {
             self.ready.notified().await;
         }
     }
+}
+
+/// Takes the chat's waiting alert out of the queue, returning whether it
+/// was a show.
+fn take_alert(queue: &mut VecDeque<Notice>, chat: ChatId) -> bool {
+    let waiting = queue.iter().position(|queued| {
+        matches!(queued, Notice::Show(alert) | Notice::Refresh(alert) if alert.chat == chat)
+    });
+    matches!(
+        waiting.and_then(|ix| queue.remove(ix)),
+        Some(Notice::Show(_))
+    )
 }
 
 /// The session's end of alerts: what the user is looking at, and the way to
@@ -538,22 +555,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dismissals_are_kept_in_order_and_drop_what_they_make_stale() {
+    async fn the_queue_keeps_each_chats_latest_notices_in_order() {
         let queue = NoticeQueue::default();
-        for n in 0..ALERTS_BUFFER as u128 + 5 {
-            queue.push(Notice::Show(alert(n, "a")));
+        // A busy chat holds one place, its newest alert; a rewrite of an
+        // alert not shown yet is still shown.
+        for n in 0..100 {
+            queue.push(Notice::Show(alert(1, &n.to_string())));
         }
-        // Full of alerts, a dismissal still gets in, and takes the alert
-        // waiting before it along; an alert after it stays after it.
-        queue.push(Notice::Dismiss(Dismiss::Chat(chat(0))));
-        queue.push(Notice::Show(alert(0, "after")));
-        let drained = drain(&queue).await;
-        assert!(!drained.contains(&Notice::Show(alert(0, "a"))));
+        queue.push(Notice::Show(alert(2, "b")));
+        queue.push(Notice::Refresh(alert(1, "edited")));
+        queue.push(Notice::Refresh(alert(3, "c")));
         assert_eq!(
-            drained[drained.len() - 2..],
+            drain(&queue).await,
             [
-                Notice::Dismiss(Dismiss::Chat(chat(0))),
-                Notice::Show(alert(0, "after"))
+                Notice::Show(alert(2, "b")),
+                Notice::Show(alert(1, "edited")),
+                Notice::Refresh(alert(3, "c")),
+            ]
+        );
+
+        // A dismissal drops what it makes stale; an alert after it stays
+        // after it.
+        queue.push(Notice::Show(alert(1, "a")));
+        queue.push(Notice::Dismiss(Dismiss::Chat(chat(1))));
+        queue.push(Notice::Show(alert(1, "after")));
+        assert_eq!(
+            drain(&queue).await,
+            [
+                Notice::Dismiss(Dismiss::Chat(chat(1))),
+                Notice::Show(alert(1, "after"))
             ]
         );
 

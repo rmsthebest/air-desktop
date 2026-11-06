@@ -6,7 +6,8 @@
 //!   `notifications` setting;
 //! - the suppression reported to the user's other devices.
 //!
-//! Alerts go to the notifier (`crate::notifier`) through a bounded channel.
+//! Alerts go to the notifier (`crate::notifier`) through a bounded channel;
+//! dismissals through their own, so a burst of alerts never drops one.
 //! There is one alert per chat. A newer alert replaces it, so a busy chat
 //! can't flood the desktop.
 
@@ -27,7 +28,7 @@ use crate::settings::Notifications;
 
 /// Alerts waiting for the notifier. Peers decide how many arrive; beyond
 /// this they are dropped.
-pub(crate) const NOTICES_BUFFER: usize = 32;
+pub(crate) const ALERTS_BUFFER: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alert {
@@ -37,12 +38,13 @@ pub struct Alert {
     pub body: String,
 }
 
-/// What the notifier is told.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Notice {
-    Show(Alert),
+/// Alerts to take off the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dismiss {
     /// The chat's alert is stale: opened, answered elsewhere, or moved.
-    Dismiss(ChatId),
+    Chat(ChatId),
+    /// The user asked alerts to reveal less than the ones shown do.
+    All,
 }
 
 /// What the user is looking at, and what they want to be told.
@@ -55,7 +57,7 @@ pub struct Attention {
 
 impl Attention {
     /// The chat the user is looking at.
-    fn watched(&self) -> Option<ChatId> {
+    pub fn watched(&self) -> Option<ChatId> {
         self.open_chat.filter(|_| self.window_active)
     }
 
@@ -87,17 +89,39 @@ impl Attention {
     }
 }
 
+/// Moves to `next`, returning what that makes stale: the chat the user
+/// starts looking at, or everything shown when the setting got stricter.
+pub fn attend(attention: &mut Attention, next: Attention) -> Option<Dismiss> {
+    let previous = std::mem::replace(attention, next);
+    if next.content > previous.content {
+        Some(Dismiss::All)
+    } else if next.watched() != previous.watched() {
+        next.watched().map(Dismiss::Chat)
+    } else {
+        None
+    }
+}
+
 /// The session's end of alerts: what the user is looking at, and the way to
 /// the notifier. Cloned into the queue and username listeners.
 #[derive(Clone)]
 pub struct Alerts {
     attention: watch::Receiver<Attention>,
-    notices: mpsc::Sender<Notice>,
+    shows: mpsc::Sender<Alert>,
+    dismissals: mpsc::UnboundedSender<Dismiss>,
 }
 
 impl Alerts {
-    pub fn new(attention: watch::Receiver<Attention>, notices: mpsc::Sender<Notice>) -> Self {
-        Self { attention, notices }
+    pub fn new(
+        attention: watch::Receiver<Attention>,
+        shows: mpsc::Sender<Alert>,
+        dismissals: mpsc::UnboundedSender<Dismiss>,
+    ) -> Self {
+        Self {
+            attention,
+            shows,
+            dismissals,
+        }
     }
 
     pub fn suppression(&self) -> NotificationSuppression {
@@ -112,21 +136,24 @@ impl Alerts {
         }
     }
 
-    fn send(&self, notice: Notice) {
-        match self.notices.try_send(notice) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => warn!("too many alerts; dropping one"),
-        }
-    }
-
     fn show(&self, alerts: Vec<Alert>) {
         let attention = *self.attention.borrow();
         for alert in alerts
             .into_iter()
             .filter_map(|alert| attention.shown(alert))
         {
-            self.send(Notice::Show(alert));
+            match self.shows.try_send(alert) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => warn!("too many alerts; dropping one"),
+            }
         }
+    }
+
+    /// Never dropped: a stale alert could reveal what the user has since
+    /// read, deleted or hidden. At most one per chat and event, and the
+    /// notifier takes them first.
+    pub fn dismiss(&self, dismiss: Dismiss) {
+        _ = self.dismissals.send(dismiss);
     }
 
     /// Alerts for what processing a queue event stored. Port of upstream's
@@ -140,7 +167,7 @@ impl Alerts {
     ) {
         let mut alerts = Vec::new();
         new_chats(user, &processed.new_chats, &mut alerts).await;
-        let (chats, quiet) = message_alerts(
+        let (chats, mut quiet) = message_alerts(
             user,
             &processed.new_messages,
             &processed.reaction_notifications,
@@ -151,22 +178,26 @@ impl Alerts {
         for chat in &processed.new_connections {
             alerts.extend(connection_alert(user, *chat).await);
         }
-        self.show(latest_per_chat(alerts));
+        let alerts = latest_per_chat(alerts);
+        quiet.extend(processed.chats_with_changed_notifications.iter().copied());
+        quiet.retain(|chat| !alerts.iter().any(|alert| alert.chat == *chat));
+        self.show(alerts);
 
         // As upstream: a chat that changed without alerting (an edit, a
-        // message the user sent from another device) keeps its alert only
-        // while something in it is still unread and not notified.
+        // remote delete, a retracted reaction, a message the user sent from
+        // another device) keeps its alert only while something in it is
+        // still unread and not notified.
         for chat in quiet {
             match user.chat_notification_rebuild_set(chat).await {
                 Ok(rebuild) if rebuild.rebuild_set.entries.is_empty() => {
-                    self.send(Notice::Dismiss(chat))
+                    self.dismiss(Dismiss::Chat(chat))
                 }
                 Ok(_) => {}
                 Err(err) => error!("failed to load a chat's notification state: {err:#}"),
             }
         }
         for chat in &processed.removed_chats {
-            self.send(Notice::Dismiss(*chat));
+            self.dismiss(Dismiss::Chat(*chat));
         }
     }
 
@@ -179,13 +210,8 @@ impl Alerts {
                 .collect(),
         );
         if let Some(moved_from) = stored.moved_from {
-            self.send(Notice::Dismiss(moved_from));
+            self.dismiss(Dismiss::Chat(moved_from));
         }
-    }
-
-    /// The user opened a chat: its alert has served its purpose.
-    pub fn dismiss(&self, chat: ChatId) {
-        self.send(Notice::Dismiss(chat));
     }
 }
 
@@ -213,30 +239,36 @@ async fn message_alerts(
     reactions: &[ReactionNotification],
     siblings: &SiblingClientStates,
 ) -> (Vec<Alert>, Vec<ChatId>) {
-    // Only the newest message of a chat is put into words: a burst of
-    // messages yields one alert.
-    let mut newest: Vec<&ChatMessage> = Vec::new();
+    // Chats with messages from others, in order of their newest.
+    let mut chats: Vec<ChatId> = Vec::new();
     for message in messages.iter().filter(|message| !is_own(user, message)) {
-        newest.retain(|kept| kept.chat_id() != message.chat_id());
-        newest.push(message);
+        chats.retain(|chat| *chat != message.chat_id());
+        chats.push(message.chat_id());
     }
-    let mut alerting = HashSet::new();
     let mut alerts = Vec::new();
-    for message in newest {
-        let Some(chat) = alerting_chat(user, message.chat_id(), siblings).await else {
+    for chat_id in chats {
+        let Some(chat) = alerting_chat(user, chat_id, siblings).await else {
             continue;
         };
-        alerting.insert(chat.id);
-        // Error notes the core adds aren't from anyone: no alert, as the
-        // chat list doesn't preview them either.
-        if let Some(body) = message_text(user, message, &chat).await {
-            alerts.push(Alert {
-                chat: chat.id,
-                title: chat_title(user, &chat).await,
-                body,
-            });
+        // One alert per chat, from its newest message that can be put into
+        // words: error notes the core adds can't, as the chat list doesn't
+        // preview them either.
+        let from_others = messages
+            .iter()
+            .rev()
+            .filter(|message| message.chat_id() == chat_id && !is_own(user, message));
+        for message in from_others {
+            if let Some(body) = message_text(user, message, &chat).await {
+                alerts.push(Alert {
+                    chat: chat.id,
+                    title: chat_title(user, &chat).await,
+                    body,
+                });
+                break;
+            }
         }
     }
+    let mut alerting: HashSet<ChatId> = alerts.iter().map(|alert| alert.chat).collect();
     for reaction in reactions {
         // A message in the same chat says more than a reaction.
         if alerting.contains(&reaction.chat_id) {
@@ -257,7 +289,6 @@ async fn message_alerts(
         });
     }
     alerting.extend(alerts.iter().map(|alert| alert.chat));
-
     let quiet = messages
         .iter()
         .filter(|message| is_own(user, message))
@@ -414,6 +445,47 @@ mod tests {
             .suppression(),
             NotificationSuppression::None
         );
+    }
+
+    #[test]
+    fn looking_at_a_chat_or_revealing_less_dismisses() {
+        let mut attention = Attention::default();
+        let looking = |window_active, open: Option<u128>| Attention {
+            window_active,
+            open_chat: open.map(chat),
+            content: Notifications::Full,
+        };
+        // Opening a chat in the background dismisses nothing; activating
+        // the window then does, once.
+        assert_eq!(attend(&mut attention, looking(false, Some(1))), None);
+        assert_eq!(
+            attend(&mut attention, looking(true, Some(1))),
+            Some(Dismiss::Chat(chat(1)))
+        );
+        assert_eq!(attend(&mut attention, looking(true, Some(1))), None);
+        assert_eq!(attend(&mut attention, looking(true, None)), None);
+
+        let reveal = |content| Attention {
+            content,
+            ..Attention::default()
+        };
+        let mut attention = reveal(Notifications::Full);
+        assert_eq!(
+            attend(&mut attention, reveal(Notifications::Private)),
+            Some(Dismiss::All)
+        );
+        assert_eq!(attend(&mut attention, reveal(Notifications::Full)), None);
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_still_takes_dismissals() {
+        let (_attention, attention_rx) = watch::channel(Attention::default());
+        let (shows_tx, _shows) = mpsc::channel(1);
+        let (dismissals_tx, mut dismissals) = mpsc::unbounded_channel();
+        let alerts = Alerts::new(attention_rx, shows_tx, dismissals_tx);
+        alerts.show(vec![alert(1, "a"), alert(2, "b")]);
+        alerts.dismiss(Dismiss::Chat(chat(1)));
+        assert_eq!(dismissals.recv().await, Some(Dismiss::Chat(chat(1))));
     }
 
     #[test]

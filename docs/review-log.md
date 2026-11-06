@@ -338,3 +338,33 @@ Fixed anyway (all low):
 - CLAUDE.md names detached tokio tasks for core operations with cleanup as
   the exception to `Tokio::spawn`. The comment says such a task survives the
   view, not an app quit.
+
+## Gate 9 — milestone 7, desktop notifications (`34cc83d..5ccebf5`): PASS
+
+Fixed:
+- **Deleted or edited text stayed on screen (medium).** Chats in
+  `chats_with_changed_notifications` are now checked like the user's own
+  sibling-sent messages: no unread, unnotified entry left means the alert
+  is dismissed. The two-user e2e test has Ada delete a message and checks
+  that Bob's alert for it is dismissed.
+- **Dismissals could be dropped (low).** They have their own unbounded
+  channel. The notifier handles them first. Covered in
+  `a_full_queue_still_takes_dismissals`.
+- **A stricter setting left revealing alerts up (low).** Moving to
+  `private` or `off` dismisses everything shown. The pure `alerts::attend`
+  rule is covered in `looking_at_a_chat_or_revealing_less_dismisses`.
+- **An error note hid a burst (low).** A chat's alert comes from its newest
+  message that can be put into words. A chat counts as alerting only once
+  an alert was actually built.
+- **An alert could land right after opening its chat (low).** The notifier
+  drops alerts for the chat being watched at show time.
+- **No bus meant one warning per alert (low).** The notifier warns once and
+  retries at most once a minute. D-Bus calls time out after 5 s.
+
+Deferred:
+- **Private mode keeps one notification per chat (low).** Their count shows
+  how many chats are active. One shared slot would fix it, but then a
+  dismissal could close a different chat's alert.
+- **Re-reporting the suppression has no dedicated test.** The arm in
+  `queue::listen_once` only compares two values. A useful test needs a
+  sibling device, which the e2e setup doesn't have yet.

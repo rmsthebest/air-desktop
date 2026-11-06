@@ -97,20 +97,24 @@ impl Session {
             };
             let (state_tx, state_rx) = watch::channel(initial);
 
-            let (notices_tx, notices_rx) = mpsc::channel(alerts::NOTICES_BUFFER);
+            let (shows_tx, shows_rx) = mpsc::channel(alerts::ALERTS_BUFFER);
+            let (dismissals_tx, dismissals_rx) = mpsc::unbounded_channel();
             let (attention, attention_rx) = watch::channel(Attention {
                 content: SettingsStore::get(cx).notifications,
                 ..Attention::default()
             });
-            let alerts = Alerts::new(attention_rx, notices_tx);
-            let notifier = Tokio::spawn(cx, crate::notifier::run(notices_rx));
+            let alerts = Alerts::new(attention_rx.clone(), shows_tx, dismissals_tx);
+            let notifier = Tokio::spawn(
+                cx,
+                crate::notifier::run(shows_rx, dismissals_rx, attention_rx),
+            );
             let settings = cx.observe_global::<SettingsStore>(|this: &mut Self, cx| {
                 let content = SettingsStore::get(cx).notifications;
-                this.attention.send_if_modified(|attention| {
-                    let changed = attention.content != content;
-                    attention.content = content;
-                    changed
-                });
+                let next = Attention {
+                    content,
+                    ..*this.attention.borrow()
+                };
+                this.attend(next);
             });
 
             let queue = Tokio::spawn(
@@ -219,16 +223,23 @@ impl Session {
     /// Tells the alerts what the user is looking at: the open chat, and
     /// whether the window is active. Looking at a chat dismisses its alert.
     pub fn set_attention(&mut self, window_active: bool, open_chat: Option<&ChatId>) {
-        let open_chat = open_chat.map(messages::core_chat_id);
-        let changed = self.attention.send_if_modified(|attention| {
-            let changed =
-                (attention.window_active, attention.open_chat) != (window_active, open_chat);
-            attention.window_active = window_active;
-            attention.open_chat = open_chat;
+        let next = Attention {
+            window_active,
+            open_chat: open_chat.map(messages::core_chat_id),
+            ..*self.attention.borrow()
+        };
+        self.attend(next);
+    }
+
+    fn attend(&mut self, next: Attention) {
+        let mut stale = None;
+        self.attention.send_if_modified(|attention| {
+            let changed = *attention != next;
+            stale = alerts::attend(attention, next);
             changed
         });
-        if let (true, true, Some(chat)) = (changed, window_active, open_chat) {
-            self.alerts.dismiss(chat);
+        if let Some(stale) = stale {
+            self.alerts.dismiss(stale);
         }
     }
 

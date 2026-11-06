@@ -70,7 +70,11 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 - `src/notifier.rs` — shows alerts via `org.freedesktop.Notifications`
   (zbus 5 on async-io, gpui's own copy). Replaces a chat's notification
   instead of stacking, closes it on dismissal, escapes bodies when the
-  server renders markup. No-op off Linux.
+  server renders markup. No-op off Linux. Dismissals travel on their own
+  unbounded channel and are never dropped (stale alerts can reveal deleted
+  or read text); alerts on a bounded one.
+- The local server rate-limits sign-ups: back-to-back e2e runs fail with
+  "Rate limited"/"Too Many Requests" at sign-up or the first requests.
 - `src/markdown.rs` — bounded message markdown parse (size/depth caps; only
   http/https/mailto become links; images and HTML stay inert text).
   `ui/markdown_view.rs` renders it; links always open through a confirm

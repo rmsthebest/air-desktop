@@ -43,7 +43,8 @@ pub enum KeymapMode {
 
 /// What desktop notifications show. Peers choose names and text, and a
 /// notification can appear over a shared screen, so this is the user's call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Ordered from most to least revealing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Notifications {
     /// The chat's name and the message.

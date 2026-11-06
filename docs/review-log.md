@@ -833,3 +833,15 @@ Accepted: an `Opened` already queued for another chat ends a wait set
 after it (focus stays on the chat list). Deferred: the command path for a
 contact-request chat focusing its messages (needs a request chat in the
 mock data listed late).
+
+## Gate 14e — gate 14d fixes (`01522b5..c807d95`): PASS
+
+Fixed (low):
+- The workspace's wait could outlive the chat list's (picking the chat
+  already open cancels the list's wait without an `Opened`), so browsing
+  onto the awaited chat later moved focus. The list now emits
+  `AwaitedOpened` only when a wait it still holds opens the chat, and only
+  that event focuses. `a_cancelled_wait_never_moves_focus_later` (fails
+  on the old handling) replaces `opening_another_chat_ends_the_wait`,
+  which no `Workspace` regression could fail.
+- A `private` test comment no longer claims a check made elsewhere.

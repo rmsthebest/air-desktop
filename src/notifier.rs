@@ -761,8 +761,8 @@ mod tests {
             ]
         );
 
-        // A click opens the newest chat, and the close the server sends
-        // after it marks nothing: the other chat's activity is unseen.
+        // A click opens the newest chat. (The close the server sends right
+        // after it has a test of its own.)
         notifier
             .handle(Notice::Show(alert_until(1, "secret", 10)), &private)
             .await;

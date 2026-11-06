@@ -121,17 +121,17 @@ impl Workspace {
                             conversation.show(chat, messages, compose, window, cx)
                         });
                         this.report_attention(window, cx);
-                        // A chat awaited until listed takes focus now, if
-                        // focus is still where the wait left it: the user
-                        // may have gone on to type elsewhere. Any other
-                        // opening ends the wait.
+                        cx.notify();
+                    }
+                    ChatListEvent::AwaitedOpened(id) => {
+                        // Takes focus if it is still where the wait left
+                        // it: the user may have gone on to type elsewhere.
                         if let Some((awaited, focus)) = this.focus_when_opened.take()
                             && &awaited == id
                             && this.chat_list.focus_handle(cx).is_focused(window)
                         {
                             focus(this, window, cx);
                         }
-                        cx.notify();
                     }
                     ChatListEvent::Updated(chat) => {
                         let chat = chat.clone();
@@ -2102,15 +2102,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn opening_another_chat_ends_the_wait(cx: &mut TestAppContext) {
+    fn a_cancelled_wait_never_moves_focus_later(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         let focus = focus_probe(&workspace, cx);
-        let first = workspace.read_with(cx, |workspace, cx| workspace.chats(cx)[0].id.clone());
+        cx.simulate_keystrokes(&format!("{MOD}-1"));
+        // Picking the chat already open cancels the wait, though nothing
+        // opens.
         let open = wait_then_list(cx, &workspace, |cx| {
             cx.simulate_keystrokes(&format!("{MOD}-1"))
         });
-        // The chat the user picked stays open, and focus where it was.
-        assert_eq!(open, Some(first));
+        assert_ne!(open, Some(ChatId("just-added".into())));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_chat_list(&FocusChatList, window, cx)
+        });
+        // Browsing onto it later in the list keeps focus there.
+        workspace.update(cx, |workspace, cx| {
+            workspace.update_chat_list(cx, |list, cx| list.open(ChatId("just-added".into()), cx))
+        });
+        cx.run_until_parked();
         assert_eq!(focus(cx), Focus::ChatList);
     }
 

@@ -19,6 +19,9 @@ use crate::ui::widgets::{avatar, badge};
 
 pub enum ChatListEvent {
     Opened(ChatId),
+    /// After `Opened`: the chat was awaited (`open_when_listed`) and is
+    /// listed now. Never for a wait something else cancelled.
+    AwaitedOpened(ChatId),
     /// The open chat's summary changed (title, preview…).
     Updated(ChatSummary),
     /// The open chat is gone (deleted, or left on another device).
@@ -73,7 +76,12 @@ impl ChatList {
         self.chats = chats;
         self.state = state;
         if let Some(id) = self.awaited.take() {
-            self.open_when_listed(id, cx);
+            if self.chat(&id).is_some() {
+                self.open(id.clone(), cx);
+                cx.emit(ChatListEvent::AwaitedOpened(id));
+            } else {
+                self.awaited = Some(id);
+            }
         }
         cx.notify();
     }

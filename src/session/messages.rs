@@ -266,7 +266,9 @@ impl Messages {
     /// false): every reaction of the user's that labels the same, as the
     /// view shows them as one. The caller decides from what it shows: two
     /// presses before the first lands both add, the second a no-op in the
-    /// core, leaving the reaction on. `None` for fixed messages (no account). Runs detached, as
+    /// core, leaving the reaction on; a retract the store no longer needs
+    /// (another device took it back) does nothing. A failed retract can
+    /// leave some variants; pressing again takes the rest. `None` for fixed messages (no account). Runs detached, as
     /// sends do.
     pub fn set_reaction(
         &self,

@@ -583,3 +583,10 @@ Fixed:
   do.
 - Tests: the add/retract decision is `model::gave`, tested; every quick
   reaction labels as itself.
+
+## Gate 11c — gate 11b fixes (`0785445..09e9604`): PASS
+
+Accepted (documented on `set_reaction`): a failed retract can be partial
+(pressing again finishes it); a retract on a stale view does nothing.
+The picker-closes-on-delete behaviour test stays deferred (needs a live
+message window).

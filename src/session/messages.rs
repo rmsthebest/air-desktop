@@ -552,6 +552,9 @@ struct Key {
     awaits: Option<MimiId>,
     /// Its attachment, to refresh it as the download goes.
     attachment: Option<CoreAttachmentId>,
+    /// Its preview wasn't decoded for want of room (see
+    /// [`attachments::MAX_PICTURES`]): reloaded once there is.
+    undrawn: bool,
 }
 
 /// The loaded window's bookkeeping: what the view shows, as keys. Each
@@ -709,7 +712,7 @@ impl Worker {
 
     async fn send(
         &mut self,
-        changes: Vec<Change<Message>>,
+        mut changes: Vec<Change<Message>>,
         first_unread: Option<Option<MessageId>>,
         scroll_to_bottom: bool,
     ) -> Result<(), Closed> {
@@ -720,6 +723,8 @@ impl Worker {
             .filter_map(|key| key.attachment)
             .collect();
         self.pictures.retain(|id, _| shown.contains(id));
+        // Pictures that left made room: draw those refused for want of it.
+        changes.extend(self.fill_pictures().await);
         let update = Update::Window(WindowUpdate {
             changes,
             has_older: self.window.has_older,
@@ -935,6 +940,29 @@ impl Worker {
         edits
     }
 
+    /// Reloads messages whose preview was refused for want of room, while
+    /// there is room.
+    async fn fill_pictures(&mut self) -> Vec<Change<Message>> {
+        let mut edits = Vec::new();
+        let refused: Vec<_> = self
+            .window
+            .keys
+            .iter()
+            .filter(|key| key.undrawn)
+            .map(|key| key.id)
+            .collect();
+        for id in refused {
+            if self.pictures.len() >= attachments::MAX_PICTURES {
+                break;
+            }
+            if let Ok(Some(message)) = self.user.message(id).await {
+                let (key, item) = self.convert(message).await;
+                edits.extend(self.window.patch(key, item));
+            }
+        }
+        edits
+    }
+
     /// Reloads the messages showing any of `attachments`.
     async fn reload_with(&mut self, attachments: &[CoreAttachmentId]) -> Vec<Change<Message>> {
         let ids: Vec<_> = self
@@ -1035,6 +1063,7 @@ impl Worker {
             _ => MessageStatus::Sent,
         };
         let mut attachment = None;
+        let mut undrawn = false;
         let body = if deleted {
             MessageBody::Notice("Message deleted".into())
         } else if message.status() == CoreStatus::Hidden {
@@ -1061,8 +1090,11 @@ impl Worker {
                             {
                                 Some((id, shown)) => {
                                     attachment = Some(id);
-                                    if let Some(picture) = &shown.image {
-                                        self.pictures.insert(id, picture.clone());
+                                    match &shown.image {
+                                        Some(picture) => {
+                                            self.pictures.insert(id, picture.clone());
+                                        }
+                                        None => undrawn = !may_decode && shown.state.is_local(),
                                     }
                                     MessageBody::Attachment(shown)
                                 }
@@ -1145,6 +1177,7 @@ impl Worker {
                 _ => None,
             },
             attachment,
+            undrawn,
         };
         let item = Message {
             id: model_message_id(message.id()),
@@ -1204,6 +1237,7 @@ mod tests {
             quotes: None,
             awaits: None,
             attachment: None,
+            undrawn: false,
         }
     }
 

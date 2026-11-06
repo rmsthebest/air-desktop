@@ -400,7 +400,11 @@ impl Workspace {
                     return;
                 }
             };
-            _ = this.update_in(cx, |this, window, cx| this.attach(paths, window, cx));
+            _ = this.update_in(cx, |this, window, cx| {
+                if let Some(chat) = this.sendable_chat(window, cx) {
+                    this.attach(chat, paths, window, cx)
+                }
+            });
         })
         .detach();
     }
@@ -423,10 +427,13 @@ impl Workspace {
     }
 
     /// Sends each file to the open chat.
-    fn attach(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(chat) = self.sendable_chat(window, cx) else {
-            return;
-        };
+    fn attach(
+        &mut self,
+        chat: ChatId,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = &self.session else {
             show_refusal("That needs an account".into(), window, cx);
             return;
@@ -450,9 +457,14 @@ impl Workspace {
     /// Files dropped on the chat: a drag released over the window by
     /// mistake mustn't send them, so ask first.
     fn attach_dropped(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        if paths.is_empty() || self.sendable_chat(window, cx).is_none() {
+        if paths.is_empty() {
             return;
         }
+        // The chat asked about is the one they go to, whatever is open
+        // by the time the user answers.
+        let Some(chat) = self.sendable_chat(window, cx) else {
+            return;
+        };
         const LISTED: usize = 5;
         let mut names: Vec<String> = paths
             .iter()
@@ -477,7 +489,7 @@ impl Workspace {
             "Send",
             move |this, window, cx| {
                 if let Some(paths) = paths.borrow_mut().take() {
-                    this.attach(paths, window, cx);
+                    this.attach(chat.clone(), paths, window, cx);
                 }
             },
             window,
@@ -645,7 +657,9 @@ impl Workspace {
             }
             Command::Attach(path) => {
                 let path = expand_home(&path);
-                self.attach(vec![path], window, cx);
+                if let Some(chat) = self.sendable_chat(window, cx) {
+                    self.attach(chat, vec![path], window, cx);
+                }
             }
             Command::Rename(title) => {
                 let Some(chat) = self.open_group(window, cx) else {
@@ -1749,6 +1763,42 @@ mod tests {
             // Focus is back where the command was typed.
             assert_eq!(focus(cx), Focus::Messages);
         }
+    }
+
+    #[gpui::test]
+    fn dropped_files_are_sent_only_once_confirmed(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let asking =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| window.has_active_dialog(cx));
+        let told =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| window.notifications(cx).len());
+        let drop = |cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.conversation.update(cx, |_, cx| {
+                    cx.emit(ConversationEvent::Attach(vec!["/tmp/a.txt".into()]))
+                })
+            });
+            cx.run_until_parked();
+        };
+        enable_helix(cx);
+        cx.simulate_keystrokes(":");
+        cx.run_until_parked();
+        cx.simulate_input("o grace");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        drop(cx);
+        assert!(asking(cx));
+        let before = told(cx);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert_eq!(told(cx), before, "cancelled, nothing was tried");
+        // Confirmed, the send runs: without an account, it is refused.
+        drop(cx);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert_eq!(told(cx), before + 1);
     }
 
     #[gpui::test]

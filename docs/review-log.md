@@ -615,3 +615,27 @@ Fixed:
 Deferred:
 - A `#[gpui::test]` for releasing preview textures: the test platform's
   atlas doesn't expose what it holds.
+
+## Gate 12b — gate 12 fixes (`cde7df9..69a351b`): PASS
+
+Fixed:
+- **A preview-less file read again on every reload (medium).** The
+  on-demand preview is tried once: for a file declared an image, the
+  core's thumbnail is generated whatever the bytes, and its stored
+  failure stops later tries.
+- **The picture budget counted pictures on their way out (medium).**
+  Messages refused a preview for want of room are reloaded once room is
+  made (`Key::undrawn`, `fill_pictures`).
+- **A drop's confirmation could send to another chat (low).** The chat
+  named in the dialog is the one the files go to.
+- **`s` gave the wrong reason (low).** Already downloading, done
+  meanwhile (reported, so the view catches up), and failed are told
+  apart.
+- Found by the new claim test: taking an attachment already being
+  downloaded deadlocked (`then_some` built and dropped a claim under the
+  lock). Fixed.
+- Tests: a drop asks first, sends nothing when cancelled, and runs once
+  confirmed; one claim per attachment.
+
+Accepted: the on-demand preview runs on the message worker (once per
+file, as above), not off it.

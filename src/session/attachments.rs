@@ -76,7 +76,13 @@ struct Claim(AttachmentId);
 impl Claim {
     fn take(id: AttachmentId) -> Option<Self> {
         let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
-        in_flight.insert(id).then_some(Self(id))
+        // Not `then_some`: that would make (and drop, relocking) a claim
+        // for a taken id while the lock is held.
+        if in_flight.insert(id) {
+            Some(Self(id))
+        } else {
+            None
+        }
     }
 }
 
@@ -203,8 +209,9 @@ async fn preview(user: &CoreUser, id: AttachmentId, image: bool) -> Option<Pictu
     let mut thumbnail = user.attachment_thumbnail(id).await;
     if image && matches!(thumbnail, Ok(None)) {
         // Downloaded, but the preview wasn't made (the app quit in
-        // between, say): make it now, as upstream does on demand.
-        make_preview(user, id).await;
+        // between, say): make it now, as upstream does on demand. Tried
+        // once: whatever it gives (a failure too) is stored.
+        make_preview(user, id, true).await;
         thumbnail = user.attachment_thumbnail(id).await;
     }
     let bytes = match thumbnail {
@@ -321,8 +328,10 @@ pub(super) async fn download_all(user: CoreUser, changed: impl Fn(AttachmentId) 
 #[derive(Debug, PartialEq)]
 enum Downloaded {
     Yes,
-    /// Not pending (or failed, when retrying), or already downloading.
-    Skipped,
+    /// Already downloading.
+    Busy,
+    /// Not pending (or failed, when retrying): downloaded already, say.
+    NotNeeded,
     Failed,
 }
 
@@ -330,12 +339,12 @@ enum Downloaded {
 /// already downloading, then makes its preview.
 async fn download(user: &CoreUser, id: AttachmentId, retry: bool) -> Downloaded {
     let Some(_claim) = Claim::take(id) else {
-        return Downloaded::Skipped;
+        return Downloaded::Busy;
     };
     match user.attachment_status(id).await {
         Ok(Some(AttachmentStatus::Pending)) => {}
         Ok(Some(AttachmentStatus::DownloadFailed)) if retry => {}
-        Ok(_) => return Downloaded::Skipped,
+        Ok(_) => return Downloaded::NotNeeded,
         Err(err) => {
             error!("failed to read an attachment's status: {err:#}");
             return Downloaded::Failed;
@@ -346,18 +355,20 @@ async fn download(user: &CoreUser, id: AttachmentId, retry: bool) -> Downloaded 
         warn!("failed to download an attachment: {err:#}");
         return Downloaded::Failed;
     }
-    make_preview(user, id).await;
+    make_preview(user, id, false).await;
     Downloaded::Yes
 }
 
-/// Makes the core's thumbnail for a downloaded WebP image (the only image
-/// format Air sends) that has none yet.
-async fn make_preview(user: &CoreUser, id: AttachmentId) {
+/// Makes the core's thumbnail for a downloaded image that has none yet:
+/// a WebP one (the only image format Air sends), or, `declared_image`,
+/// whatever the sender declared an image. The core stores a failure
+/// too, so a file is never read for this twice.
+async fn make_preview(user: &CoreUser, id: AttachmentId, declared_image: bool) {
     if !matches!(user.attachment_thumbnail(id).await, Ok(None)) {
         return;
     }
     let bytes = match user.load_attachment(id).await {
-        Ok(AttachmentContent::Ready(bytes)) if is_webp(&bytes) => bytes,
+        Ok(AttachmentContent::Ready(bytes)) if declared_image || is_webp(&bytes) => bytes,
         Ok(_) => return,
         Err(err) => {
             error!("failed to load a downloaded attachment: {err:#}");
@@ -405,9 +416,10 @@ pub(super) async fn retry(
 ) -> Result<AttachmentId, Failure> {
     let id = attachment_in(&user, chat, message).await?;
     match download(&user, id, true).await {
-        Downloaded::Yes => Ok(id),
-        Downloaded::Skipped => Err(Failure::Shown("Already downloading".into())),
-        Downloaded::Failed => Err(Failure::Shown("The download failed again".into())),
+        // Done meanwhile: reported all the same, so the view catches up.
+        Downloaded::Yes | Downloaded::NotNeeded => Ok(id),
+        Downloaded::Busy => Err(Failure::Shown("Already downloading".into())),
+        Downloaded::Failed => Err(Failure::Shown("The download failed".into())),
     }
 }
 
@@ -605,6 +617,17 @@ mod tests {
             disposition,
             vec![part(Disposition::Attachment, url, "a.txt")],
         ))
+    }
+
+    #[test]
+    fn one_download_per_attachment_at_a_time() {
+        let id = AttachmentId {
+            uuid: uuid::Uuid::new_v4(),
+        };
+        let claim = Claim::take(id).expect("free");
+        assert!(Claim::take(id).is_none());
+        drop(claim);
+        assert!(Claim::take(id).is_some());
     }
 
     #[test]

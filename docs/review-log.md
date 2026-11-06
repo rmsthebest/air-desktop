@@ -639,3 +639,21 @@ Fixed:
 
 Accepted: the on-demand preview runs on the message worker (once per
 file, as above), not off it.
+
+## Gate 12c — gate 12b fixes (`69a351b..286d1f8`): PASS
+
+Fixed (all low):
+- Only declared images wait for a preview slot, and freed slots go
+  newest first.
+- An own image whose thumbnail failed when sent is tried once too.
+- The file dialog sends to the chat open when it was opened; if another
+  chat was opened meanwhile, nothing is sent and the user is told.
+- `s` on a file the core can't download says so.
+- The claim test fails, rather than hangs, if the deadlock returns.
+
+Deferred:
+- A test for the picture budget refill (needs a live message window, or
+  more of the worker made pure), and an e2e check that a declared image
+  with undecodable bytes is read only once.
+- A test that a confirmed drop goes to the chat the dialog named needs a
+  session seam in the workspace tests.

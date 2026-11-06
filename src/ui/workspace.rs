@@ -376,9 +376,11 @@ impl Workspace {
 
     /// Picks files to send to the open chat with the system's file dialog.
     fn attach_file(&mut self, _: &AttachFile, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sendable_chat(window, cx).is_none() {
+        // The files go to the chat open when the dialog was: the dialog
+        // isn't modal, and the open chat can change meanwhile.
+        let Some(chat) = self.sendable_chat(window, cx) else {
             return;
-        }
+        };
         let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
@@ -401,8 +403,14 @@ impl Workspace {
                 }
             };
             _ = this.update_in(cx, |this, window, cx| {
-                if let Some(chat) = this.sendable_chat(window, cx) {
-                    this.attach(chat, paths, window, cx)
+                match this.sendable_chat(window, cx) {
+                    Some(open) if open == chat => this.attach(chat, paths, window, cx),
+                    Some(_) => show_refusal(
+                        "Another chat was opened meanwhile; nothing was sent".into(),
+                        window,
+                        cx,
+                    ),
+                    None => {}
                 }
             });
         })

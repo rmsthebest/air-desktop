@@ -951,7 +951,8 @@ impl Worker {
             .filter(|key| key.undrawn)
             .map(|key| key.id)
             .collect();
-        for id in refused {
+        // Newest first: the user is most often at the bottom.
+        for id in refused.into_iter().rev() {
             if self.pictures.len() >= attachments::MAX_PICTURES {
                 break;
             }
@@ -1077,6 +1078,7 @@ impl Worker {
                     },
                     Body::Attachment => match attachments::declared(content.content()) {
                         Some(declared) => {
+                            let declared_image = declared.image;
                             let cached = |id| self.pictures.get(&id).cloned();
                             let may_decode = self.pictures.len() < attachments::MAX_PICTURES;
                             match attachments::load(
@@ -1094,7 +1096,11 @@ impl Worker {
                                         Some(picture) => {
                                             self.pictures.insert(id, picture.clone());
                                         }
-                                        None => undrawn = !may_decode && shown.state.is_local(),
+                                        None => {
+                                            undrawn = !may_decode
+                                                && declared_image
+                                                && shown.state.is_local()
+                                        }
                                     }
                                     MessageBody::Attachment(shown)
                                 }

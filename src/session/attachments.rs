@@ -369,6 +369,12 @@ async fn make_preview(user: &CoreUser, id: AttachmentId, declared_image: bool) {
     }
     let bytes = match user.load_attachment(id).await {
         Ok(AttachmentContent::Ready(bytes)) if declared_image || is_webp(&bytes) => bytes,
+        // An own image whose thumbnail failed when sent: tried once too.
+        Ok(AttachmentContent::Uploading(bytes) | AttachmentContent::UploadFailed(bytes))
+            if declared_image =>
+        {
+            bytes
+        }
         Ok(_) => return,
         Err(err) => {
             error!("failed to load a downloaded attachment: {err:#}");
@@ -416,8 +422,12 @@ pub(super) async fn retry(
 ) -> Result<AttachmentId, Failure> {
     let id = attachment_in(&user, chat, message).await?;
     match download(&user, id, true).await {
+        Downloaded::Yes => Ok(id),
         // Done meanwhile: reported all the same, so the view catches up.
-        Downloaded::Yes | Downloaded::NotNeeded => Ok(id),
+        Downloaded::NotNeeded => match user.attachment_status(id).await? {
+            Some(AttachmentStatus::Ready) => Ok(id),
+            _ => Err(Failure::Shown("That file can't be downloaded".into())),
+        },
         Downloaded::Busy => Err(Failure::Shown("Already downloading".into())),
         Downloaded::Failed => Err(Failure::Shown("The download failed".into())),
     }
@@ -625,7 +635,11 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
         };
         let claim = Claim::take(id).expect("free");
-        assert!(Claim::take(id).is_none());
+        // On a thread, so a deadlock fails the test instead of hanging it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(Claim::take(id).is_none()));
+        let refused = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(refused, Ok(true), "a taken attachment is refused, promptly");
         drop(claim);
         assert!(Claim::take(id).is_some());
     }

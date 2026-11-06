@@ -54,6 +54,12 @@
     }
   },
   {
+    "context": "MessageList && helix && reacting",
+    "bindings": {
+      "escape": "air::PickReaction"
+    }
+  },
+  {
     "context": "Composer && helix",
     "bindings": {
       "escape": "air::FocusMessages"

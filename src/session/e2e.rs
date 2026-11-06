@@ -467,6 +467,7 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
     let got = next_message(&mut ada_updates, |m| m.plain_text() == "hi ada").await;
     assert_eq!((got.own, got.sender_name.as_ref()), (false, "Bob"));
+    let got_hi_ada = got.clone();
 
     // Ada reading it shows as read on Bob's side.
     let read_id = messages::core_message_id(&got.id).unwrap();
@@ -539,6 +540,37 @@ async fn e2e_two_users_connect_by_username_and_talk() {
             );
         }
     }
+
+    // Ada reacts to Bob's first message: Bob sees it on his message, and
+    // is alerted. Toggling again retracts it.
+    let hi = messages::core_message_id(&got_hi_ada.id).unwrap();
+    let added = messages::toggle_reaction(&ada, ada_chat, hi, "👍".into()).await;
+    assert!(matches!(added, Ok(true)), "{added:?}");
+    let reacted = next_message(&mut bob_updates, |m| {
+        m.plain_text() == "hi ada" && !m.reactions.is_empty()
+    })
+    .await;
+    assert_eq!(
+        reacted.reactions,
+        [crate::model::Reaction {
+            label: "👍".into(),
+            count: 1,
+            own: false
+        }]
+    );
+    let alert = next_alert(&bob_notices, |alert| alert.chat == bob_chat).await;
+    assert_eq!(alert.body, "Ada Lovelace reacted 👍 to hi ada");
+    let removed = messages::toggle_reaction(&ada, ada_chat, hi, "👍".into()).await;
+    assert!(matches!(removed, Ok(false)), "{removed:?}");
+    next_message(&mut bob_updates, |m| {
+        m.plain_text() == "hi ada" && m.reactions.is_empty()
+    })
+    .await;
+    // Only messages of the chat named take reactions.
+    let elsewhere = aircoreclient::MessageId::new(uuid::Uuid::new_v4());
+    assert!(refused(
+        messages::toggle_reaction(&ada, ada_chat, elsewhere, "👍".into()).await
+    ));
 
     // Bob's rename reaches the messages Ada already has from him.
     let mut profile = bob.own_user_profile().await.unwrap();

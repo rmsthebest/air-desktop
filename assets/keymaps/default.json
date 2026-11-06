@@ -56,7 +56,20 @@
       "secondary-c": "air::YankMessage",
       "enter": "air::OpenLinks",
       "e": "air::EditMessage",
-      "r": "air::ReplyToMessage"
+      "r": "air::ReplyToMessage",
+      "+": "air::PickReaction"
+    }
+  },
+  {
+    "context": "MessageList && reacting",
+    "bindings": {
+      "1": ["air::React", { "index": 0 }],
+      "2": ["air::React", { "index": 1 }],
+      "3": ["air::React", { "index": 2 }],
+      "4": ["air::React", { "index": 3 }],
+      "5": ["air::React", { "index": 4 }],
+      "6": ["air::React", { "index": 5 }],
+      "escape": "air::PickReaction"
     }
   },
   {

@@ -44,6 +44,7 @@ gpui_kit::actions!(
         EditMessage,
         EditLastMessage,
         ReplyToMessage,
+        PickReaction,
         CancelCompose,
         AddContact,
         NewGroup,
@@ -60,6 +61,14 @@ gpui_kit::actions!(
 #[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
 #[action(namespace = air)]
 pub struct OpenChatAt {
+    pub index: usize,
+}
+
+/// Toggles a quick reaction (0-based, see `model::QUICK_REACTIONS`) on
+/// the message under the cursor, while the reaction picker is open.
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = air)]
+pub struct React {
     pub index: usize,
 }
 
@@ -148,6 +157,8 @@ pub fn label(action: &dyn Action) -> String {
         "EditMessage" => "edit message",
         "EditLastMessage" => "edit last message",
         "ReplyToMessage" => "reply",
+        "PickReaction" => "react",
+        "React" => "toggle reaction",
         "AddContact" => "add contact",
         "NewGroup" => "new group",
         "InviteToGroup" => "invite to group",

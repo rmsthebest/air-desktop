@@ -545,3 +545,8 @@ Accepted:
 - Test suggestions (case/space-alike names; comparing tags instead of
   positions in the completion test) taken as nice-to-haves: identical
   normalized names already exercise the alike path.
+
+Moved (milestone 9): the gate 9c deferral "reactions keep an old alert
+alive" goes to milestone 12. Upstream advances `notified_until` when the
+user dismisses a notification, which needs the server's
+`NotificationClosed` signal that milestone subscribes to.

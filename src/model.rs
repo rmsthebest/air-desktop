@@ -172,6 +172,65 @@ pub struct Message {
     pub edited: bool,
     /// The message this one replies to.
     pub reply_to: Option<Quote>,
+    /// See [`reactions`]: bounded, the user's own always among them.
+    pub reactions: Vec<Reaction>,
+    /// Kinds of reaction not shown.
+    pub more_reactions: usize,
+}
+
+/// One kind of reaction on a message, as shown under it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reaction {
+    /// The emoji as one visible grapheme (see [`reaction_label`]).
+    pub label: SharedString,
+    pub count: usize,
+    /// The user reacted with it.
+    pub own: bool,
+}
+
+/// The quick reactions the picker offers, in the order of its keys (1–6).
+/// As upstream's reaction bar.
+pub const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
+/// Kinds of reaction shown under a message; peers decide how many there are.
+const MAX_REACTIONS: usize = 12;
+
+/// A peer's reaction emoji as shown: one visible grapheme ("…" after it if
+/// they sent more), "?" if nothing visible is left. Reactions are any
+/// text the peer chose; the core doesn't check them.
+pub fn reaction_label(emoji: &str) -> SharedString {
+    let label = one_line(emoji, 1);
+    if label.is_empty() { "?".into() } else { label }
+}
+
+/// What a message's reactions show: `(emoji, reactors, user among them)`,
+/// in order of first appearance. Emoji that look the same once labelled
+/// are counted together. At most [`MAX_REACTIONS`] kinds, but always the
+/// user's own (so they can see what they would retract); returns how many
+/// kinds were left out.
+pub fn reactions<'a>(
+    raw: impl IntoIterator<Item = (&'a str, usize, bool)>,
+) -> (Vec<Reaction>, usize) {
+    let mut merged: Vec<Reaction> = Vec::new();
+    for (emoji, count, own) in raw {
+        let label = reaction_label(emoji);
+        match merged.iter_mut().find(|reaction| reaction.label == label) {
+            Some(reaction) => {
+                reaction.count += count;
+                reaction.own |= own;
+            }
+            None => merged.push(Reaction { label, count, own }),
+        }
+    }
+    let total = merged.len();
+    let mut shown = Vec::new();
+    for (ix, reaction) in merged.into_iter().enumerate() {
+        if ix < MAX_REACTIONS || reaction.own {
+            shown.push(reaction);
+        }
+    }
+    let more = total - shown.len();
+    (shown, more)
 }
 
 /// A replied-to message as shown above a reply: who wrote it and one
@@ -225,6 +284,8 @@ impl Message {
             status: MessageStatus::Sent,
             edited: false,
             reply_to: None,
+            reactions: Vec::new(),
+            more_reactions: 0,
         }
     }
 
@@ -535,7 +596,10 @@ pub mod mock {
             ),
             msg(true, "Yes, it is so much nicer on a big screen.", 9),
             msg(true, "And everything is reachable from the keyboard.", 9),
-            msg(false, "Ctrl+K to jump between chats is my favourite.", 7),
+            Message {
+                reactions: reactions([("👍", 2, true), ("😂", 1, false)]).0,
+                ..msg(false, "Ctrl+K to jump between chats is my favourite.", 7)
+            },
             msg(false, "The engine can compose music too.", 3),
         ]
     }
@@ -707,6 +771,37 @@ mod tests {
         assert_eq!(at(Duration::days(400)), "2025-10-01");
         // Clock skew: a peer timestamp in the future still renders as a time.
         assert_eq!(at(Duration::hours(-2)), "17:00");
+    }
+
+    #[test]
+    fn reactions_are_bounded_and_never_hide_the_users_own() {
+        let many: Vec<String> = (0..40)
+            .map(|n| char::from_u32(0x1F600 + n).unwrap().to_string())
+            .collect();
+        let mut raw: Vec<(&str, usize, bool)> =
+            many.iter().map(|e| (e.as_str(), 1, false)).collect();
+        // Looks like 👍 once invisible characters go: counted with it.
+        raw.insert(0, ("👍", 2, false));
+        raw.insert(1, ("\u{200B}👍\u{202E}", 1, true));
+        // The user's, but far down the list.
+        raw.push(("🙏", 1, true));
+        // Text instead of an emoji, and nothing visible.
+        raw.insert(2, ("not an emoji at all", 1, false));
+        raw.insert(3, ("\u{200B}", 1, false));
+        let (shown, more) = reactions(raw);
+        assert_eq!(
+            shown[0],
+            Reaction {
+                label: "👍".into(),
+                count: 3,
+                own: true
+            }
+        );
+        assert_eq!(shown[1].label.as_ref(), "n…");
+        assert_eq!(shown[2].label.as_ref(), "?");
+        assert_eq!(shown.len(), MAX_REACTIONS + 1);
+        assert!(shown.last().is_some_and(|r| r.label == "🙏" && r.own));
+        assert_eq!(more, 3 + 40 + 1 - shown.len());
     }
 
     #[test]

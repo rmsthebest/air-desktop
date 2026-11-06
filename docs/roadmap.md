@@ -7,7 +7,7 @@ milestones. Each one ends with a review gate (see CLAUDE.md).
 8. **Groups and members** (done). Create a group, invite contacts, remove members
    (as the room policy allows), rename, leave and delete. Members are shown
    in the details pane. Keyboard and `:` commands for each.
-9. **Reactions.** Show reactions under messages, and add or retract one
+9. **Reactions** (done). Show reactions under messages, and add or retract one
    from the keyboard (quick picker on the message cursor).
 10. **Attachments and images.** Show and download received files and
     images (size caps, no automatic fetches beyond what the core does).
@@ -17,6 +17,8 @@ milestones. Each one ends with a review gate (see CLAUDE.md).
 12. **Notification actions.** Clicking a notification opens its chat and
     raises the window (D-Bus `ActionInvoked`, Wayland activation token).
     In `private` mode, one shared notification instead of one per chat.
+    A notification the user dismisses advances the chat's `notified_until`
+    (as upstream), so old reactions stop coming back in rewritten alerts.
 13. **Multi-device linking.** Link and unlink devices. With a second
     device of the same user, cover sibling notification suppression in
     the e2e tests (deferred since gate 9).

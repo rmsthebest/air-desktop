@@ -18,7 +18,7 @@ use aircoreclient::{
 };
 use chrono::{DateTime, Utc};
 use gpui::{EventEmitter, SharedString};
-use gpui_kit::{AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
+use gpui_kit::{App, AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
 use mimi_content::MessageStatus as CoreStatus;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::markdown;
 use crate::model::{ChatId, Message, MessageBody, MessageId, MessageStatus, Quote, UserId};
 use crate::runtime::{Tokio, TokioTask};
+use crate::session::contacts::{Failure, on_tokio};
 use crate::session::pending::{Changes, Pending};
 use crate::session::preview::{Body, body_of, quote_line};
 use crate::session::{Session, SessionEvent, display_name};
@@ -259,6 +260,25 @@ impl Messages {
                 }
             });
         }));
+    }
+
+    /// Adds `emoji` to the message's reactions, or retracts it if the user
+    /// reacted with it. Resolves to whether it was added. `None` for fixed
+    /// messages (no account). Runs detached, as sends do.
+    pub fn toggle_reaction(
+        &self,
+        id: &MessageId,
+        emoji: &str,
+        cx: &App,
+    ) -> Option<impl Future<Output = Result<bool, String>> + use<>> {
+        let live = self.live.as_ref()?;
+        let (user, chat, id) = (live.user.clone(), live.chat, core_message_id(id));
+        let emoji = emoji.to_string();
+        Some(on_tokio(cx, "react", async move {
+            let id =
+                id.ok_or_else(|| Failure::Shown("That message can't take reactions".into()))?;
+            toggle_reaction(&user, chat, id, emoji).await
+        }))
     }
 
     /// Appends a message locally (the mock echo of a send).
@@ -873,7 +893,7 @@ impl Worker {
 
     /// Turns a stored message into what the view shows. Port of
     /// `UiChatMessage::from_message`, minus what isn't shown yet
-    /// (reactions, replies, attachments).
+    /// (attachments).
     async fn convert(&mut self, message: ChatMessage) -> (Key, Message) {
         let sender = message.message().actor().cloned();
         let sender_name = match &sender {
@@ -952,6 +972,18 @@ impl Worker {
             ),
             _ => (None, None, None),
         };
+        // A deleted or hidden message's reactions aren't shown either.
+        let (reactions, more_reactions) = if matches!(body, MessageBody::Text { .. }) {
+            let me = self.user.user_id();
+            crate::model::reactions(
+                message
+                    .reactions()
+                    .iter()
+                    .map(|(emoji, users)| (emoji.as_str(), users.len(), users.contains(me))),
+            )
+        } else {
+            (Vec::new(), 0)
+        };
         let edited = match message.message() {
             CoreMessage::Content(content) => content.edited_at().is_some(),
             CoreMessage::Event(_) => false,
@@ -977,9 +1009,35 @@ impl Worker {
             status,
             edited,
             reply_to,
+            reactions,
+            more_reactions,
         };
         (key, item)
     }
+}
+
+/// See [`Messages::toggle_reaction`].
+pub(super) async fn toggle_reaction(
+    user: &CoreUser,
+    chat: CoreChatId,
+    message: CoreMessageId,
+    emoji: String,
+) -> Result<bool, Failure> {
+    // The core finds the message by id alone; only this chat's are ours.
+    let found = user.message(message).await?;
+    if found.as_ref().is_none_or(|found| found.chat_id() != chat) {
+        return Err(Failure::Shown("That message is gone".into()));
+    }
+    let reactions = user.message_reactions(message).await?;
+    let own = reactions
+        .get(&emoji)
+        .is_some_and(|users| users.contains(user.user_id()));
+    if own {
+        user.delete_reaction(chat, message, emoji).await?;
+    } else {
+        user.send_reaction(chat, message, emoji).await?;
+    }
+    Ok(!own)
 }
 
 #[cfg(test)]

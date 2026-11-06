@@ -30,12 +30,12 @@ use gpui_kit::{
 use crate::actions::{
     AcceptRequest, CancelCompose, ClearCursor, CursorDown, CursorFirst, CursorLast, CursorUp,
     DeclineRequest, EditLastMessage, EditMessage, HalfPageDown, HalfPageUp, OpenLinks,
-    ReplyToMessage, ToggleDetails, YankMessage,
+    PickReaction, React, ReplyToMessage, ToggleDetails, YankMessage,
 };
 use crate::markdown::Block;
 use crate::model::{
-    ChatSummary, Message, MessageBody, MessageStatus, Quote, Request, format_day,
-    format_message_time, move_cursor, starts_day, starts_group,
+    ChatSummary, Message, MessageBody, MessageStatus, QUICK_REACTIONS, Quote, Reaction, Request,
+    format_day, format_message_time, move_cursor, starts_day, starts_group,
 };
 use crate::session::composer::{Composer, ComposerEvent};
 use crate::session::messages::{Messages, MessagesEvent};
@@ -64,6 +64,8 @@ pub struct Conversation {
     shown: Option<Shown>,
     /// Message under the normal-mode cursor.
     cursor: Option<usize>,
+    /// The reaction picker is open, for the message under the cursor.
+    reacting: bool,
     /// Focus of the message list (normal mode).
     focus_handle: FocusHandle,
     composer: Entity<TextareaState>,
@@ -171,6 +173,7 @@ impl Conversation {
             probes: Rc::default(),
             shown: None,
             cursor: None,
+            reacting: false,
             focus_handle: cx.focus_handle(),
             composer,
             compose: None,
@@ -227,6 +230,7 @@ impl Conversation {
         self.chat = Some(chat);
         self.messages = Some(messages);
         self.cursor = None;
+        self.reacting = false;
         self.shown = None;
         self.probes.borrow_mut().shown = None;
         if loaded {
@@ -282,6 +286,7 @@ impl Conversation {
         self._messages_subscription = None;
         self.list.reset(0);
         self.cursor = None;
+        self.reacting = false;
         cx.notify();
     }
 
@@ -324,6 +329,11 @@ impl Conversation {
     #[cfg(test)]
     pub fn messages_entity(&self) -> Option<&Entity<Messages>> {
         self.messages.as_ref()
+    }
+
+    #[cfg(test)]
+    pub fn is_reacting(&self) -> bool {
+        self.reacting
     }
 
     #[cfg(test)]
@@ -495,6 +505,8 @@ impl Conversation {
 
     fn set_cursor(&mut self, cursor: Option<usize>, cx: &mut Context<Self>) {
         self.cursor = cursor;
+        // Follows the cursor; there is nothing to react to without one.
+        self.reacting &= cursor.is_some();
         if let Some(ix) = cursor {
             // Revealing it pages in more, as scrolling does.
             self.list.scroll_to_reveal_item(ix);
@@ -504,6 +516,91 @@ impl Conversation {
 
     fn cursor_message<'a>(&self, cx: &'a App) -> Option<&'a Message> {
         self.messages(cx).get(self.cursor?)
+    }
+
+    /// The message under the cursor, if it can take reactions.
+    fn reactable<'a>(&self, cx: &'a App) -> Option<&'a Message> {
+        self.cursor_message(cx)
+            .filter(|message| matches!(message.body, MessageBody::Text { .. }))
+    }
+
+    fn pick_reaction(&mut self, _: &PickReaction, _: &mut Window, cx: &mut Context<Self>) {
+        self.reacting = !self.reacting && self.reactable(cx).is_some();
+        cx.notify();
+    }
+
+    fn react(&mut self, action: &React, window: &mut Window, cx: &mut Context<Self>) {
+        self.reacting = false;
+        cx.notify();
+        let (Some(emoji), Some(messages)) = (QUICK_REACTIONS.get(action.index), &self.messages)
+        else {
+            return;
+        };
+        let Some(id) = self.reactable(cx).map(|message| message.id.clone()) else {
+            return;
+        };
+        let Some(toggle) = messages.read(cx).toggle_reaction(&id, emoji, cx) else {
+            crate::ui::show_refusal("Reactions need an account".into(), window, cx);
+            return;
+        };
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(refusal) = toggle.await {
+                _ = cx.update(|window, cx| crate::ui::show_refusal(refusal, window, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// The quick reactions on offer, the ones the user gave highlighted.
+    fn render_picker(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if !self.reacting {
+            return None;
+        }
+        let message = self.reactable(cx)?;
+        let theme = cx.theme();
+        let chips = QUICK_REACTIONS.iter().enumerate().map(|(ix, emoji)| {
+            let own = message
+                .reactions
+                .iter()
+                .any(|reaction| reaction.own && reaction.label.as_ref() == *emoji);
+            h_flex()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(if own { theme.primary } else { theme.border })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child((ix + 1).to_string()),
+                )
+                .child(*emoji)
+        });
+        Some(
+            h_flex()
+                .flex_none()
+                .px_6()
+                .py_2()
+                .gap_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("React"),
+                )
+                .children(chips)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("esc to cancel"),
+                )
+                .into_any_element(),
+        )
     }
 
     fn yank(&mut self, _: &YankMessage, _: &mut Window, cx: &mut Context<Self>) {
@@ -684,6 +781,8 @@ impl Conversation {
             )
             .child(body)
             .child(div().text_xs().opacity(0.7).text_right().child(footer));
+        let reactions = (!message.reactions.is_empty())
+            .then(|| render_reactions(&message.reactions, message.more_reactions, cx));
 
         v_flex()
             .w_full()
@@ -707,6 +806,7 @@ impl Conversation {
                 )
             })
             .child(bubble)
+            .children(reactions)
             .into_any_element()
     }
 
@@ -844,7 +944,11 @@ impl Render for Conversation {
         let list_focused = self.focus_handle.is_focused(window);
         let composer_focused = self.composer_focus(cx).contains_focused(window, cx);
         let details_open = crate::settings::SettingsStore::get(cx).details_open;
-        let message_list_context: KeyContext = key_context("MessageList", cx);
+        let mut message_list_context: KeyContext = key_context("MessageList", cx);
+        if self.reacting {
+            message_list_context.add("reacting");
+        }
+        let picker = self.render_picker(cx);
         let composer_context: KeyContext = key_context("Composer", cx);
         let status = self.render_status(cx);
         let compose_bar = self.render_compose_bar(cx);
@@ -925,10 +1029,13 @@ impl Render for Conversation {
                     .on_action(cx.listener(Self::open_links))
                     .on_action(cx.listener(Self::edit_message))
                     .on_action(cx.listener(Self::reply))
+                    .on_action(cx.listener(Self::pick_reaction))
+                    .on_action(cx.listener(Self::react))
                     .flex_1()
                     .min_h_0()
                     .children(status)
                     .child(history)
+                    .children(picker)
                     .child(self.probe_results(cx)),
             )
             .child(match chat.request {
@@ -1029,6 +1136,42 @@ fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElemen
         .px_6()
         .pb_4()
         .child(card)
+        .into_any_element()
+}
+
+/// Reactions under a message: each kind once, with its count; the user's
+/// own outlined.
+fn render_reactions(reactions: &[Reaction], more: usize, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    h_flex()
+        .flex_wrap()
+        .max_w(gpui_kit::relative(0.75))
+        .pt_1()
+        .gap_1()
+        .children(reactions.iter().map(|reaction| {
+            h_flex()
+                .gap_1()
+                .px_2()
+                .rounded_full()
+                .border_1()
+                .border_color(if reaction.own {
+                    theme.primary
+                } else {
+                    theme.border
+                })
+                .bg(theme.secondary)
+                .text_xs()
+                .child(reaction.label.clone())
+                .child(reaction.count.to_string())
+        }))
+        .when(more > 0, |row| {
+            row.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("+{more}")),
+            )
+        })
         .into_any_element()
 }
 

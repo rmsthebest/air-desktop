@@ -41,7 +41,13 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   - `messages.rs`: port of `MessageListCubit`. A tokio worker owns a
     bounded window (`MAX_WINDOW`) of one chat's messages, pages it on
     request, follows changes, and sends `Change`s the entity applies and
-    re-emits as list splices. Opens at the first unread message. Marking as
+    re-emits as list splices. Reactions come with each message (the core
+    loads them) and are summarized by `model::reactions`: peer emoji are
+    unchecked text, so each is cut to one visible grapheme, look-alikes
+    merge, at most 12 kinds show, the user's own always.
+    `toggle_reaction` adds or retracts (detached, like sends). The picker
+    (`+`, then 1–6) is a bar under the list, not part of a list item, so
+    opening it doesn't re-measure the list. Opens at the first unread message. Marking as
     read is debounced, only for messages shown while the window is active,
     and sends receipts as upstream (self chat only when receipts are off).
   - `composer.rs`: port of `ChatDetailsCubit`'s draft/send parts. The

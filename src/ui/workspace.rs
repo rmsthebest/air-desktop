@@ -1654,6 +1654,39 @@ mod tests {
         assert_eq!(clipboard(cx), Some(expected));
     }
 
+    #[gpui::test]
+    fn reactions_are_picked_on_the_message_under_the_cursor(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        enable_helix(cx);
+        let reacting = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace.conversation.read(cx).is_reacting()
+            })
+        };
+        let told =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| window.notifications(cx).len());
+        // Nothing to react to without a message under the cursor.
+        cx.simulate_keystrokes("g g l +");
+        assert!(!reacting(cx));
+        cx.simulate_keystrokes("k +");
+        assert!(reacting(cx));
+        // Escape closes the picker, not the cursor.
+        cx.simulate_keystrokes("escape");
+        assert!(!reacting(cx));
+        assert!(workspace.read_with(cx, |w, cx| w.conversation.read(cx).cursor().is_some()));
+        // A key picks one and closes it (mock data has no account: refused).
+        cx.simulate_keystrokes("+");
+        let before = told(cx);
+        cx.simulate_keystrokes("1");
+        cx.run_until_parked();
+        assert!(!reacting(cx));
+        assert_eq!(told(cx), before + 1);
+        // Digits do nothing while the picker is closed.
+        cx.simulate_keystrokes("1");
+        cx.run_until_parked();
+        assert_eq!(told(cx), before + 1);
+    }
+
     /// The newest message marked as read, and the open chat's newest.
     fn read_state(
         workspace: &Entity<Workspace>,

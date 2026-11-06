@@ -28,7 +28,15 @@ pub trait Desktop {
     ) -> impl Future<Output = Option<u32>> + Send;
     /// Whether notification `id` is gone (closed now, or already).
     fn close(&mut self, id: u32) -> impl Future<Output = bool> + Send;
+    /// Which server instance serves notifications now, `None` if that
+    /// can't be told (the desktop is unreachable).
+    fn owner(&mut self) -> impl Future<Output = Option<Owner>> + Send;
 }
+
+/// A notification server instance (its unique bus name); `None` while none
+/// runs. Ids mean something only to the instance that gave them out: after
+/// a restart, the new one hands the same ids to other apps.
+pub type Owner = Option<String>;
 
 /// The platform's notifications.
 pub fn system() -> impl Desktop + Send {
@@ -61,6 +69,11 @@ struct Notifier<D> {
     /// Notifications taken off our books whose close hasn't gone through
     /// yet; retried, in order, before each notice.
     closing: Vec<u32>,
+    /// The server instance the ids above belong to.
+    owner: Owner,
+    /// A close failed while handling this notice: don't wait on the
+    /// desktop again for the rest of it.
+    stalled: bool,
 }
 
 impl<D: Desktop + Send> Notifier<D> {
@@ -69,10 +82,14 @@ impl<D: Desktop + Send> Notifier<D> {
             desktop,
             shown: HashMap::new(),
             closing: Vec::new(),
+            owner: None,
+            stalled: false,
         }
     }
 
     async fn handle(&mut self, notice: Notice, attention: &Attention) {
+        self.stalled = false;
+        self.follow_owner().await;
         self.close_pending().await;
         match notice {
             Notice::Show(alert) => {
@@ -93,6 +110,12 @@ impl<D: Desktop + Send> Notifier<D> {
                 // notification was gone (closed by the user, or expired),
                 // and a rewrite mustn't bring it back; no id means what is
                 // on screen is stale and couldn't be rewritten.
+                if let Some(new) = rewritten
+                    && new != replaces
+                {
+                    // In case the old one is still up after all.
+                    self.closing.push(replaces);
+                }
                 if rewritten != Some(replaces) {
                     self.dismiss(Dismiss::Chat(chat)).await;
                 }
@@ -106,8 +129,26 @@ impl<D: Desktop + Send> Notifier<D> {
     async fn show(&mut self, alert: Alert, quiet: bool) -> Option<u32> {
         let replaces = self.shown.get(&alert.chat).copied().unwrap_or(0);
         let id = self.desktop.notify(replaces, &alert, quiet).await?;
+        if self.owner.is_none() {
+            // That call started a server (D-Bus activation): the id is
+            // its. Unknown if unreachable; then the next notice forgets it.
+            self.owner = self.desktop.owner().await.flatten();
+        }
         self.shown.insert(alert.chat, id);
         Some(id)
+    }
+
+    /// Forgets every id once another server instance took over: closing or
+    /// replacing one would hit another app's notification. The window
+    /// between this check and the calls after it is left open.
+    async fn follow_owner(&mut self) {
+        if let Some(owner) = self.desktop.owner().await
+            && owner != self.owner
+        {
+            self.shown.clear();
+            self.closing.clear();
+            self.owner = owner;
+        }
     }
 
     async fn dismiss(&mut self, dismiss: Dismiss) {
@@ -121,8 +162,11 @@ impl<D: Desktop + Send> Notifier<D> {
     /// Closes what is waiting to be closed, stopping at the first failure:
     /// a desktop that just failed is likely to fail again right away.
     async fn close_pending(&mut self) {
-        while let Some(&id) = self.closing.first() {
+        while !self.stalled
+            && let Some(&id) = self.closing.first()
+        {
             if !self.desktop.close(id).await {
+                self.stalled = true;
                 return;
             }
             self.closing.remove(0);
@@ -141,6 +185,9 @@ impl Desktop for Unsupported {
     async fn close(&mut self, _: u32) -> bool {
         true
     }
+    async fn owner(&mut self) -> Option<Owner> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -154,12 +201,28 @@ mod tests {
         next_id: u32,
         visible: HashMap<u32, (Alert, bool)>,
         down: bool,
+        /// The server instance running, if any.
+        server: Option<u32>,
+        started: u32,
+    }
+
+    impl Screen {
+        /// The server stops with its notifications; ids start over.
+        fn restart(&mut self) {
+            self.visible.clear();
+            self.next_id = 0;
+            self.server = None;
+        }
     }
 
     impl Desktop for Screen {
         async fn notify(&mut self, replaces: u32, alert: &Alert, quiet: bool) -> Option<u32> {
             if self.down {
                 return None;
+            }
+            if self.server.is_none() {
+                self.started += 1;
+                self.server = Some(self.started);
             }
             let id = if self.visible.contains_key(&replaces) {
                 replaces
@@ -176,6 +239,9 @@ mod tests {
             }
             self.visible.remove(&id);
             true
+        }
+        async fn owner(&mut self) -> Option<Owner> {
+            (!self.down).then(|| self.server.map(|n| n.to_string()))
         }
     }
 
@@ -293,6 +359,30 @@ mod tests {
             .await;
         assert!(bodies(&notifier).is_empty());
     }
+
+    #[tokio::test]
+    async fn ids_from_a_restarted_server_are_never_reused() {
+        let mut notifier = Notifier::new(Screen::default());
+        let full = Attention::default();
+        notifier.handle(Notice::Show(alert(1, "old")), &full).await;
+        notifier.desktop.restart();
+        // The new server gives chat 2's notification the old one's id.
+        notifier.handle(Notice::Show(alert(2, "new")), &full).await;
+        let first = alert(1, "").chat;
+        notifier
+            .handle(Notice::Refresh(alert(1, "older")), &full)
+            .await;
+        notifier
+            .handle(Notice::Dismiss(Dismiss::Chat(first)), &full)
+            .await;
+        assert_eq!(bodies(&notifier), ["new"]);
+        // What the new server showed is still ours to close.
+        let second = alert(2, "").chat;
+        notifier
+            .handle(Notice::Dismiss(Dismiss::Chat(second)), &full)
+            .await;
+        assert!(bodies(&notifier).is_empty());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -301,6 +391,8 @@ mod linux {
 
     use std::time::Duration;
 
+    use zbus::fdo::DBusProxy;
+    use zbus::names::{BusName, WellKnownName};
     use zbus::zvariant::Value;
     use zbus::{Connection, Proxy};
 
@@ -355,6 +447,19 @@ mod linux {
                 .ok()
         }
 
+        async fn owner(&mut self) -> Option<super::Owner> {
+            let result = self.bus().await?.owner().await;
+            match result {
+                Ok(owner) => Some(Some(owner)),
+                Err(zbus::fdo::Error::NameHasNoOwner(_)) => Some(None),
+                Err(err) => {
+                    warn!("failed to look up the notification service: {err}");
+                    self.bus = None;
+                    None
+                }
+            }
+        }
+
         async fn close(&mut self, id: u32) -> bool {
             let Some(bus) = self.bus().await else {
                 return false;
@@ -386,8 +491,11 @@ mod linux {
             .map_err(|_| zbus::Error::Failure("timed out".into()))?
     }
 
+    const SERVICE: &str = "org.freedesktop.Notifications";
+
     struct Bus {
         proxy: Proxy<'static>,
+        dbus: DBusProxy<'static>,
         /// The server renders a subset of HTML in bodies.
         markup: bool,
     }
@@ -399,16 +507,29 @@ mod linux {
 
         async fn connect_unbounded() -> zbus::Result<Self> {
             let connection = Connection::session().await?;
+            let dbus = DBusProxy::new(&connection).await?;
             let proxy = Proxy::new(
                 &connection,
-                "org.freedesktop.Notifications",
+                SERVICE,
                 "/org/freedesktop/Notifications",
                 "org.freedesktop.Notifications",
             )
             .await?;
             let capabilities: Vec<String> = proxy.call("GetCapabilities", &()).await?;
             let markup = capabilities.iter().any(|c| c == "body-markup");
-            Ok(Self { proxy, markup })
+            Ok(Self {
+                proxy,
+                dbus,
+                markup,
+            })
+        }
+
+        async fn owner(&self) -> zbus::fdo::Result<String> {
+            let name = BusName::from(WellKnownName::from_static_str_unchecked(SERVICE));
+            tokio::time::timeout(CALL_TIMEOUT, self.dbus.get_name_owner(name))
+                .await
+                .map_err(|_| zbus::fdo::Error::TimedOut("timed out".into()))?
+                .map(|owner| owner.to_string())
         }
 
         async fn notify(&self, replaces: u32, alert: &Alert, quiet: bool) -> zbus::Result<u32> {

@@ -441,3 +441,23 @@ Deferred:
   Listening to `NotificationClosed` and retrying on a timer belong with
   milestone 12 (notification actions), which subscribes to the server's
   signals anyway.
+
+## Gate 9e — gate 9d fixes (`ee64c10..96e99a5`): PASS
+
+Fixed:
+- **Ids outlived the notification server that issued them (medium).**
+  After a daemon restart the new instance hands the same ids to other
+  apps, so a retried close or a `replaces_id` could hit their
+  notifications. The notifier now tracks the service's unique bus name and
+  forgets every id when it changes (an id from a server it just activated
+  is kept). Covered in `ids_from_a_restarted_server_are_never_reused`.
+- **A rewrite that got a new id left the old one unreferenced (low).** The
+  old id is closed as well; an id that is already gone closes as success.
+- **One dismissal against a hung service stalled twice (low).** After a
+  failed close, the rest of that notice doesn't wait on the desktop again.
+
+Deferred:
+- **"A new id means the user closed it" depends on the server (low).**
+  Servers that reuse an unknown `replaces_id` (dunst does) bring a closed
+  notification back with new text on a quiet refresh. The real fix is
+  tracking `NotificationClosed`, with milestone 12.

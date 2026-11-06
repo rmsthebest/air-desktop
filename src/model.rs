@@ -32,8 +32,11 @@ pub struct Member {
     pub own: bool,
     /// Being removed: the removal isn't committed yet.
     pub removing: bool,
-    /// The room policy lets the user remove them.
+    /// The room policy lets the user remove them (never in an ended group).
     pub can_remove: bool,
+    /// Unique within the group, from a hash of the user id: tells apart
+    /// members whose (peer-chosen) names are the same. `:kick #<tag>`.
+    pub tag: SharedString,
 }
 
 #[derive(Debug, Clone, PartialEq)]

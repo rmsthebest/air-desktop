@@ -499,11 +499,12 @@ impl Workspace {
                 let Some((members, _)) = &self.members else {
                     return;
                 };
-                let removal = members.read(cx).remove(&query, cx);
+                let members = members.clone();
+                // Started only once `contact_op` lets it.
                 self.contact_op(
                     window,
                     cx,
-                    |_, _| removal,
+                    move |_, cx| members.read(cx).remove(&query, cx),
                     |name, _, window, cx| show_info(format!("Removing {name}"), window, cx),
                 );
             }
@@ -522,10 +523,12 @@ impl Workspace {
                 let Some(chat) = self.open_group(window, cx) else {
                     return;
                 };
+                let name = self.open_title(cx);
                 self.confirm(
-                    "Leave this group?",
+                    format!("Leave {name}?"),
                     "You stop getting its messages. The chat stays in your list, \
-                     ended, until you delete it.",
+                     ended, until you delete it."
+                        .into(),
                     "Leave",
                     move |this, window, cx| {
                         let chat = chat.clone();
@@ -544,9 +547,12 @@ impl Workspace {
                 let Some(chat) = self.open_group(window, cx) else {
                     return;
                 };
+                let name = self.open_title(cx);
                 self.confirm(
-                    "Delete this group?",
-                    "You leave it, and its messages are erased from this device.",
+                    format!("Delete {name}?"),
+                    "If the group is still going, this ends it for everyone in it. \
+                     It is then erased from all your devices. This can't be undone."
+                        .into(),
                     "Delete",
                     move |this, window, cx| {
                         let chat = chat.clone();
@@ -562,6 +568,14 @@ impl Workspace {
                 );
             }
         }
+    }
+
+    /// The open chat's title (peer-chosen, one bounded line).
+    fn open_title(&self, cx: &App) -> gpui::SharedString {
+        let list = self.chat_list.read(cx);
+        list.selected_index()
+            .map(|ix| list.chats()[ix].title.clone())
+            .unwrap_or_default()
     }
 
     /// The open chat, if it is a group; tells the user otherwise.
@@ -581,8 +595,8 @@ impl Workspace {
     /// the workspace, so `run` reaches it through a weak handle.
     fn confirm(
         &self,
-        title: &'static str,
-        description: &'static str,
+        title: String,
+        description: String,
         ok: &'static str,
         run: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
@@ -590,17 +604,24 @@ impl Workspace {
     ) {
         let this = cx.weak_entity();
         let run = std::rc::Rc::new(run);
+        let previous_focus = window.focused(cx);
         window.open_alert_dialog(cx, move |alert, _, _| {
-            let (this, run) = (this.clone(), run.clone());
+            let (this, run, previous_focus) = (this.clone(), run.clone(), previous_focus.clone());
             alert
                 .confirm()
-                .title(title)
-                .description(description)
+                .title(title.clone())
+                .description(description.clone())
                 .ok_text(ok)
                 .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, window, cx| {
+                    // Closed first, so focus is back before `run` (which
+                    // may report) and stays where the command came from.
+                    window.close_dialog(cx);
+                    if let Some(focus) = &previous_focus {
+                        focus.focus(window, cx);
+                    }
                     _ = this.update(cx, |this, cx| run(this, window, cx));
-                    true
+                    false
                 })
         });
     }
@@ -1541,8 +1562,9 @@ mod tests {
 
     #[gpui::test]
     fn leaving_or_deleting_a_group_asks_first(cx: &mut TestAppContext) {
-        let (_, cx) = setup(cx);
+        let (workspace, cx) = setup(cx);
         enable_helix(cx);
+        let focus = focus_probe(&workspace, cx);
         let run = |line: &str, cx: &mut VisualTestContext| {
             cx.simulate_keystrokes(":");
             cx.run_until_parked();
@@ -1550,20 +1572,30 @@ mod tests {
             cx.simulate_keystrokes("enter");
             cx.run_until_parked();
         };
-        let asking = |cx: &mut VisualTestContext| {
-            cx.update(|window, cx| window.has_active_dialog(cx))
-        };
+        let asking =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| window.has_active_dialog(cx));
         // Not in a one-to-one chat: refused before anything is asked.
         run("o grace", cx);
         run("leave", cx);
         assert!(!asking(cx));
         run("o design", cx);
+        let told =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| window.notifications(cx).len());
         for command in ["leave", "delete-chat"] {
             run(command, cx);
             assert!(asking(cx), "{command} didn't ask");
             cx.simulate_keystrokes("escape");
             cx.run_until_parked();
             assert!(!asking(cx));
+            // Confirmed, it runs: without an account, it is refused.
+            run(command, cx);
+            let before = told(cx);
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+            assert!(!asking(cx));
+            assert_eq!(told(cx), before + 1, "{command} didn't run");
+            // Focus is back where the command was typed.
+            assert_eq!(focus(cx), Focus::Messages);
         }
     }
 

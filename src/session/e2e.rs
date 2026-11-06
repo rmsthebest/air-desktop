@@ -640,6 +640,32 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     })
     .await;
     assert!(refused(groups::leave(&ada, ada_self).await));
+    // Nor is it listed as one.
+    let listed = chats::summary(&ada, ada.chat(&ada_self).await.unwrap()).await;
+    assert!(listed.is_self_chat && !listed.is_group, "{listed:?}");
+
+    // Deleting a group that is still going ends it for everyone in it.
+    let group = groups::create(&ada, "Doomed").await.unwrap();
+    groups::invite(ada.clone(), group, "robert".into())
+        .await
+        .unwrap();
+    let bob_group = eventually("Bob joins the second group", async || {
+        for id in bob.ordered_chat_ids().await.unwrap() {
+            let chat = bob.chat(&id).await?;
+            if chat.attributes().is_some_and(|a| a.title == "Doomed") {
+                return Some(id);
+            }
+        }
+        None
+    })
+    .await;
+    groups::delete(&ada, group).await.unwrap();
+    assert!(ada.chat(&group).await.is_none());
+    eventually("the group ends for Bob", async || {
+        let chat = bob.chat(&bob_group).await?;
+        matches!(chat.status(), ChatStatus::Inactive(_)).then_some(())
+    })
+    .await;
 
     // A removed username is no longer listened to or reported.
     contacts::remove_username(ada.clone(), name.clone())

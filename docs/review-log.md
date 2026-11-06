@@ -461,3 +461,34 @@ Deferred:
   Servers that reuse an unknown `replaces_id` (dunst does) bring a closed
   notification back with new text on a quiet refresh. The real fix is
   tracking `NotificationClosed`, with milestone 12.
+
+## Gate 10 — milestone 8 and gate 9e fixes (`96e99a5..11ba89c`): BLOCK
+
+Fixed:
+- **The delete dialog understated delete (high).** `delete_and_erase_chat`
+  ends an active group for every member and erases it on all the user's
+  devices. The dialog (now naming the group) says so; an e2e step pins it:
+  Bob's copy ends when Ada deletes.
+- **`:kick` ran past the single-flight and account checks (medium).** The
+  removal is built inside `contact_op`'s start closure.
+- **A copied name shielded a member from removal (medium).** Members show
+  a `#tag` (SHA-256 of the user id, lengthened until unique in the group,
+  since clients choose their ids) and `:kick #tag` takes it; a tag matching
+  several is refused. `a_copied_name_never_shields_a_member_from_removal`.
+- **Ended groups accepted rename, invite and kick (low).** Refused as
+  "You're no longer in this group"; nobody is removable in an ended group.
+- **Unbounded member list, reloaded on any user's change (low).** At most
+  100 rows plus a count; reloads only for the chat or its members.
+- Tests added: removal resolution, `parse_title` bounds, confirming the
+  dialog runs the operation and returns focus (which found that
+  gpui-component's OK path lost focus; fixed), self chat listed as no group.
+
+Deferred:
+- **Inviting a contact whose name was copied (medium, part of the above).**
+  Contacts have nothing the user can tell apart yet; safety codes
+  (milestone 14) give them that. Until then such an invite is refused as
+  ambiguous, never guessed.
+- **Old `replaces_id` after a failed owner lookup (low).** A notify that
+  reconnects to a restarted daemon right after the lookup failed can still
+  replace another app's notification. With milestone 12's
+  `NotificationClosed` tracking.

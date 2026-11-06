@@ -31,6 +31,11 @@ use crate::runtime::Tokio;
 /// bounded line anyway; this keeps what is sent to the group modest.
 const MAX_TITLE: usize = 128;
 
+/// Fewest hex digits of a member's tag. Tags grow until they are unique in
+/// the group: user ids are chosen by clients, so a member could pick one
+/// whose short hash matches another member's.
+const TAG_LEN: usize = 8;
+
 impl Session {
     /// Creates a group with only the user in it. Resolves to the new chat.
     pub fn create_group(
@@ -82,7 +87,8 @@ impl Session {
         )
     }
 
-    /// Deletes the group here: leaves it if still in it, then erases it.
+    /// Deletes the group: ends it for every member (the core removes them
+    /// all), then erases it from all of the user's devices.
     pub fn delete_group(
         &self,
         chat: &ChatId,
@@ -103,15 +109,12 @@ pub(super) async fn create(user: &CoreUser, title: &str) -> Result<CoreChatId, F
 }
 
 pub(super) async fn rename(user: &CoreUser, chat: CoreChatId, title: &str) -> Result<(), Failure> {
-    group(user, chat).await?;
+    active_group(user, chat).await?;
     Ok(user.set_chat_title(chat, parse_title(title)?).await?)
 }
 
 pub(super) async fn leave(user: &CoreUser, chat: CoreChatId) -> Result<(), Failure> {
-    let group = group(user, chat).await?;
-    if matches!(group.status(), ChatStatus::Inactive(_)) {
-        return Err(Failure::Shown("You're no longer in this group".into()));
-    }
+    active_group(user, chat).await?;
     Ok(user.leave_chat(chat).await?)
 }
 
@@ -137,6 +140,16 @@ async fn group(user: &CoreUser, chat: CoreChatId) -> Result<aircoreclient::Chat,
     Ok(group)
 }
 
+/// The group, if the user is still in it: an ended group can only be
+/// deleted.
+async fn active_group(user: &CoreUser, chat: CoreChatId) -> Result<aircoreclient::Chat, Failure> {
+    let group = group(user, chat).await?;
+    if matches!(group.status(), ChatStatus::Inactive(_)) {
+        return Err(Failure::Shown("You're no longer in this group".into()));
+    }
+    Ok(group)
+}
+
 fn parse_title(title: &str) -> Result<String, Failure> {
     let title = title.trim();
     if title.is_empty() {
@@ -155,7 +168,7 @@ pub(super) async fn invite(
     chat: CoreChatId,
     query: String,
 ) -> Result<SharedString, Failure> {
-    group(&user, chat).await?;
+    active_group(&user, chat).await?;
     let contacts = user
         .contacts_with_supported_features()
         .await
@@ -231,10 +244,12 @@ impl Members {
                 notifications,
                 overflowed,
             } => {
+                // Membership changes come with the chat; names with users,
+                // of which only members matter.
                 let touched = notifications.iter().any(|notification| {
                     notification.ops.keys().any(|entity| match entity {
                         DbEntityId::Chat(id) => *id == chat,
-                        DbEntityId::User(_) => true,
+                        DbEntityId::User(user) => this.ids.values().any(|id| id == user),
                         _ => false,
                     })
                 });
@@ -264,47 +279,25 @@ impl Members {
         self.loaded
     }
 
-    /// Removes the member `query` names (see [`matches_name`]). Resolves to
-    /// their name.
+    /// Removes the member `query` names (see [`resolve_removal`]).
+    /// Resolves to their name.
     pub fn remove(
         &self,
         query: &str,
         cx: &App,
     ) -> impl Future<Output = Result<SharedString, String>> + use<> {
-        let target = self.removal(query);
+        let target = resolve_removal(&self.members, query).and_then(|member| {
+            let id = self.ids.get(&member.id).cloned();
+            id.map(|id| (member.name.clone(), id))
+                .ok_or_else(|| "That member is gone".to_string())
+        });
         let (user, chat) = (self.user.clone(), self.chat);
         on_tokio(cx, "remove the member", async move {
-            let (name, id) = target?;
+            let (name, id) = target.map_err(Failure::Shown)?;
+            active_group(&user, chat).await?;
             user.remove_users(chat, vec![id]).await?;
             Ok(name)
         })
-    }
-
-    /// Who `query` names, if the user may remove them.
-    fn removal(&self, query: &str) -> Result<(SharedString, CoreUserId), Failure> {
-        let others: Vec<_> = self.members.iter().filter(|member| !member.own).collect();
-        let member = match matches_name(query, others.iter().map(|member| member.name.as_ref())) {
-            NameMatch::One(name) => others.iter().find(|member| member.name.as_ref() == name),
-            NameMatch::None => {
-                return Err(Failure::Shown(format!("No member matches {query:?}")));
-            }
-            NameMatch::Ambiguous(n) => {
-                return Err(Failure::Shown(format!(
-                    "{n} members match {query:?}; be more specific"
-                )));
-            }
-        };
-        let Some((member, id)) = member.and_then(|m| Some((m, self.ids.get(&m.id)?.clone())))
-        else {
-            return Err(Failure::Shown("That member is gone".into()));
-        };
-        if !member.can_remove {
-            return Err(Failure::Shown(format!(
-                "You can't remove {} from this group",
-                member.name
-            )));
-        }
-        Ok((member.name.clone(), id))
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -326,11 +319,47 @@ impl Members {
     }
 }
 
+/// The member `query` names, if the user may remove them: by name (see
+/// [`matches_name`]), or by `#tag` when names are alike. Never the user.
+fn resolve_removal<'a>(members: &'a [Member], query: &str) -> Result<&'a Member, String> {
+    let others: Vec<_> = members.iter().filter(|member| !member.own).collect();
+    let member = if let Some(tag) = query.trim().strip_prefix('#') {
+        let tag = tag.to_lowercase();
+        let mut tagged = others.iter().filter(|member| member.tag.as_ref() == tag);
+        match (tagged.next(), tagged.next()) {
+            (Some(member), None) => member,
+            (None, _) => return Err(format!("No member is tagged #{tag}")),
+            (Some(_), Some(_)) => return Err(format!("Several members are tagged #{tag}")),
+        }
+    } else {
+        match matches_name(query, others.iter().map(|member| member.name.as_ref())) {
+            NameMatch::One(name) => others
+                .iter()
+                .find(|member| member.name.as_ref() == name)
+                .ok_or_else(|| "That member is gone".to_string())?,
+            NameMatch::None => return Err(format!("No member matches {query:?}")),
+            NameMatch::Ambiguous(n) => {
+                return Err(format!(
+                    "{n} members match {query:?}: use the #tag the details pane shows"
+                ));
+            }
+        }
+    };
+    if !member.can_remove {
+        return Err(format!("You can't remove {} from this group", member.name));
+    }
+    Ok(member)
+}
+
 /// The group's members, the user first, then by name. `None` without a chat.
 pub(super) async fn load(
     user: &CoreUser,
     chat: CoreChatId,
 ) -> Option<Vec<(Member, (UserId, CoreUserId))>> {
+    let active = user
+        .chat(&chat)
+        .await
+        .is_some_and(|chat| !matches!(chat.status(), ChatStatus::Inactive(_)));
     let participants = user.chat_participants(chat).await?;
     let removing = user.pending_removes(chat).await.unwrap_or_default();
     let room = user
@@ -347,15 +376,37 @@ pub(super) async fn load(
             name: super::display_name(user, &id).await,
             own,
             removing: removing.contains(&id),
+            tag: SharedString::default(),
             can_remove: !own
+                && active
                 && room
                     .as_ref()
                     .is_some_and(|(us, state)| can_remove(us, state, &id)),
         };
         members.push((member, (model, id)));
     }
+    let hashes: Vec<String> = members.iter().map(|(_, (_, id))| id_hash(id)).collect();
+    let len = (TAG_LEN..64)
+        .find(|&len| {
+            let tags: std::collections::HashSet<_> = hashes.iter().map(|h| &h[..len]).collect();
+            tags.len() == hashes.len()
+        })
+        .unwrap_or(64);
+    for ((member, _), hash) in members.iter_mut().zip(&hashes) {
+        member.tag = hash[..len].to_string().into();
+    }
     members.sort_by(|(a, _), (b, _)| (!a.own, &a.name).cmp(&(!b.own, &b.name)));
     Some(members)
+}
+
+/// Hex SHA-256 of the user id's wire form (uuid and domain).
+fn id_hash(id: &CoreUserId) -> String {
+    use sha2::Digest as _;
+    let bytes = id.tls_serialize_detached().unwrap_or_default();
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Whether the room policy lets `us` make `target` an outsider: upstream's
@@ -374,4 +425,52 @@ fn can_remove(us: &CoreUserId, state: &VerifiedRoomState, target: &CoreUserId) -
             }],
         )
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(name: &str, tag: &str, own: bool, can_remove: bool) -> Member {
+        Member {
+            id: UserId(tag.to_string().into()),
+            name: name.to_string().into(),
+            own,
+            removing: false,
+            can_remove,
+            tag: tag.to_string().into(),
+        }
+    }
+
+    #[test]
+    fn a_copied_name_never_shields_a_member_from_removal() {
+        let members = [
+            member("You", "00000000", true, false),
+            member("Grace", "1a2b3c4d", false, true),
+            // Took Grace's name, so names alone can't tell them apart.
+            member("Grace", "5e6f7a8b", false, true),
+            member("Alan", "9c0d1e2f", false, false),
+        ];
+        let removed = |query| resolve_removal(&members, query).map(|m| m.tag.to_string());
+        assert!(removed("grace").is_err(), "never guessed");
+        assert_eq!(removed("#5E6F7A8B").as_deref(), Ok("5e6f7a8b"));
+        // Not the user, nor those the policy protects.
+        assert!(removed("you").is_err());
+        assert!(removed("#00000000").is_err());
+        assert!(removed("alan").is_err());
+        assert!(removed("#ffffffff").is_err());
+        // Tags are unique when loaded; a duplicate is still never guessed.
+        let mut twins = members.clone();
+        twins[2].tag = twins[1].tag.clone();
+        assert!(resolve_removal(&twins, "#1a2b3c4d").is_err());
+    }
+
+    #[test]
+    fn group_names_are_trimmed_and_bounded() {
+        assert!(parse_title(" \t ").is_err());
+        assert_eq!(parse_title(" Engines ").ok().as_deref(), Some("Engines"));
+        let longest = "é".repeat(MAX_TITLE);
+        assert!(parse_title(&longest).is_ok(), "characters, not bytes");
+        assert!(parse_title(&format!("{longest}x")).is_err());
+    }
 }

@@ -63,8 +63,13 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     detached like contact operations, and the `Members` entity (an open
     group's members, reloaded on its chat's or any user's change;
     `can_remove` is upstream's `can_kick` on the room policy, which for
-    the core's trusted default lets any member remove another). Contacts
-    and members are picked by name with `matches_name` (never guessed).
+    the core's trusted default lets any member remove another; ended
+    groups refuse everything but delete). Contacts and members are picked
+    by name with `matches_name` (never guessed); members also by `#tag`,
+    a hash prefix of the user id grown until unique in the group, so a
+    copied name can't shield anyone from removal. Delete ends a group for
+    every member and erases it on all the user's devices (the dialog says
+    so).
     The self chat is a group in the core but never one here
     (`is_group` false, operations refuse it). Invites need the contact's
     `encrypted_group_profiles` feature, as upstream.
@@ -120,7 +125,8 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   (`ChatList::open_when_listed`). Groups likewise: `:group <name>`
   (`NewGroup`), `:invite`/`:kick` (complete contacts/members), `:rename`,
   and `:leave`/`:delete-chat` behind a confirm dialog (`Workspace::confirm`
-  reaches the workspace through a weak handle).
+  reaches the workspace through a weak handle, and closes the dialog and
+  restores focus itself before running: gpui-component's OK path doesn't).
 - Normal-mode letter bindings must never live in a context that contains a
   text input (they'd steal typing): use `ChatList`/`MessageList`, or
   `Workspace && helix && !Input`.

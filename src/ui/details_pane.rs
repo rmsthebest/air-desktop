@@ -7,6 +7,9 @@ use gpui_kit::{App, FontWeight, IntoElement, div, px};
 use crate::model::{ChatSummary, Member};
 use crate::ui::widgets::avatar;
 
+/// Members listed; others can invite any number.
+const MAX_ROWS: usize = 100;
+
 /// `members` is the open group's, once loaded.
 pub fn details_pane(
     chat: Option<&ChatSummary>,
@@ -54,7 +57,20 @@ pub fn details_pane(
                             .text_color(theme.muted_foreground)
                             .child(format!("{} members", members.len())),
                     )
-                    .children(members.iter().map(|member| member_row(member, cx))),
+                    .children(
+                        members
+                            .iter()
+                            .take(MAX_ROWS)
+                            .map(|member| member_row(member, cx)),
+                    )
+                    .when(members.len() > MAX_ROWS, |list| {
+                        list.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("and {} more", members.len() - MAX_ROWS)),
+                        )
+                    }),
             )
         })
 }
@@ -63,11 +79,11 @@ fn member_row(member: &Member, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     // What is said about the member, after their (peer-chosen) name.
     let note = if member.removing {
-        Some("being removed")
+        format!("being removed · #{}", member.tag)
     } else if member.own {
-        Some("you")
+        "you".to_string()
     } else {
-        None
+        format!("#{}", member.tag)
     };
     h_flex()
         .w_full()
@@ -80,13 +96,11 @@ fn member_row(member: &Member, cx: &App) -> impl IntoElement {
                 .truncate()
                 .child(member.name.clone()),
         )
-        .when_some(note, |row, note| {
-            row.child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(note),
-            )
-        })
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(note),
+        )
 }

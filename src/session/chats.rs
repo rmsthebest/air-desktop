@@ -281,6 +281,12 @@ async fn reload(
 
 /// Loads what the list shows for a chat. Port of `load_chat_details`, minus
 /// what the list doesn't show yet.
+/// How `chat` is listed.
+#[cfg(test)]
+pub(super) async fn summary(user: &CoreUser, chat: Chat) -> ChatSummary {
+    load_chat(user, chat).await.0
+}
+
 async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
     let unread = user.unread_messages_count(chat.id).await;
     let last = user

@@ -671,8 +671,24 @@ in workspace tests).
 
 ## Gate 12e — gate 12d fixes (`6c68979..3525a3f`): PASS
 
-Fixed (low):
+Fixed in `35c3afb` (low):
 - A file dialog answered after the chat closed told the user twice, the
   second time wrongly: back to `sendable_chat`'s one refusal.
-- `s` on a download left "downloading" by a quit (its reset not having
-  happened) downloads it: holding the claim, nothing else is.
+- `retry` downloads an attachment stored as downloading while holding
+  its claim (a quit whose reset didn't happen).
+
+## Gate 12f — gate 12e fixes (`3525a3f..35c3afb`): PASS
+
+Fixed (low):
+- `s` on a file shown as downloading goes to the session too, so the
+  stuck case above is reachable from the view; a real download in
+  this process still answers "Already downloading" (its claim).
+- A file dialog answered after another chat was opened always says
+  nothing was sent, whatever that chat is (a request one included).
+
+Accepted: the claim is per process. Two instances on one data
+directory could fetch the same file twice (as the startup reset already
+assumes one instance); a data-directory lock is for later.
+
+Deferred: a core-backed test of `retry` on a stale downloading
+attachment versus a claimed one.

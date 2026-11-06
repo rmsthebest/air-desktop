@@ -639,7 +639,11 @@ impl Conversation {
             crate::ui::show_refusal(text.into(), window, cx)
         };
         match attachment.state {
-            AttachmentState::DownloadFailed | AttachmentState::Pending => {
+            // Downloading too: the session says if it really is, and
+            // fetches one a quit left marked so.
+            AttachmentState::DownloadFailed
+            | AttachmentState::Pending
+            | AttachmentState::Downloading => {
                 let Some(retry) = messages.retry_download(&message.id, cx) else {
                     return refuse("Files need an account", window, cx);
                 };
@@ -651,7 +655,6 @@ impl Conversation {
                 })
                 .detach();
             }
-            AttachmentState::Downloading => refuse("Still downloading", window, cx),
             AttachmentState::Gone => refuse("That file is no longer available", window, cx),
             AttachmentState::Ready | AttachmentState::Uploading | AttachmentState::UploadFailed => {
                 let Some(save) = messages.save_attachment(&message.id, &attachment.name, cx) else {

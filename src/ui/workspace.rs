@@ -403,15 +403,20 @@ impl Workspace {
                 }
             };
             _ = this.update_in(cx, |this, window, cx| {
-                match this.sendable_chat(window, cx) {
-                    Some(open) if open == chat => this.attach(chat, paths, window, cx),
-                    Some(_) => show_refusal(
+                let list = this.chat_list.read(cx);
+                let open = list.selected_index().map(|ix| list.chats()[ix].id.clone());
+                if open.as_ref() != Some(&chat) {
+                    show_refusal(
                         "Another chat was opened meanwhile; nothing was sent".into(),
                         window,
                         cx,
-                    ),
-                    // `sendable_chat` has told the user why.
-                    None => {}
+                    );
+                    return;
+                }
+                // Still that chat; `sendable_chat` tells why if it can't
+                // take files any more.
+                if this.sendable_chat(window, cx).is_some() {
+                    this.attach(chat, paths, window, cx)
                 }
             });
         })

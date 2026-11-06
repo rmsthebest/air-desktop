@@ -344,6 +344,9 @@ async fn download(user: &CoreUser, id: AttachmentId, retry: bool) -> Downloaded 
     match user.attachment_status(id).await {
         Ok(Some(AttachmentStatus::Pending)) => {}
         Ok(Some(AttachmentStatus::DownloadFailed)) if retry => {}
+        // Stale while we hold the claim (a quit mid-download whose reset
+        // didn't happen): nothing is fetching it, so fetch it.
+        Ok(Some(AttachmentStatus::Downloading)) if retry => {}
         Ok(_) => return Downloaded::NotNeeded,
         Err(err) => {
             error!("failed to read an attachment's status: {err:#}");
@@ -420,10 +423,6 @@ pub(super) async fn retry(
         // Done meanwhile: reported all the same, so the view catches up.
         Downloaded::NotNeeded => match user.attachment_status(id).await? {
             Some(AttachmentStatus::Ready) => Ok(id),
-            // Left so by a quit mid-download: the loop resets it.
-            Some(AttachmentStatus::Downloading) => {
-                Err(Failure::Shown("Already downloading".into()))
-            }
             _ => Err(Failure::Shown("That file can't be downloaded".into())),
         },
         Downloaded::Busy => Err(Failure::Shown("Already downloading".into())),

@@ -659,13 +659,20 @@ Deferred:
 
 ## Gate 12d — gate 12c fixes (`286d1f8..6c68979`): PASS
 
-Fixed (all low): an unreachable branch removed (the core refuses an
-image it can't decode at upload, and stores its thumbnail with it); `s`
-on a download left mid-way by a quit says "Already downloading"; a file
-dialog answered after the chat changed or closed always tells the user.
+Fixed in `3525a3f`: an unreachable branch removed (the core refuses an
+image it can't decode at upload, and stores its thumbnail with it).
 
 Accepted: a WebP not declared an image that misses a preview slot stays
 a file card (fails closed).
 
 Deferred: tests for `retry` per status and for a file dialog answered
-after the chat changed (need a core-backed seam in workspace tests).
+after the chat changed (need a core-backed seam, or a file-dialog seam,
+in workspace tests).
+
+## Gate 12e — gate 12d fixes (`6c68979..3525a3f`): PASS
+
+Fixed (low):
+- A file dialog answered after the chat closed told the user twice, the
+  second time wrongly: back to `sendable_chat`'s one refusal.
+- `s` on a download left "downloading" by a quit (its reset not having
+  happened) downloads it: holding the claim, nothing else is.

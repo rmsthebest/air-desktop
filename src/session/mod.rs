@@ -61,6 +61,14 @@ pub enum SessionEvent {
     },
 }
 
+/// The user clicked a chat's desktop notification: show it, raising the
+/// window.
+pub struct OpenFromAlert(pub ChatId);
+
+/// Clicks waiting for the UI. A handful at most: the user clicks one
+/// notification at a time.
+const CLICKS_BUFFER: usize = 8;
+
 #[derive(Clone, Copy, PartialEq)]
 struct QueueState {
     status: ConnectionStatus,
@@ -86,10 +94,11 @@ pub struct Session {
     _drafts: TokioTask<()>,
     _forward: TokioTask<()>,
     _downloads: TokioTask<()>,
-    _receive: [Task<()>; 3],
+    _receive: [Task<()>; 4],
 }
 
 impl EventEmitter<SessionEvent> for Session {}
+impl EventEmitter<OpenFromAlert> for Session {}
 
 impl Session {
     pub fn start(user: CoreUser, cx: &mut App) -> Entity<Self> {
@@ -106,9 +115,15 @@ impl Session {
                 ..Attention::default()
             });
             let alerts = Alerts::new(attention_rx.clone(), notices.clone());
+            let (clicks_tx, mut clicks_rx) = mpsc::channel(CLICKS_BUFFER);
             let notifier = Tokio::spawn(
                 cx,
-                crate::notifier::run(notices, attention_rx, crate::notifier::system()),
+                crate::notifier::run(
+                    notices,
+                    attention_rx,
+                    crate::notifier::system(),
+                    alert_outcome(user.clone(), clicks_tx),
+                ),
             );
             let settings = cx.observe_global::<SettingsStore>(|this: &mut Self, cx| {
                 let content = SettingsStore::get(cx).notifications;
@@ -178,6 +193,17 @@ impl Session {
                     receive_changes(this, changes_rx, overflowed, cx).await
                 }),
                 cx.spawn(async move |this, cx| receive_queue_state(this, state_rx, cx).await),
+                cx.spawn(async move |this, cx| {
+                    while let Some(chat) = clicks_rx.recv().await {
+                        let chat = chats::model_id(&chat);
+                        if this
+                            .update(cx, |_, cx| cx.emit(OpenFromAlert(chat)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }),
                 cx.spawn(async move |this, cx| {
                     while usernames_rx.changed().await.is_ok() {
                         let usernames = usernames_rx.borrow_and_update().clone();
@@ -304,6 +330,29 @@ impl Session {
             notifications,
             overflowed,
         });
+    }
+}
+
+/// Carries out what the user did with a desktop notification. Runs on the
+/// notifier's tokio task.
+fn alert_outcome(
+    user: CoreUser,
+    clicks: mpsc::Sender<aircoreclient::ChatId>,
+) -> impl FnMut(crate::notifier::Outcome) + Send {
+    use crate::notifier::Outcome;
+    move |outcome| match outcome {
+        // Dropped if the UI is that far behind: the user can click again.
+        Outcome::Open(chat) => _ = clicks.try_send(chat),
+        // Detached: the notifier mustn't wait on the database. The core
+        // never moves the watermark back.
+        Outcome::Dismissed { chat, until } => {
+            let user = user.clone();
+            tokio::spawn(async move {
+                if let Err(err) = user.set_chat_notified_until(chat, until).await {
+                    error!("failed to mark a dismissed alert's chat as notified: {err:#}");
+                }
+            });
+        }
     }
 }
 

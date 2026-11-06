@@ -21,11 +21,11 @@ use crate::actions::{
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, Request, UserId, mock};
-use crate::session::Session;
 use crate::session::chats::{Chats, LoadState};
 use crate::session::composer::Composer;
 use crate::session::groups::Members;
 use crate::session::messages::Messages;
+use crate::session::{OpenFromAlert, Session};
 use crate::settings::{Appearance, KeymapMode, Notifications, SettingsStore};
 use crate::theme;
 use crate::ui::chat_list::{ChatList, ChatListEvent};
@@ -155,6 +155,13 @@ impl Workspace {
         if let Some(session) = &session {
             // Account name and connection status are shown in the rail.
             subscriptions.push(cx.observe(session, |_, _, cx| cx.notify()));
+            subscriptions.push(cx.subscribe_in(
+                session,
+                window,
+                |this, _, OpenFromAlert(chat), window, cx| {
+                    this.open_from_alert(chat.clone(), window, cx)
+                },
+            ));
         }
         if let Some(chats) = &chats {
             subscriptions.push(cx.observe(chats, |this, chats, cx| {
@@ -241,6 +248,18 @@ impl Workspace {
         } else {
             self.focus_composer(&FocusComposer, window, cx);
         }
+    }
+
+    /// A click on a chat's desktop notification: the window comes up
+    /// showing the chat, as after picking it from the palette.
+    fn open_from_alert(&mut self, chat: ChatId, window: &mut Window, cx: &mut Context<Self>) {
+        // On Wayland the compositor may only mark the window as wanting
+        // attention: gpui can't pass on the server's activation token.
+        window.activate_window();
+        self.unhide_settings(cx);
+        self.jump_to_chat(chat, window, cx);
+        // In case the chat was open already (no `Opened` to report it).
+        self.report_attention(window, cx);
     }
 
     fn update_chat_list(

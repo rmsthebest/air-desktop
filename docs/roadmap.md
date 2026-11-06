@@ -16,11 +16,13 @@ milestones. Each one ends with a review gate (see CLAUDE.md).
     retrying a failed upload is left for later.
 11. **Settings screen** (done). A view for theme, appearance, keymap,
     notifications, display name and usernames, next to the commands.
-12. **Notification actions.** Clicking a notification opens its chat and
+12. **Notification actions** (done). Clicking a notification opens its chat and
     raises the window (D-Bus `ActionInvoked`, Wayland activation token).
     In `private` mode, one shared notification instead of one per chat.
     A notification the user dismisses advances the chat's `notified_until`
     (as upstream), so old reactions stop coming back in rewritten alerts.
+    Under Wayland the window may only be marked as wanting attention:
+    gpui has no way to activate it with the server's token.
 13. **Multi-device linking.** Link and unlink devices. With a second
     device of the same user, cover sibling notification suppression in
     the e2e tests (deferred since gate 9).

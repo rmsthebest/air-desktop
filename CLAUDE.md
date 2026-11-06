@@ -126,7 +126,15 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   later notice; a rewrite that gets a new id (the user closed the old one)
   is closed at once. The notifier re-applies `Attention`
   at show time. The D-Bus side sits behind the `notifier::Desktop` trait
-  (tests use a fake screen).
+  (tests use a fake screen). The server's signals are heard only from the
+  instance that gave out our ids: a click (`default` action) opens the
+  chat (`OpenFromAlert`, the workspace raises the window; gpui can't use
+  the server's Wayland activation token), a user dismissal advances each
+  shown chat's `notified_until` to the alert's `until` (what it showed,
+  never newer), and a closed notification is forgotten so no rewrite
+  brings it back. `private` mode keeps one shared notification for all
+  chats, closed once none needs it. While the server can't be told, no
+  id is replaced or closed; failed closes retry every 30 s.
 - The local server rate-limits sign-ups: back-to-back e2e runs fail with
   "Rate limited"/"Too Many Requests" at sign-up or the first requests.
 - `src/markdown.rs` — bounded message markdown parse (size/depth caps; only

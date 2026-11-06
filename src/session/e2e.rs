@@ -560,6 +560,12 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     );
     let alert = next_alert(&bob_notices, |alert| alert.chat == bob_chat).await;
     assert_eq!(alert.body, "Ada Lovelace reacted 👍 to hi ada");
+    // Bob dismisses it: nothing it stood for is alerted again, not even
+    // in a rewrite after a change (as the retraction below).
+    let until = alert.until.expect("the alert stands for the reaction");
+    bob.set_chat_notified_until(bob_chat, until).await.unwrap();
+    let chat = bob.chat(&bob_chat).await.unwrap();
+    assert_eq!(super::alerts::current_alert(&bob, &chat).await, None);
     let removed = messages::set_reaction(&ada, ada_chat, hi, "👍".into(), false).await;
     assert!(removed.is_ok(), "{removed:?}");
     next_message(&mut bob_updates, |m| {

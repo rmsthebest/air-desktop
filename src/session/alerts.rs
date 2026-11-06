@@ -22,6 +22,7 @@ use aircommon::messages::client_state::NotificationSuppression;
 use aircoreclient::clients::process::process_qs::{NewChat, ProcessedQsMessages};
 use aircoreclient::clients::{CoreUser, SiblingClientStates};
 use aircoreclient::{Chat, ChatId, ChatMessage, ChatNotificationEntry, ChatType, StoredRequest};
+use chrono::{DateTime, Utc};
 use tokio::sync::{Notify, watch};
 use tracing::error;
 
@@ -35,6 +36,11 @@ pub struct Alert {
     /// One bounded line each; peer-chosen text is never passed on raw.
     pub title: String,
     pub body: String,
+    /// The newest entry of the chat's notification state this alert
+    /// stands for. Dismissing it advances the chat's `notified_until` to
+    /// here, never to what arrived after it. `None` for alerts outside that
+    /// state (new chats, contact requests).
+    pub until: Option<DateTime<Utc>>,
 }
 
 /// What the notifier is told.
@@ -102,6 +108,7 @@ impl Attention {
                 chat: alert.chat,
                 title: "Air".into(),
                 body: "New activity".into(),
+                until: alert.until,
             }),
             Notifications::Off => None,
         }
@@ -349,12 +356,17 @@ fn is_own(user: &CoreUser, message: &ChatMessage) -> bool {
 /// not yet notified entry from others that can be put into words (error
 /// notes the core adds can't, as the chat list doesn't preview them).
 /// Deleted messages aren't in that state, and edited ones are current.
-async fn current_alert(user: &CoreUser, chat: &Chat) -> Option<Alert> {
+pub(super) async fn current_alert(user: &CoreUser, chat: &Chat) -> Option<Alert> {
     let rebuild = user
         .chat_notification_rebuild_set(chat.id)
         .await
         .inspect_err(|err| error!("failed to load a chat's notification state: {err:#}"))
         .ok()?;
+    let until = rebuild
+        .rebuild_set
+        .entries
+        .last()
+        .map(|entry| entry.timestamp());
     for entry in rebuild.rebuild_set.entries.iter().rev() {
         let body = match entry {
             ChatNotificationEntry::Message(message) if is_own(user, message) => continue,
@@ -380,6 +392,7 @@ async fn current_alert(user: &CoreUser, chat: &Chat) -> Option<Alert> {
                 chat: chat.id,
                 title: chat_title(user, chat).await,
                 body,
+                until,
             });
         }
     }
@@ -427,6 +440,7 @@ async fn new_chats(user: &CoreUser, new_chats: &[NewChat], alerts: &mut Vec<Aler
             chat: *chat_id,
             title: format!("You were added to {title}"),
             body: "Say hi to everyone".into(),
+            until: None,
         });
     }
 }
@@ -451,6 +465,7 @@ async fn connection_alert(user: &CoreUser, chat: ChatId) -> Option<Alert> {
         chat: chat.id,
         title,
         body: body.into(),
+        until: None,
     })
 }
 
@@ -467,6 +482,7 @@ mod tests {
             chat: chat(chat_n),
             title: "Grace".into(),
             body: body.into(),
+            until: None,
         }
     }
 

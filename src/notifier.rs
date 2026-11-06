@@ -5,12 +5,19 @@
 //! build doesn't have.
 //!
 //! Each chat has at most one notification on screen: a new alert replaces
-//! it, a refresh rewrites it quietly, and a dismissal closes it.
+//! it, a refresh rewrites it quietly, and a dismissal closes it. In
+//! `private` mode the chats share one notification, which says nothing
+//! about any of them; it closes once none of them has activity left.
+//!
+//! The server tells what the user did: clicking a notification opens its
+//! chat, and dismissing one advances its chats' `notified_until` to what it
+//! showed, as upstream, so what was dismissed isn't alerted again.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use aircoreclient::ChatId;
+use chrono::{DateTime, Utc};
 use tokio::sync::watch;
 
 use crate::session::alerts::{Alert, Attention, Dismiss, Notice, NoticeQueue};
@@ -31,12 +38,44 @@ pub trait Desktop {
     /// Which server instance serves notifications now, `None` if that
     /// can't be told (the desktop is unreachable).
     fn owner(&mut self) -> impl Future<Output = Option<Owner>> + Send;
+    /// The next thing the user did with a notification; pending while
+    /// nothing can be heard. Cancel-safe: it races the notices.
+    fn reply(&mut self) -> impl Future<Output = Reply> + Send;
 }
 
 /// A notification server instance (its unique bus name); `None` while none
 /// runs. Ids mean something only to the instance that gave them out: after
 /// a restart, the new one hands the same ids to other apps.
 pub type Owner = Option<String>;
+
+/// What a server says the user did with notification `id`. Servers may
+/// tell every app about every notification, so only the instance that
+/// gave out our ids (`from`) is listened to, and only about them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub from: String,
+    pub id: u32,
+    pub what: Replied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replied {
+    /// Its default action: the user clicked it.
+    Clicked,
+    /// The user closed it.
+    Dismissed,
+    /// It timed out, and is gone.
+    Expired,
+}
+
+/// What the session is asked to do about a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Show the chat, raising the window.
+    Open(ChatId),
+    /// Advance the chat's `notified_until` to `until`.
+    Dismissed { chat: ChatId, until: DateTime<Utc> },
+}
 
 /// The platform's notifications.
 pub fn system() -> impl Desktop + Send {
@@ -53,19 +92,45 @@ pub async fn run(
     notices: Arc<NoticeQueue>,
     attention: watch::Receiver<Attention>,
     desktop: impl Desktop + Send,
+    mut outcome: impl FnMut(Outcome) + Send,
 ) {
     let mut notifier = Notifier::new(desktop);
     loop {
-        let notice = notices.next().await;
-        let attention = *attention.borrow();
-        notifier.handle(notice, &attention).await;
+        let retrying = !notifier.closing.is_empty();
+        tokio::select! {
+            notice = notices.next() => {
+                let attention = *attention.borrow();
+                notifier.handle(notice, &attention).await;
+            }
+            reply = notifier.desktop.reply() => {
+                notifier.replied(reply).into_iter().for_each(&mut outcome);
+            }
+            // Stale text mustn't wait for the next alert to go.
+            () = tokio::time::sleep(RETRY_CLOSE), if retrying => notifier.retry().await,
+        }
     }
+}
+
+/// How long a failed close waits before it is tried again.
+const RETRY_CLOSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A chat's alert on screen.
+#[derive(Debug, Clone, Copy)]
+struct Shown {
+    /// The desktop's id of the notification showing it; chats sharing
+    /// one have the same.
+    id: u32,
+    until: Option<DateTime<Utc>>,
+    /// When it was shown, to open the newest of a shared one's chats.
+    seq: u64,
 }
 
 struct Notifier<D> {
     desktop: D,
-    /// The desktop's id of each chat's notification.
-    shown: HashMap<ChatId, u32>,
+    shown: HashMap<ChatId, Shown>,
+    /// The notification chats share in `private` mode, if one is up.
+    shared: Option<u32>,
+    seq: u64,
     /// Notifications taken off our books whose close hasn't gone through
     /// yet; retried, in order, before each notice.
     closing: Vec<u32>,
@@ -74,6 +139,9 @@ struct Notifier<D> {
     /// A close failed while handling this notice: don't wait on the
     /// desktop again for the rest of it.
     stalled: bool,
+    /// Which server runs couldn't be told for this notice: the ids above
+    /// may be another app's by now, so none is replaced or closed.
+    unsure: bool,
 }
 
 impl<D: Desktop + Send> Notifier<D> {
@@ -81,41 +149,51 @@ impl<D: Desktop + Send> Notifier<D> {
         Self {
             desktop,
             shown: HashMap::new(),
+            shared: None,
+            seq: 0,
             closing: Vec::new(),
             owner: None,
             stalled: false,
+            unsure: false,
         }
     }
 
     async fn handle(&mut self, notice: Notice, attention: &Attention) {
-        self.stalled = false;
-        self.follow_owner().await;
-        self.close_pending().await;
+        self.retry().await;
+        let shares = attention.content == crate::settings::Notifications::Private;
         match notice {
             Notice::Show(alert) => {
                 if let Some(alert) = attention.shown(alert) {
-                    self.show(alert, false).await;
+                    self.show(alert, false, shares).await;
                 }
             }
             Notice::Refresh(alert) => {
-                let Some(&replaces) = self.shown.get(&alert.chat) else {
+                let Some(replaces) = self.shown.get(&alert.chat).map(|shown| shown.id) else {
                     return;
                 };
                 let chat = alert.chat;
-                let rewritten = match attention.shown(alert) {
-                    Some(alert) => self.show(alert, true).await,
+                let alert = attention.shown(alert);
+                if let Some(alert) = &alert
+                    && self.shared == Some(replaces)
+                {
+                    // The shared notification says nothing about the chat:
+                    // only what dismissing it would mark changes.
+                    if let Some(shown) = self.shown.get_mut(&chat) {
+                        shown.until = alert.until;
+                    }
+                    return;
+                }
+                // Full text left up under `private` would say too much; and
+                // while the server is unknown, a rewrite would be shown
+                // anew, drawing attention again.
+                let rewritten = match alert.filter(|_| !shares && !self.unsure) {
+                    Some(alert) => self.show(alert, true, false).await,
                     None => None,
                 };
                 // Kept only if rewritten in place. A new id means the old
                 // notification was gone (closed by the user, or expired),
                 // and a rewrite mustn't bring it back; no id means what is
                 // on screen is stale and couldn't be rewritten.
-                if let Some(new) = rewritten
-                    && new != replaces
-                {
-                    // In case the old one is still up after all.
-                    self.closing.push(replaces);
-                }
                 if rewritten != Some(replaces) {
                     self.dismiss(Dismiss::Chat(chat)).await;
                 }
@@ -124,28 +202,98 @@ impl<D: Desktop + Send> Notifier<D> {
         }
     }
 
+    /// Starts on a notice: learns which server runs, and closes what is
+    /// waiting to be closed.
+    async fn retry(&mut self) {
+        self.stalled = false;
+        self.follow_owner().await;
+        self.close_pending().await;
+    }
+
     /// Returns the notification's id. On failure, whatever the chat had on
     /// screen is still there and still tracked.
-    async fn show(&mut self, alert: Alert, quiet: bool) -> Option<u32> {
-        let replaces = self.shown.get(&alert.chat).copied().unwrap_or(0);
-        let id = self.desktop.notify(replaces, &alert, quiet).await?;
+    async fn show(&mut self, alert: Alert, quiet: bool, shared: bool) -> Option<u32> {
+        let own = self
+            .shown
+            .get(&alert.chat)
+            .map(|shown| shown.id)
+            .filter(|id| Some(*id) != self.shared);
+        let replaces = if self.unsure {
+            // Shown anew; the old one is closed once the server is known.
+            None
+        } else if shared {
+            self.shared
+        } else {
+            own
+        };
+        let id = self
+            .desktop
+            .notify(replaces.unwrap_or(0), &alert, quiet)
+            .await?;
         if self.owner.is_none() {
             // That call started a server (D-Bus activation): the id is
             // its. Unknown if unreachable; then the next notice forgets it.
             self.owner = self.desktop.owner().await.flatten();
         }
-        self.shown.insert(alert.chat, id);
+        self.seq += 1;
+        let previous = self.shown.insert(
+            alert.chat,
+            Shown {
+                id,
+                until: alert.until,
+                seq: self.seq,
+            },
+        );
+        if shared
+            && let Some(old) = self.shared.replace(id)
+            && old != id
+        {
+            if self.unsure {
+                // Moved, not gone: the old one is closed once it can be.
+                self.shown
+                    .values_mut()
+                    .filter(|shown| shown.id == old)
+                    .for_each(|shown| shown.id = id);
+            } else {
+                // The shared notification was gone (closed by the user),
+                // and what it showed with it.
+                self.shown.retain(|_, shown| shown.id != old);
+            }
+            self.release(old);
+        }
+        if let Some(previous) = previous
+            && previous.id != id
+        {
+            self.release(previous.id);
+        }
         Some(id)
+    }
+
+    /// Closes notification `id` once no chat's alert is in it any more.
+    fn release(&mut self, id: u32) {
+        if self.shown.values().any(|shown| shown.id == id) {
+            return;
+        }
+        if self.shared == Some(id) {
+            self.shared = None;
+        }
+        if !self.closing.contains(&id) {
+            self.closing.push(id);
+        }
     }
 
     /// Forgets every id once another server instance took over: closing or
     /// replacing one would hit another app's notification. The window
     /// between this check and the calls after it is left open.
     async fn follow_owner(&mut self) {
-        if let Some(owner) = self.desktop.owner().await
-            && owner != self.owner
-        {
+        let Some(owner) = self.desktop.owner().await else {
+            self.unsure = true;
+            return;
+        };
+        self.unsure = false;
+        if owner != self.owner {
             self.shown.clear();
+            self.shared = None;
             self.closing.clear();
             self.owner = owner;
         }
@@ -153,8 +301,15 @@ impl<D: Desktop + Send> Notifier<D> {
 
     async fn dismiss(&mut self, dismiss: Dismiss) {
         match dismiss {
-            Dismiss::Chat(chat) => self.closing.extend(self.shown.remove(&chat)),
-            Dismiss::All => self.closing.extend(self.shown.drain().map(|(_, id)| id)),
+            Dismiss::Chat(chat) => {
+                if let Some(shown) = self.shown.remove(&chat) {
+                    self.release(shown.id);
+                }
+            }
+            Dismiss::All => {
+                let ids: Vec<u32> = self.shown.drain().map(|(_, shown)| shown.id).collect();
+                ids.into_iter().for_each(|id| self.release(id));
+            }
         }
         self.close_pending().await;
     }
@@ -163,6 +318,7 @@ impl<D: Desktop + Send> Notifier<D> {
     /// a desktop that just failed is likely to fail again right away.
     async fn close_pending(&mut self) {
         while !self.stalled
+            && !self.unsure
             && let Some(&id) = self.closing.first()
         {
             if !self.desktop.close(id).await {
@@ -170,6 +326,48 @@ impl<D: Desktop + Send> Notifier<D> {
                 return;
             }
             self.closing.remove(0);
+        }
+    }
+
+    /// What the user did with one of our notifications asks of the session.
+    /// A notification that is gone takes its chats' alerts with it, so a
+    /// rewrite won't bring it back.
+    fn replied(&mut self, reply: Reply) -> Vec<Outcome> {
+        if self.owner.as_ref() != Some(&reply.from) {
+            return Vec::new();
+        }
+        let chats: Vec<(ChatId, Shown)> = self
+            .shown
+            .iter()
+            .filter(|(_, shown)| shown.id == reply.id)
+            .map(|(chat, shown)| (*chat, *shown))
+            .collect();
+        match reply.what {
+            Replied::Clicked => chats
+                .iter()
+                .max_by_key(|(_, shown)| shown.seq)
+                .map(|(chat, _)| Outcome::Open(*chat))
+                .into_iter()
+                .collect(),
+            Replied::Dismissed | Replied::Expired => {
+                self.shown.retain(|_, shown| shown.id != reply.id);
+                if self.shared == Some(reply.id) {
+                    self.shared = None;
+                }
+                self.closing.retain(|&id| id != reply.id);
+                if reply.what == Replied::Expired {
+                    return Vec::new();
+                }
+                chats
+                    .into_iter()
+                    .filter_map(|(chat, shown)| {
+                        Some(Outcome::Dismissed {
+                            chat,
+                            until: shown.until?,
+                        })
+                    })
+                    .collect()
+            }
         }
     }
 }
@@ -188,6 +386,9 @@ impl Desktop for Unsupported {
     async fn owner(&mut self) -> Option<Owner> {
         None
     }
+    async fn reply(&mut self) -> Reply {
+        std::future::pending().await
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +405,8 @@ mod tests {
         /// The server instance running, if any.
         server: Option<u32>,
         started: u32,
+        /// Which server runs can't be told, though notifying works.
+        lookup_down: bool,
     }
 
     impl Screen {
@@ -241,7 +444,10 @@ mod tests {
             true
         }
         async fn owner(&mut self) -> Option<Owner> {
-            (!self.down).then(|| self.server.map(|n| n.to_string()))
+            (!self.down && !self.lookup_down).then(|| self.server.map(|n| n.to_string()))
+        }
+        async fn reply(&mut self) -> Reply {
+            std::future::pending().await
         }
     }
 
@@ -250,7 +456,33 @@ mod tests {
             chat: ChatId::new(uuid::Uuid::from_u128(chat)),
             title: "Grace".into(),
             body: body.into(),
+            until: None,
         }
+    }
+
+    /// An alert standing for the chat's activity up to `at` seconds.
+    fn alert_until(chat: u128, body: &str, at: i64) -> Alert {
+        Alert {
+            until: DateTime::from_timestamp(at, 0),
+            ..alert(chat, body)
+        }
+    }
+
+    /// The user does `what` to the notification showing `body`, as the
+    /// running server reports it.
+    fn user_does(notifier: &mut Notifier<Screen>, body: &str, what: Replied) -> Vec<Outcome> {
+        let id = notifier
+            .desktop
+            .visible
+            .iter()
+            .find(|(_, (alert, _))| alert.body == body)
+            .map(|(id, _)| *id)
+            .expect("on screen");
+        if what != Replied::Clicked {
+            notifier.desktop.visible.remove(&id);
+        }
+        let from = notifier.desktop.server.unwrap().to_string();
+        notifier.replied(Reply { from, id, what })
     }
 
     fn bodies(notifier: &Notifier<Screen>) -> Vec<String> {
@@ -361,6 +593,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_click_opens_and_a_dismissal_marks_only_what_was_shown() {
+        let mut notifier = Notifier::new(Screen::default());
+        let full = Attention::default();
+        let (first, second) = (alert(1, "").chat, alert(2, "").chat);
+        notifier
+            .handle(Notice::Show(alert_until(1, "hi", 10)), &full)
+            .await;
+        // Edited: what dismissing it marks follows what it shows.
+        notifier
+            .handle(Notice::Refresh(alert_until(1, "hi!", 20)), &full)
+            .await;
+        notifier
+            .handle(Notice::Show(alert_until(2, "yo", 30)), &full)
+            .await;
+
+        assert_eq!(
+            user_does(&mut notifier, "yo", Replied::Clicked),
+            [Outcome::Open(second)]
+        );
+        // Another server instance's word about the same id counts for
+        // nothing.
+        let id = notifier.shown[&first].id;
+        let stranger = Reply {
+            from: "elsewhere".into(),
+            id,
+            what: Replied::Dismissed,
+        };
+        assert!(notifier.replied(stranger).is_empty());
+        assert_eq!(
+            user_does(&mut notifier, "hi!", Replied::Dismissed),
+            [Outcome::Dismissed {
+                chat: first,
+                until: DateTime::from_timestamp(20, 0).unwrap(),
+            }]
+        );
+        // Gone, so a rewrite doesn't bring it back.
+        notifier
+            .handle(Notice::Refresh(alert_until(1, "hi?", 40)), &full)
+            .await;
+        assert_eq!(bodies(&notifier), ["yo"]);
+
+        // One that timed out is forgotten without marking anything.
+        assert!(user_does(&mut notifier, "yo", Replied::Expired).is_empty());
+        notifier
+            .handle(Notice::Refresh(alert_until(2, "yo!", 50)), &full)
+            .await;
+        assert!(bodies(&notifier).is_empty());
+    }
+
+    #[tokio::test]
+    async fn private_alerts_share_one_notification_until_no_chat_needs_it() {
+        let mut notifier = Notifier::new(Screen::default());
+        let private = Attention {
+            content: Notifications::Private,
+            ..Attention::default()
+        };
+        let (first, second) = (alert(1, "").chat, alert(2, "").chat);
+        notifier
+            .handle(Notice::Show(alert_until(1, "secret", 10)), &private)
+            .await;
+        notifier
+            .handle(Notice::Show(alert_until(2, "other", 20)), &private)
+            .await;
+        assert_eq!(bodies(&notifier), ["New activity"]);
+
+        // Opening one chat leaves it up for the other.
+        notifier
+            .handle(Notice::Dismiss(Dismiss::Chat(first)), &private)
+            .await;
+        assert_eq!(bodies(&notifier), ["New activity"]);
+        notifier
+            .handle(Notice::Dismiss(Dismiss::Chat(second)), &private)
+            .await;
+        assert!(bodies(&notifier).is_empty());
+
+        notifier
+            .handle(Notice::Show(alert_until(1, "secret", 10)), &private)
+            .await;
+        notifier
+            .handle(Notice::Show(alert_until(2, "other", 20)), &private)
+            .await;
+        // A click opens the newest; a dismissal marks every chat in it.
+        assert_eq!(
+            user_does(&mut notifier, "New activity", Replied::Clicked),
+            [Outcome::Open(second)]
+        );
+        let mut marked = user_does(&mut notifier, "New activity", Replied::Dismissed);
+        marked.sort_by_key(|outcome| match outcome {
+            Outcome::Dismissed { until, .. } => *until,
+            Outcome::Open(_) => DateTime::UNIX_EPOCH,
+        });
+        assert_eq!(
+            marked,
+            [
+                Outcome::Dismissed {
+                    chat: first,
+                    until: DateTime::from_timestamp(10, 0).unwrap(),
+                },
+                Outcome::Dismissed {
+                    chat: second,
+                    until: DateTime::from_timestamp(20, 0).unwrap(),
+                },
+            ]
+        );
+
+        // The next alert gets a new shared notification, and only its
+        // chat is in it: the dismissed ones don't come back with it.
+        notifier
+            .handle(Notice::Show(alert_until(3, "new", 30)), &private)
+            .await;
+        assert_eq!(bodies(&notifier), ["New activity"]);
+        assert_eq!(notifier.shown.len(), 1);
+
+        // Back to full text: new alerts get their own notification, and
+        // the shared one stays for its chat.
+        let full = Attention::default();
+        notifier
+            .handle(Notice::Show(alert_until(4, "hello", 40)), &full)
+            .await;
+        assert_eq!(bodies(&notifier), ["New activity", "hello"]);
+    }
+
+    #[tokio::test]
+    async fn an_id_is_never_replaced_while_the_server_is_unknown() {
+        let mut notifier = Notifier::new(Screen::default());
+        let full = Attention::default();
+        notifier.handle(Notice::Show(alert(1, "old")), &full).await;
+        // The server restarted, and gave our old id to another app; which
+        // server runs can't be told right now.
+        notifier.desktop.restart();
+        notifier.desktop.server = Some(9);
+        notifier.desktop.next_id = 1;
+        notifier
+            .desktop
+            .visible
+            .insert(1, (alert(7, "theirs"), false));
+        notifier.desktop.lookup_down = true;
+        notifier.handle(Notice::Show(alert(1, "new")), &full).await;
+        notifier
+            .handle(Notice::Dismiss(Dismiss::Chat(alert(2, "").chat)), &full)
+            .await;
+        assert_eq!(bodies(&notifier), ["new", "theirs"]);
+        // Once it can be told, the old id is forgotten, not closed.
+        notifier.desktop.lookup_down = false;
+        notifier.retry().await;
+        assert_eq!(bodies(&notifier), ["new", "theirs"]);
+    }
+
+    #[tokio::test]
     async fn ids_from_a_restarted_server_are_never_reused() {
         let mut notifier = Notifier::new(Screen::default());
         let full = Attention::default();
@@ -391,10 +772,12 @@ mod linux {
 
     use std::time::Duration;
 
+    use futures_util::StreamExt;
     use zbus::fdo::DBusProxy;
     use zbus::names::{BusName, WellKnownName};
+    use zbus::proxy::SignalStream;
     use zbus::zvariant::Value;
-    use zbus::{Connection, Proxy};
+    use zbus::{Connection, Message, Proxy};
 
     use tracing::{info, warn};
 
@@ -460,6 +843,25 @@ mod linux {
             }
         }
 
+        async fn reply(&mut self) -> super::Reply {
+            loop {
+                // Connected by the first alert: before it, nothing of ours
+                // is on screen to hear about.
+                let Some(bus) = self.bus.as_mut() else {
+                    return std::future::pending().await;
+                };
+                match bus.signals.next().await {
+                    Some(message) => {
+                        if let Some(reply) = reply_from(&message) {
+                            return reply;
+                        }
+                    }
+                    // The connection is gone; the next alert reconnects.
+                    None => self.bus = None,
+                }
+            }
+        }
+
         async fn close(&mut self, id: u32) -> bool {
             let Some(bus) = self.bus().await else {
                 return false;
@@ -496,6 +898,8 @@ mod linux {
     struct Bus {
         proxy: Proxy<'static>,
         dbus: DBusProxy<'static>,
+        /// The service's signals: what the user did with notifications.
+        signals: SignalStream<'static>,
         /// The server renders a subset of HTML in bodies.
         markup: bool,
     }
@@ -515,11 +919,14 @@ mod linux {
                 "org.freedesktop.Notifications",
             )
             .await?;
+            // Subscribed before anything is shown, so no reply is missed.
+            let signals = proxy.receive_all_signals().await?;
             let capabilities: Vec<String> = proxy.call("GetCapabilities", &()).await?;
             let markup = capabilities.iter().any(|c| c == "body-markup");
             Ok(Self {
                 proxy,
                 dbus,
+                signals,
                 markup,
             })
         }
@@ -557,7 +964,9 @@ mod linux {
                     APP_ID,
                     alert.title.as_str(),
                     body.as_str(),
-                    Vec::<&str>::new(),
+                    // Clicking the notification; servers without actions
+                    // ignore it.
+                    [DEFAULT_ACTION, "Open"],
                     hints,
                     -1i32,
                 ),
@@ -568,6 +977,39 @@ mod linux {
         async fn close(&self, id: u32) -> zbus::Result<()> {
             bounded(self.proxy.call("CloseNotification", &(id,))).await
         }
+    }
+
+    const DEFAULT_ACTION: &str = "default";
+
+    /// The spec's close reasons.
+    const EXPIRED: u32 = 1;
+    const DISMISSED: u32 = 2;
+
+    /// A signal as a reply, if it is one we act on. Closes by a
+    /// `CloseNotification` call (reason 3) are ours, already accounted for;
+    /// and a stale one could name an id the server has since handed out
+    /// again.
+    fn reply_from(message: &Message) -> Option<super::Reply> {
+        use super::Replied;
+        let header = message.header();
+        let from = header.sender()?.to_string();
+        let (id, what) = match header.member()?.as_str() {
+            "ActionInvoked" => {
+                let (id, action): (u32, String) = message.body().deserialize().ok()?;
+                (id, (action == DEFAULT_ACTION).then_some(Replied::Clicked)?)
+            }
+            "NotificationClosed" => {
+                let (id, reason): (u32, u32) = message.body().deserialize().ok()?;
+                let what = match reason {
+                    EXPIRED => Replied::Expired,
+                    DISMISSED => Replied::Dismissed,
+                    _ => return None,
+                };
+                (id, what)
+            }
+            _ => return None,
+        };
+        Some(super::Reply { from, id, what })
     }
 
     /// Escapes the characters the notification markup subset gives meaning.
@@ -588,6 +1030,52 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
+        use super::super::{Replied, Reply};
+        use zbus::Message;
+
+        fn signal(
+            member: &str,
+            body: &(impl serde::Serialize + zbus::zvariant::DynamicType),
+        ) -> Message {
+            Message::signal(
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                member,
+            )
+            .unwrap()
+            .sender(":1.5")
+            .unwrap()
+            .build(body)
+            .unwrap()
+        }
+
+        #[test]
+        fn only_clicks_and_the_users_closes_are_replies() {
+            let reply = |what| {
+                Some(Reply {
+                    from: ":1.5".into(),
+                    id: 7,
+                    what,
+                })
+            };
+            let read = |message: Message| super::reply_from(&message);
+            assert_eq!(
+                read(signal("ActionInvoked", &(7u32, "default"))),
+                reply(Replied::Clicked)
+            );
+            assert_eq!(read(signal("ActionInvoked", &(7u32, "inline-reply"))), None);
+            assert_eq!(
+                read(signal("NotificationClosed", &(7u32, 2u32))),
+                reply(Replied::Dismissed)
+            );
+            assert_eq!(
+                read(signal("NotificationClosed", &(7u32, 1u32))),
+                reply(Replied::Expired)
+            );
+            // Closed by a call: ours, or stale for an id handed out again.
+            assert_eq!(read(signal("NotificationClosed", &(7u32, 3u32))), None);
+        }
+
         #[test]
         fn peer_text_never_becomes_markup() {
             assert_eq!(

@@ -240,27 +240,25 @@ pub fn complete(input: &str, candidates: &Candidates) -> Vec<(String, String)> {
     let Some(spec) = spec(name) else {
         return Vec::new();
     };
-    let arg_typed = normalize(arg.trim_start());
-    if spec.arg == Arg::Member {
-        // Matched on what is shown, which names the member.
-        return candidates
-            .members
-            .iter()
-            .filter(|(_, shown)| normalize(shown).contains(&arg_typed))
-            .map(|(insert, shown)| (format!("{name} {insert}"), shown.clone()))
-            .collect();
-    }
+    let arg = normalize(arg.trim_start());
     let candidates: Vec<String> = match spec.arg {
         Arg::None | Arg::Text => return Vec::new(),
+        // Matched on what is shown, which names the member.
+        Arg::Member => {
+            return candidates
+                .members
+                .iter()
+                .filter(|(_, shown)| normalize(shown).contains(&arg))
+                .map(|(insert, shown)| (format!("{name} {insert}"), shown.clone()))
+                .collect();
+        }
         Arg::Theme => candidates.themes.clone(),
         Arg::Chat => candidates.chats.clone(),
         Arg::Contact => candidates.contacts.clone(),
-        Arg::Member => unreachable!("completed above"),
         Arg::Appearance => ["system", "light", "dark"].map(String::from).to_vec(),
         Arg::Keymap => ["standard", "helix"].map(String::from).to_vec(),
         Arg::Notifications => ["full", "private", "off"].map(String::from).to_vec(),
     };
-    let arg = normalize(arg.trim_start());
     candidates
         .into_iter()
         .filter(|candidate| normalize(candidate).contains(&arg))

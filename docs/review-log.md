@@ -530,3 +530,18 @@ Fixed:
 Deferred:
 - A test of the "Still loading" refusal needs a session; covered by
   reading, with the e2e for the loaded path.
+
+## Gate 10d — gate 10c fixes (`570ab43..24acd35`): PASS
+
+Fixed:
+- **`unreachable!` kept alive by an early return (low).** Member
+  completion is an arm of the match.
+
+Accepted:
+- **A failed reload leaves the pane's list in place (low).** Removal
+  refuses while it is stale; the only way a reload fails is the load task
+  itself failing, which is logged. A "couldn't refresh" note can come with
+  the settings/details work (milestone 11).
+- Test suggestions (case/space-alike names; comparing tags instead of
+  positions in the completion test) taken as nice-to-haves: identical
+  normalized names already exercise the alike path.

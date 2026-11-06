@@ -15,8 +15,8 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    Bounds, ClipboardItem, EventEmitter, FollowMode, KeyContext, ListAlignment, ListOffset,
-    ListState, Pixels, SharedString, canvas,
+    Bounds, ClipboardItem, EventEmitter, ExternalPaths, FollowMode, ImageSource, KeyContext,
+    ListAlignment, ListOffset, ListState, Pixels, SharedString, canvas, img,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
@@ -30,12 +30,13 @@ use gpui_kit::{
 use crate::actions::{
     AcceptRequest, CancelCompose, ClearCursor, CursorDown, CursorFirst, CursorLast, CursorUp,
     DeclineRequest, EditLastMessage, EditMessage, HalfPageDown, HalfPageUp, OpenLinks,
-    PickReaction, React, ReplyToMessage, ToggleDetails, YankMessage,
+    PickReaction, React, ReplyToMessage, SaveAttachment, ToggleDetails, YankMessage,
 };
 use crate::markdown::Block;
 use crate::model::{
-    ChatSummary, Message, MessageBody, MessageStatus, QUICK_REACTIONS, Quote, Reaction, Request,
-    format_day, format_message_time, move_cursor, starts_day, starts_group,
+    Attachment, AttachmentState, ChatSummary, Message, MessageBody, MessageStatus, QUICK_REACTIONS,
+    Quote, Reaction, Request, format_day, format_message_time, move_cursor, starts_day,
+    starts_group,
 };
 use crate::session::composer::{Composer, ComposerEvent};
 use crate::session::messages::{Messages, MessagesEvent};
@@ -53,7 +54,12 @@ const PAGE_AHEAD: usize = 10;
 pub enum ConversationEvent {
     /// The user submitted a non-empty message in the composer.
     Send(String),
+    /// Files were dropped on the open chat: send them.
+    Attach(Vec<std::path::PathBuf>),
 }
+
+/// The box an image preview is fitted into, in pixels.
+const MAX_IMAGE: (u32, u32) = (360, 270);
 
 pub struct Conversation {
     chat: Option<ChatSummary>,
@@ -405,7 +411,8 @@ impl Conversation {
     fn edit_message(&mut self, _: &EditMessage, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self
             .cursor_message(cx)
-            .filter(|m| m.own)
+            // Only text is edited; a file is sent anew.
+            .filter(|m| m.own && matches!(m.body, MessageBody::Text { .. }))
             .map(|m| m.id.clone())
         else {
             return;
@@ -522,8 +529,12 @@ impl Conversation {
 
     /// The message under the cursor, if it can take reactions.
     fn reactable<'a>(&self, cx: &'a App) -> Option<&'a Message> {
-        self.cursor_message(cx)
-            .filter(|message| matches!(message.body, MessageBody::Text { .. }))
+        self.cursor_message(cx).filter(|message| {
+            matches!(
+                message.body,
+                MessageBody::Text { .. } | MessageBody::Attachment(_)
+            )
+        })
     }
 
     fn pick_reaction(&mut self, _: &PickReaction, _: &mut Window, cx: &mut Context<Self>) {
@@ -611,6 +622,58 @@ impl Conversation {
         // Only on an explicit command, and only the body under the cursor.
         if let Some(message) = self.cursor_message(cx) {
             cx.write_to_clipboard(ClipboardItem::new_string(message.plain_text().to_string()));
+        }
+    }
+
+    /// Saves the file under the cursor to the downloads directory, or
+    /// retries its download if that failed.
+    fn save_attachment(&mut self, _: &SaveAttachment, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(message) = self.cursor_message(cx) else {
+            return;
+        };
+        let MessageBody::Attachment(attachment) = &message.body else {
+            return;
+        };
+        let Some(messages) = &self.messages else {
+            return;
+        };
+        let messages = messages.read(cx);
+        let refuse = |text: &str, window: &mut Window, cx: &mut App| {
+            crate::ui::show_refusal(text.into(), window, cx)
+        };
+        match attachment.state {
+            AttachmentState::DownloadFailed => {
+                let Some(retry) = messages.retry_download(&message.id, cx) else {
+                    return refuse("Files need an account", window, cx);
+                };
+                crate::ui::show_info("Downloading again".into(), window, cx);
+                cx.spawn_in(window, async move |_, cx| {
+                    if let Err(refusal) = retry.await {
+                        _ = cx.update(|window, cx| crate::ui::show_refusal(refusal, window, cx));
+                    }
+                })
+                .detach();
+            }
+            AttachmentState::Pending | AttachmentState::Downloading => {
+                refuse("Still downloading", window, cx)
+            }
+            AttachmentState::Gone => refuse("That file is no longer available", window, cx),
+            AttachmentState::Ready | AttachmentState::Uploading | AttachmentState::UploadFailed => {
+                let Some(save) = messages.save_attachment(&message.id, &attachment.name, cx) else {
+                    return refuse("Files need an account", window, cx);
+                };
+                cx.spawn_in(window, async move |_, cx| {
+                    let shown = match save.await {
+                        Ok(path) => Ok(format!("Saved to {}", path.display())),
+                        Err(refusal) => Err(refusal),
+                    };
+                    _ = cx.update(|window, cx| match shown {
+                        Ok(info) => crate::ui::show_info(info, window, cx),
+                        Err(refusal) => crate::ui::show_refusal(refusal, window, cx),
+                    });
+                })
+                .detach();
+            }
         }
     }
 
@@ -734,6 +797,7 @@ impl Conversation {
                 .opacity(0.8)
                 .child(text.clone())
                 .into_any_element(),
+            MessageBody::Attachment(attachment) => render_attachment(attachment, under_cursor),
         };
         let mut footer = format_message_time(message.sent_at);
         if message.edited {
@@ -971,7 +1035,14 @@ impl Render for Conversation {
         )
         .size_full();
 
+        let drop_target = theme.drop_target;
         root.bg(theme.background)
+            .when(chat.request.is_none(), |root| {
+                root.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_target))
+                    .on_drop(cx.listener(|_, paths: &ExternalPaths, _, cx| {
+                        cx.emit(ConversationEvent::Attach(paths.paths().to_vec()))
+                    }))
+            })
             .child(
                 h_flex()
                     .flex_none()
@@ -1035,6 +1106,7 @@ impl Render for Conversation {
                     .on_action(cx.listener(Self::reply))
                     .on_action(cx.listener(Self::pick_reaction))
                     .on_action(cx.listener(Self::react))
+                    .on_action(cx.listener(Self::save_attachment))
                     .flex_1()
                     .min_h_0()
                     .children(status)
@@ -1145,6 +1217,60 @@ fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElemen
 
 /// Reactions under a message: each kind once, with its count; the user's
 /// own outlined.
+/// A file as a card (name, size, what is happening to it), and an image's
+/// preview above it. The preview's size is known before it is drawn, so
+/// the list measures the message once.
+fn render_attachment(attachment: &Attachment, under_cursor: bool) -> AnyElement {
+    let state = match attachment.state {
+        AttachmentState::Uploading => "sending",
+        AttachmentState::UploadFailed => "not sent",
+        AttachmentState::Pending => "waiting to download",
+        AttachmentState::Downloading => "downloading",
+        AttachmentState::Ready => "",
+        AttachmentState::DownloadFailed => "download failed",
+        AttachmentState::Gone => "no longer available",
+    };
+    let hint = match attachment.state {
+        _ if !under_cursor => None,
+        AttachmentState::DownloadFailed => Some("s to retry"),
+        state if state.is_local() => Some("s to save"),
+        _ => None,
+    };
+    let details = [
+        crate::model::format_size(attachment.size),
+        state.to_string(),
+    ]
+    .into_iter()
+    .chain(hint.map(str::to_string))
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ");
+    v_flex()
+        .gap_1()
+        .children(attachment.image.as_ref().map(|picture| {
+            let (width, height) = crate::model::fit(picture.size(), MAX_IMAGE);
+            img(ImageSource::Render(picture.0.clone()))
+                .w(px(width as f32))
+                .h(px(height as f32))
+                .rounded_md()
+        }))
+        .child(
+            h_flex()
+                .gap_2()
+                .min_w_0()
+                .child(div().flex_none().child("📎"))
+                .child(div().min_w_0().truncate().child(attachment.name.clone())),
+        )
+        .children(
+            attachment
+                .description
+                .clone()
+                .map(|description| div().text_sm().child(description)),
+        )
+        .child(div().text_xs().opacity(0.8).child(details))
+        .into_any_element()
+}
+
 fn render_reactions(reactions: &[Reaction], more: usize, cx: &App) -> AnyElement {
     let theme = cx.theme();
     h_flex()

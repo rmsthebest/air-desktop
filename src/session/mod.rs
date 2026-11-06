@@ -4,6 +4,7 @@
 
 pub mod account;
 pub mod alerts;
+mod attachments;
 pub mod chats;
 pub mod composer;
 mod contacts;
@@ -84,6 +85,7 @@ pub struct Session {
     _usernames: TokioTask<()>,
     _drafts: TokioTask<()>,
     _forward: TokioTask<()>,
+    _downloads: TokioTask<()>,
     _receive: [Task<()>; 3],
 }
 
@@ -131,6 +133,7 @@ impl Session {
             let overflowed = Arc::new(AtomicBool::new(false));
             // Subscribe before anything runs, so no change is missed.
             let mut notifications = user.db_notifications();
+            let previews_tx = changes_tx.clone();
             let forward = Tokio::spawn(cx, {
                 let overflowed = overflowed.clone();
                 async move {
@@ -144,6 +147,18 @@ impl Session {
                         }
                     }
                 }
+            });
+
+            // Previews made after a download reach the views like any
+            // other change.
+            let downloads = Tokio::spawn(cx, {
+                let overflowed = overflowed.clone();
+                attachments::download_all(user.clone(), move |id| {
+                    let full = previews_tx.try_send(attachments::previewed(id));
+                    if let Err(mpsc::error::TrySendError::Full(_)) = full {
+                        overflowed.store(true, Ordering::Relaxed);
+                    }
+                })
             });
 
             let (usernames_tx, mut usernames_rx) = watch::channel(Vec::new());
@@ -192,6 +207,7 @@ impl Session {
                 user,
                 _queue: queue,
                 _forward: forward,
+                _downloads: downloads,
                 _receive: receive,
             };
             session.reload_profile(cx);

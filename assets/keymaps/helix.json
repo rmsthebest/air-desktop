@@ -6,6 +6,7 @@
       "space n": "air::AddContact",
       "space g": "air::NewGroup",
       "space i": "air::InviteToGroup",
+      "space u": "air::AttachFile",
       "space ?": "air::OpenPalette",
       "space t": "air::PickTheme",
       "space d": "air::ToggleDetails",

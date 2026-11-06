@@ -19,8 +19,8 @@ use super::chats::{self, Update};
 use super::contacts::{self, Failure};
 use super::pending::Pending;
 use super::queue::{self, ConnectionStatus, QueueEvent};
-use super::{composer, groups, messages};
-use crate::model::{Message, MessageStatus, Quote};
+use super::{attachments, composer, groups, messages};
+use crate::model::{AttachmentState, Message, MessageBody, MessageStatus, Quote};
 use crate::settings::Notifications;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::clients::store::{ClientRecord, ClientRecordState};
@@ -461,8 +461,8 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     .await;
 
     // Messages go both ways, named by their sender.
-    let (_ada_worker, mut ada_updates) = open_messages(&ada, ada_chat);
-    let (_bob_worker, mut bob_updates) = open_messages(&bob, bob_chat);
+    let (_ada_worker, mut ada_updates, _) = open_messages(&ada, ada_chat);
+    let (_bob_worker, mut bob_updates, bob_pending) = open_messages(&bob, bob_chat);
     let sent = composer::send(&bob, bob_chat, "hi ada".into(), None).await;
     assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
     let got = next_message(&mut ada_updates, |m| m.plain_text() == "hi ada").await;
@@ -583,6 +583,76 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     let elsewhere = aircoreclient::MessageId::new(uuid::Uuid::new_v4());
     assert!(refused(
         messages::set_reaction(&ada, ada_chat, elsewhere, "👍".into(), true).await
+    ));
+
+    // Ada sends a file and an image. Her own image shows its preview at
+    // once; Bob's device downloads both and makes the image's preview.
+    let files = tempfile::tempdir().unwrap();
+    let notes = files.path().join("notes.txt");
+    std::fs::write(&notes, "attached").unwrap();
+    let photo = files.path().join("photo.png");
+    image::RgbaImage::from_pixel(40, 30, image::Rgba([200, 0, 0, 255]))
+        .save(&photo)
+        .unwrap();
+    let attachment = |m: &Message| match &m.body {
+        MessageBody::Attachment(attachment) => Some(attachment.clone()),
+        _ => None,
+    };
+    attachments::send(ada.clone(), ada_chat, notes)
+        .await
+        .unwrap();
+    attachments::send(ada.clone(), ada_chat, photo)
+        .await
+        .unwrap();
+    assert!(refused(
+        attachments::send(ada.clone(), ada_chat, files.path().to_path_buf()).await
+    ));
+    next_message(&mut ada_updates, |m| {
+        attachment(m).is_some_and(|a| a.image.is_some())
+    })
+    .await;
+    let _downloads = Aborting(tokio::spawn(attachments::download_all(
+        bob.clone(),
+        move |id| bob_pending.add(&[attachments::previewed(id)], false),
+    )));
+    // The uploads race: either may land first.
+    let (mut file, mut picture) = (None, None);
+    while file.is_none() || picture.is_none() {
+        let message = next_message(&mut bob_updates, |m| {
+            attachment(m).is_some_and(|a| a.state == AttachmentState::Ready)
+        })
+        .await;
+        let got = attachment(&message).unwrap();
+        match got.image {
+            Some(image) => picture = Some(image),
+            None if got.name == "notes.txt" => file = Some(message),
+            None => {}
+        }
+    }
+    let (file, picture) = (file.unwrap(), picture.unwrap());
+    assert_eq!(picture.size(), (40, 30));
+    // Saving copies the file, never over another; only this chat's files.
+    let downloads = files.path().join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let file_id = messages::core_message_id(&file.id).unwrap();
+    for expected in ["notes.txt", "notes (2).txt"] {
+        let saved = attachments::save(
+            bob.clone(),
+            bob_chat,
+            file_id,
+            "notes.txt".into(),
+            downloads.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved, downloads.join(expected));
+        assert_eq!(std::fs::read(&saved).unwrap(), b"attached");
+    }
+    let elsewhere = aircoreclient::ChatId {
+        uuid: uuid::Uuid::new_v4(),
+    };
+    assert!(refused(
+        attachments::save(bob.clone(), elsewhere, file_id, "x".into(), downloads).await
     ));
 
     // Bob's rename reaches the messages Ada already has from him.
@@ -791,7 +861,11 @@ fn notice_chat(notice: &Notice) -> Option<aircoreclient::ChatId> {
 fn open_messages(
     user: &CoreUser,
     chat: aircoreclient::ChatId,
-) -> ([Aborting; 2], mpsc::Receiver<messages::Update>) {
+) -> (
+    [Aborting; 2],
+    mpsc::Receiver<messages::Update>,
+    Arc<Pending>,
+) {
     let pending = Arc::new(Pending::default());
     let mut notifications = user.db_notifications();
     let forward = tokio::spawn({
@@ -803,8 +877,8 @@ fn open_messages(
             }
         }
     });
-    let (worker, updates) = messages::start(user.clone(), chat, pending);
-    ([Aborting(forward), Aborting(worker)], updates)
+    let (worker, updates) = messages::start(user.clone(), chat, pending.clone());
+    ([Aborting(forward), Aborting(worker)], updates, pending)
 }
 
 struct Aborting(tokio::task::JoinHandle<()>);

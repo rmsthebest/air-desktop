@@ -10,11 +10,13 @@ use gpui_kit::{
     Task, Window, div, px,
 };
 
+use std::path::PathBuf;
+
 use crate::actions::{
-    self, AcceptRequest, AddContact, DeclineRequest, FindChat, FocusChatList, FocusComposer,
-    FocusConversation, FocusMessages, FocusNextPane, InviteToGroup, JumpBack, JumpForward,
-    NewGroup, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette, PickTheme,
-    PrevChat, PrevUnreadChat, SelectFirst, SelectLast, ShowShortcuts, ToggleAppearance,
+    self, AcceptRequest, AddContact, AttachFile, DeclineRequest, FindChat, FocusChatList,
+    FocusComposer, FocusConversation, FocusMessages, FocusNextPane, InviteToGroup, JumpBack,
+    JumpForward, NewGroup, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette,
+    PickTheme, PrevChat, PrevUnreadChat, SelectFirst, SelectLast, ShowShortcuts, ToggleAppearance,
     ToggleDetails, ToggleHelixMode,
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
@@ -128,6 +130,7 @@ impl Workspace {
                 window,
                 |this, _, event, window, cx| match event {
                     ConversationEvent::Send(text) => this.send(text.clone(), window, cx),
+                    ConversationEvent::Attach(paths) => this.attach(paths.clone(), window, cx),
                 },
             ),
             // Redraw the status line and which-key popup as keys are typed.
@@ -369,6 +372,74 @@ impl Workspace {
         }
     }
 
+    /// Picks files to send to the open chat with the system's file dialog.
+    fn attach_file(&mut self, _: &AttachFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sendable_chat(window, cx).is_none() {
+            return;
+        }
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Send".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let paths = match picked.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(None)) | Err(_) => return,
+                Ok(Err(_)) => {
+                    _ = cx.update(|window, cx| {
+                        show_refusal(
+                            "Couldn't open a file dialog; use :attach".into(),
+                            window,
+                            cx,
+                        )
+                    });
+                    return;
+                }
+            };
+            _ = this.update_in(cx, |this, window, cx| this.attach(paths, window, cx));
+        })
+        .detach();
+    }
+
+    /// The open chat, if files and messages can go to it.
+    fn sendable_chat(&self, window: &mut Window, cx: &mut App) -> Option<ChatId> {
+        let list = self.chat_list.read(cx);
+        let chat = list.selected_index().map(|ix| &list.chats()[ix]);
+        match chat {
+            Some(chat) if chat.request.is_none() => Some(chat.id.clone()),
+            Some(_) => {
+                show_refusal("Accept the contact request first".into(), window, cx);
+                None
+            }
+            None => {
+                show_refusal("Open a chat first".into(), window, cx);
+                None
+            }
+        }
+    }
+
+    /// Sends each file to the open chat.
+    fn attach(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.sendable_chat(window, cx) else {
+            return;
+        };
+        let Some(session) = &self.session else {
+            show_refusal("That needs an account".into(), window, cx);
+            return;
+        };
+        for path in paths {
+            let send = session.read(cx).send_attachment(&chat, path, cx);
+            cx.spawn_in(window, async move |_, cx| {
+                if let Err(refusal) = send.await {
+                    _ = cx.update(|window, cx| show_refusal(refusal, window, cx));
+                }
+            })
+            .detach();
+        }
+    }
+
     /// Opens the command line with `initial` typed.
     fn prompt(&mut self, initial: &str, window: &mut Window, cx: &mut Context<Self>) {
         let chats = self.chats(cx);
@@ -526,6 +597,10 @@ impl Workspace {
                     window,
                     cx,
                 );
+            }
+            Command::Attach(path) => {
+                let path = expand_home(&path);
+                self.attach(vec![path], window, cx);
             }
             Command::Rename(title) => {
                 let Some(chat) = self.open_group(window, cx) else {
@@ -831,6 +906,18 @@ impl Workspace {
 
 /// `(remaining keys, label)` for every binding that continues the pending
 /// prefix, skipping unbound (`null`) entries.
+/// A typed path with a leading `~` meaning the home directory.
+fn expand_home(path: &str) -> PathBuf {
+    let home = || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match home() {
+            Some(home) => home.join(rest.trim_start_matches('/')),
+            None => PathBuf::from(path),
+        },
+        _ => PathBuf::from(path),
+    }
+}
+
 fn which_key_rows(window: &Window, os: OperatingSystem) -> Vec<(String, String)> {
     let Some(pending) = window.pending_input_keystrokes() else {
         return Vec::new();
@@ -924,6 +1011,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_command_line))
             .on_action(cx.listener(Self::add_contact))
             .on_action(cx.listener(Self::new_group))
+            .on_action(cx.listener(Self::attach_file))
             .on_action(cx.listener(Self::invite_to_group))
             .on_action(cx.listener(Self::accept_request))
             .on_action(cx.listener(Self::decline_request))

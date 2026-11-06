@@ -23,6 +23,10 @@ anyhow = "1"
 mimi-room-policy = { git = "https://github.com/phnx-im/mimi-room-policy", rev = "603f3e07372119560ce9d60252e5df2f6cbd1e18" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 directories = "6"
+futures-util = "0.3"
+# Attachment previews (WebP) are decoded here, under explicit limits, into
+# the frames gpui draws: gpui's own decoding has none. Same copy as gpui's.
+image = { version = "0.25", default-features = false, features = ["webp"] }
 # Air's markdown flavour; previews are flattened from it.
 pulldown-cmark = { version = "0.13", default-features = false }
 # Must match gpui's schemars major: the Action derive implements its trait.

@@ -13,8 +13,8 @@ use aircommon::utils::FibonacciBackoff;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::{DbEntityId, DbOperation};
 use aircoreclient::{
-    ChatId as CoreChatId, ChatMessage, EventMessage, Message as CoreMessage,
-    MessageId as CoreMessageId, ReadReceiptsSetting,
+    AttachmentId as CoreAttachmentId, ChatId as CoreChatId, ChatMessage, EventMessage,
+    Message as CoreMessage, MessageId as CoreMessageId, ReadReceiptsSetting,
 };
 use chrono::{DateTime, Utc};
 use gpui::{EventEmitter, SharedString};
@@ -25,8 +25,11 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::markdown;
-use crate::model::{ChatId, Message, MessageBody, MessageId, MessageStatus, Quote, UserId};
+use crate::model::{
+    ChatId, Message, MessageBody, MessageId, MessageStatus, Picture, Quote, UserId,
+};
 use crate::runtime::{Tokio, TokioTask};
+use crate::session::attachments;
 use crate::session::contacts::{Failure, on_tokio};
 use crate::session::pending::{Changes, Pending};
 use crate::session::preview::{Body, body_of, quote_line};
@@ -149,6 +152,7 @@ impl Messages {
             chat,
             window: Window::default(),
             names: HashMap::new(),
+            pictures: HashMap::new(),
             tx: updates_tx,
         };
         let live = Live {
@@ -163,6 +167,15 @@ impl Messages {
             tokio: Tokio::handle(cx),
             _subscription: subscription,
         };
+        // Drawn images live on the GPU until dropped.
+        cx.on_release(|this: &mut Self, cx| {
+            for message in &this.messages {
+                if let Some(picture) = picture_of(message) {
+                    cx.drop_image(picture.0.clone(), None);
+                }
+            }
+        })
+        .detach();
         Self {
             loaded: false,
             live: Some(live),
@@ -287,6 +300,43 @@ impl Messages {
         }))
     }
 
+    /// Saves a copy of the message's file in the downloads directory.
+    /// Returns where. `None` for fixed messages (no account).
+    pub fn save_attachment(
+        &self,
+        id: &MessageId,
+        name: &str,
+        cx: &App,
+    ) -> Option<impl Future<Output = Result<std::path::PathBuf, String>> + use<>> {
+        let live = self.live.as_ref()?;
+        let (user, chat, id) = (live.user.clone(), live.chat, core_message_id(id));
+        let name = name.to_string();
+        Some(on_tokio(cx, "save the file", async move {
+            let id = id.ok_or_else(|| Failure::Shown("That message has no file".into()))?;
+            let dir = attachments::downloads_dir()
+                .ok_or_else(|| Failure::Shown("No downloads directory to save to".into()))?;
+            attachments::save(user, chat, id, name, dir).await
+        }))
+    }
+
+    /// Downloads the message's file again after a failure.
+    pub fn retry_download(
+        &self,
+        id: &MessageId,
+        cx: &App,
+    ) -> Option<impl Future<Output = Result<(), String>> + use<>> {
+        let live = self.live.as_ref()?;
+        let (user, chat, id) = (live.user.clone(), live.chat, core_message_id(id));
+        let pending = live.pending.clone();
+        Some(on_tokio(cx, "download the file", async move {
+            let id = id.ok_or_else(|| Failure::Shown("That message has no file".into()))?;
+            let attachment = attachments::retry(user, chat, id).await?;
+            // The core doesn't report the content landing.
+            pending.add(&[attachments::previewed(attachment)], false);
+            Ok(())
+        }))
+    }
+
     /// Appends a message locally (the mock echo of a send).
     pub fn push(&mut self, message: Message, cx: &mut Context<Self>) {
         // The worker owns a live window: a local insert would desync it.
@@ -307,9 +357,26 @@ impl Messages {
                 // While newer messages are still unloaded, anything that
                 // arrives already existed.
                 let paged = self.has_newer;
+                let before: HashMap<_, _> = self
+                    .messages
+                    .iter()
+                    .filter_map(picture_of)
+                    .map(|picture| (picture.0.id, picture.clone()))
+                    .collect();
                 for change in window.changes {
                     let (old, count) = change.apply(&mut self.messages);
                     cx.emit(MessagesEvent::Spliced { old, count, paged });
+                }
+                let after: std::collections::HashSet<_> = self
+                    .messages
+                    .iter()
+                    .filter_map(picture_of)
+                    .map(|picture| picture.0.id)
+                    .collect();
+                for (id, picture) in before {
+                    if !after.contains(&id) {
+                        cx.drop_image(picture.0, None);
+                    }
                 }
                 self.has_older = window.has_older;
                 self.has_newer = window.has_newer;
@@ -331,6 +398,13 @@ impl Messages {
         self.loading_older = false;
         self.loading_newer = false;
         cx.notify();
+    }
+}
+
+fn picture_of(message: &Message) -> Option<&Picture> {
+    match &message.body {
+        MessageBody::Attachment(attachment) => attachment.image.as_ref(),
+        _ => None,
     }
 }
 
@@ -475,6 +549,8 @@ struct Key {
     /// The quoted message's MIMI id while it isn't here, to pick it up
     /// when it arrives.
     awaits: Option<MimiId>,
+    /// Its attachment, to refresh it as the download goes.
+    attachment: Option<CoreAttachmentId>,
 }
 
 /// The loaded window's bookkeeping: what the view shows, as keys. Each
@@ -569,6 +645,9 @@ struct Worker {
     window: Window,
     /// Display names shown in the window; dropped when the user changes.
     names: HashMap<CoreUserId, SharedString>,
+    /// Decoded previews shown in the window, so a reload (a reaction, a
+    /// status change) doesn't decode again.
+    pictures: HashMap<CoreAttachmentId, Picture>,
     tx: mpsc::Sender<Update>,
 }
 
@@ -589,6 +668,7 @@ pub(super) fn start(
         chat,
         window: Window::default(),
         names: HashMap::new(),
+        pictures: HashMap::new(),
         tx,
     };
     let task = tokio::spawn(async move {
@@ -627,11 +707,18 @@ impl Worker {
     }
 
     async fn send(
-        &self,
+        &mut self,
         changes: Vec<Change<Message>>,
         first_unread: Option<Option<MessageId>>,
         scroll_to_bottom: bool,
     ) -> Result<(), Closed> {
+        let shown: std::collections::HashSet<_> = self
+            .window
+            .keys
+            .iter()
+            .filter_map(|key| key.attachment)
+            .collect();
+        self.pictures.retain(|id, _| shown.contains(id));
         let update = Update::Window(WindowUpdate {
             changes,
             has_older: self.window.has_older,
@@ -748,6 +835,7 @@ impl Worker {
         let mut own_new_message = false;
         let mut renamed = Vec::new();
         let mut arrived = Vec::new();
+        let mut attachments_changed = Vec::new();
         for (entity, ops) in &changes.merged.ops {
             match entity {
                 DbEntityId::Message(id) if ops.contains(DbOperation::Remove) => {
@@ -780,12 +868,17 @@ impl Worker {
                 DbEntityId::User(user) if self.names.remove(user).is_some() => {
                     renamed.push(user.clone());
                 }
+                DbEntityId::Attachment(id) => {
+                    self.pictures.remove(id);
+                    attachments_changed.push(*id);
+                }
                 _ => {}
             }
         }
         for user in renamed {
             edits.extend(self.reload_from(&user).await);
         }
+        edits.extend(self.reload_with(&attachments_changed).await);
         // Replies show their original: refresh them when it changes.
         let changed: Vec<_> = changes
             .merged
@@ -836,6 +929,29 @@ impl Worker {
                 }
                 Ok(None) => {}
                 Err(err) => error!("failed to reload a reply: {err:#}"),
+            }
+        }
+        edits
+    }
+
+    /// Reloads the messages showing any of `attachments`.
+    async fn reload_with(&mut self, attachments: &[CoreAttachmentId]) -> Vec<Change<Message>> {
+        let ids: Vec<_> = self
+            .window
+            .keys
+            .iter()
+            .filter(|key| key.attachment.is_some_and(|id| attachments.contains(&id)))
+            .map(|key| key.id)
+            .collect();
+        let mut edits = Vec::new();
+        for id in ids {
+            match self.user.message(id).await {
+                Ok(Some(message)) => {
+                    let (key, item) = self.convert(message).await;
+                    edits.extend(self.window.patch(key, item));
+                }
+                Ok(None) => {}
+                Err(err) => error!("failed to reload a message: {err:#}"),
             }
         }
         edits
@@ -898,8 +1014,7 @@ impl Worker {
     }
 
     /// Turns a stored message into what the view shows. Port of
-    /// `UiChatMessage::from_message`, minus what isn't shown yet
-    /// (attachments).
+    /// `UiChatMessage::from_message`.
     async fn convert(&mut self, message: ChatMessage) -> (Key, Message) {
         let sender = message.message().actor().cloned();
         let sender_name = match &sender {
@@ -918,6 +1033,7 @@ impl Worker {
             _ if !message.is_sent() => MessageStatus::Sending,
             _ => MessageStatus::Sent,
         };
+        let mut attachment = None;
         let body = if deleted {
             MessageBody::Notice("Message deleted".into())
         } else if message.status() == CoreStatus::Hidden {
@@ -929,9 +1045,24 @@ impl Worker {
                         markdown: Arc::new(markdown::parse(&source)),
                         source: source.into(),
                     },
-                    Body::Attachment => {
-                        MessageBody::Notice("Attachments aren't supported yet".into())
-                    }
+                    Body::Attachment => match attachments::declared(content.content()) {
+                        Some(declared) => {
+                            let cached = |id| self.pictures.get(&id).cloned();
+                            match attachments::load(&self.user, message.id(), declared, cached)
+                                .await
+                            {
+                                Some((id, shown)) => {
+                                    attachment = Some(id);
+                                    if let Some(picture) = &shown.image {
+                                        self.pictures.insert(id, picture.clone());
+                                    }
+                                    MessageBody::Attachment(shown)
+                                }
+                                None => MessageBody::Notice("File not found".into()),
+                            }
+                        }
+                        None => MessageBody::Notice("Unsupported attachment".into()),
+                    },
                     Body::Unsupported => MessageBody::Notice("Unsupported message".into()),
                 },
                 CoreMessage::Event(event @ EventMessage::System(_)) => {
@@ -979,17 +1110,18 @@ impl Worker {
             _ => (None, None, None),
         };
         // A deleted or hidden message's reactions aren't shown either.
-        let (reactions, more_reactions) = if matches!(body, MessageBody::Text { .. }) {
-            crate::model::reactions(
-                message
-                    .reactions()
-                    .iter()
-                    .map(|(emoji, users)| (emoji.as_str(), users.as_slice())),
-                self.user.user_id(),
-            )
-        } else {
-            (Vec::new(), 0)
-        };
+        let (reactions, more_reactions) =
+            if matches!(body, MessageBody::Text { .. } | MessageBody::Attachment(_)) {
+                crate::model::reactions(
+                    message
+                        .reactions()
+                        .iter()
+                        .map(|(emoji, users)| (emoji.as_str(), users.as_slice())),
+                    self.user.user_id(),
+                )
+            } else {
+                (Vec::new(), 0)
+            };
         let edited = match message.message() {
             CoreMessage::Content(content) => content.edited_at().is_some(),
             CoreMessage::Event(_) => false,
@@ -1004,6 +1136,7 @@ impl Worker {
                 Some((mimi_id, None)) => Some(*mimi_id),
                 _ => None,
             },
+            attachment,
         };
         let item = Message {
             id: model_message_id(message.id()),
@@ -1062,6 +1195,7 @@ mod tests {
             quoted: None,
             quotes: None,
             awaits: None,
+            attachment: None,
         }
     }
 

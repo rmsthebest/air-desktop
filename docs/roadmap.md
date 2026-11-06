@@ -9,9 +9,11 @@ milestones. Each one ends with a review gate (see CLAUDE.md).
    in the details pane. Keyboard and `:` commands for each.
 9. **Reactions** (done). Show reactions under messages, and add or retract one
    from the keyboard (quick picker on the message cursor).
-10. **Attachments and images.** Show and download received files and
-    images (size caps, no automatic fetches beyond what the core does).
-    Send files from a picker or by drag and drop.
+10. **Attachments and images** (done). Show and download received files
+    and images (size caps, no automatic fetches beyond what the core does).
+    Send files from a picker or by drag and drop. Downloads are automatic,
+    as in upstream's app (only from Air's own storage, nothing third-party);
+    retrying a failed upload is left for later.
 11. **Settings screen.** A view for theme, appearance, keymap,
     notifications, display name and usernames, next to the commands.
 12. **Notification actions.** Clicking a notification opens its chat and

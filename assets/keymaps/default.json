@@ -20,6 +20,7 @@
       "secondary-i": "air::ToggleDetails",
       "secondary-n": "air::AddContact",
       "secondary-shift-n": "air::NewGroup",
+      "secondary-o": "air::AttachFile",
       "secondary-enter": "air::AcceptRequest",
       "secondary-shift-backspace": "air::DeclineRequest",
       "secondary-shift-t": "air::ToggleAppearance",
@@ -57,7 +58,8 @@
       "enter": "air::OpenLinks",
       "e": "air::EditMessage",
       "r": "air::ReplyToMessage",
-      "+": "air::PickReaction"
+      "+": "air::PickReaction",
+      "s": "air::SaveAttachment"
     }
   },
   {

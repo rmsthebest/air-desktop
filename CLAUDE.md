@@ -84,6 +84,22 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     The self chat is a group in the core but never one here
     (`is_group` false, operations refuse it). Invites need the contact's
     `encrypted_group_profiles` feature, as upstream.
+  - `attachments.rs`: port of upstream's `attachments_repository`. The
+    session's `download_all` downloads pending attachments (5 at once,
+    resumed after restarts) and makes an image's thumbnail in the core,
+    then reports the attachment changed itself (the core doesn't notify
+    for thumbnails). Images are drawn only from the core's thumbnail, or
+    the original where the core says it fits (≤ 8 MiB), decoded by us as
+    WebP under limits (1024² edge, 16 MiB) into a gpui `RenderImage`:
+    never a failed thumbnail's original, never undecoded bytes. The
+    message worker caches decoded pictures per attachment; the `Messages`
+    entity drops a picture's GPU texture when it leaves the window.
+    Files are never opened: `s` on one saves a copy to the downloads
+    directory under `model::file_name` (one component, not hidden,
+    bounded), never replacing a file (`create_new`, numbered), 0600.
+    Save and retry check the message is in the open chat. Sending:
+    `:attach <path>`, the file dialog (`AttachFile`) or dropping files on
+    the chat.
   - `alerts.rs`: desktop notifications ("alerts"; database notifications
     are the core's). Port of upstream `notifications/` + `NotificationPolicy`:
     the queue and username listeners hand over what processing stored; at

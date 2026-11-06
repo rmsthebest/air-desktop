@@ -271,6 +271,150 @@ pub enum MessageBody {
     Event(SharedString),
     /// Stands in for content that can't be shown (deleted, hidden…).
     Notice(SharedString),
+    /// A file or image. Its name and description are peer-chosen.
+    Attachment(Attachment),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttachmentId(pub uuid::Uuid);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    pub id: AttachmentId,
+    /// The sender's file name as one bounded line ("file" if blank).
+    pub name: SharedString,
+    pub description: Option<SharedString>,
+    /// As the sender declared it.
+    pub size: u64,
+    pub state: AttachmentState,
+    /// Only ever a preview the core made (or checked) and we decoded under
+    /// size limits; never the received file itself, undecoded.
+    pub image: Option<Picture>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentState {
+    Uploading,
+    UploadFailed,
+    Pending,
+    Downloading,
+    Ready,
+    DownloadFailed,
+    /// The server no longer has it.
+    Gone,
+}
+
+impl AttachmentState {
+    /// The file's bytes are on this device.
+    pub fn is_local(self) -> bool {
+        matches!(self, Self::Ready | Self::Uploading | Self::UploadFailed)
+    }
+}
+
+/// A decoded image, ready for the GPU.
+#[derive(Clone)]
+pub struct Picture(pub Arc<gpui_kit::RenderImage>);
+
+impl Picture {
+    pub fn size(&self) -> (u32, u32) {
+        let size = self.0.size(0);
+        (size.width.0 as u32, size.height.0 as u32)
+    }
+}
+
+impl PartialEq for Picture {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
+    }
+}
+
+impl std::fmt::Debug for Picture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (width, height) = self.size();
+        write!(f, "Picture({width}x{height})")
+    }
+}
+
+/// An image's size on screen: fit into `max` keeping its aspect ratio,
+/// never scaled up, never collapsing to nothing.
+pub fn fit(size: (u32, u32), max: (u32, u32)) -> (u32, u32) {
+    let (width, height) = (size.0.max(1) as f64, size.1.max(1) as f64);
+    let scale = (max.0 as f64 / width).min(max.1 as f64 / height).min(1.0);
+    let edge = |e: f64| ((e * scale).round() as u32).max(1);
+    (edge(width), edge(height))
+}
+
+/// "3 B", "1.5 KB", "12 MB": decimal units, one decimal below ten.
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1000.0;
+    let mut unit = 0;
+    while value >= 999.95 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if value < 9.95 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// Longest file name saved, in bytes (most file systems allow 255).
+const MAX_FILE_NAME: usize = 200;
+
+/// A peer-chosen file name made safe to save under: one plain component
+/// (no separators, no `..`, not hidden), no control or invisible
+/// characters, bounded, keeping a short extension when cut.
+pub fn file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_whitespace() => ' ',
+            c => c,
+        })
+        .filter(|c| !is_invisible(*c))
+        .collect();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Leading dots would hide the file (or make it `..`); trailing dots
+    // and spaces are dropped by some systems, changing the name.
+    let cleaned = cleaned
+        .trim_start_matches(['.', ' '])
+        .trim_end_matches(['.', ' ']);
+    if cleaned.is_empty() {
+        return "attachment".into();
+    }
+    if cleaned.len() <= MAX_FILE_NAME {
+        return cleaned.into();
+    }
+    let extension = cleaned
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| extension.len() <= 16)
+        .unwrap_or("");
+    let room = MAX_FILE_NAME - extension.len() - 1;
+    let mut cut = room;
+    while !cleaned.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let stem = cleaned[..cut].trim_end_matches(['.', ' ']);
+    if extension.is_empty() {
+        stem.into()
+    } else {
+        format!("{stem}.{extension}")
+    }
+}
+
+/// The `n`th alternative to a taken file name: "a.txt" → "a (2).txt".
+pub fn numbered_file_name(name: &str, n: usize) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => format!("{stem} ({n}).{extension}"),
+        _ => format!("{name} ({n})"),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +457,7 @@ impl Message {
         match &self.body {
             MessageBody::Text { source, .. } => source.clone(),
             MessageBody::Event(text) | MessageBody::Notice(text) => text.clone(),
+            MessageBody::Attachment(attachment) => attachment.name.clone(),
         }
     }
 
@@ -620,6 +765,17 @@ pub mod mock {
                 ..msg(false, "Ctrl+K to jump between chats is my favourite.", 7)
             },
             msg(false, "The engine can compose music too.", 3),
+            Message {
+                body: MessageBody::Attachment(Attachment {
+                    id: AttachmentId(uuid::Uuid::nil()),
+                    name: "notes-on-the-engine.pdf".into(),
+                    description: None,
+                    size: 248_000,
+                    state: AttachmentState::Ready,
+                    image: None,
+                }),
+                ..msg(false, "", 2)
+            },
         ]
     }
 }
@@ -908,5 +1064,28 @@ mod tests {
         // Bidi overrides and zero-width chars can't become the initial.
         assert_eq!(initials("\u{202E}mallory \u{200B}eve"), "ME");
         assert_eq!(initials("\u{202E}\u{200B}"), "");
+    }
+
+    #[test]
+    fn saved_names_are_one_bounded_component_keeping_the_extension() {
+        assert_eq!(file_name("report.pdf"), "report.pdf");
+        assert_eq!(file_name("../../.ssh/id"), "_.._.ssh_id");
+        assert_eq!(file_name("..."), "attachment");
+        assert_eq!(file_name("\u{202E}\u{200B} "), "attachment");
+        assert_eq!(file_name("C:\\x\ny"), "C__x y");
+        let long = format!("{}.tar.gz", "ä".repeat(300));
+        let cut = file_name(&long);
+        assert!(cut.len() <= MAX_FILE_NAME, "{}", cut.len());
+        assert!(cut.ends_with("ä.gz"), "{cut}");
+        assert_eq!(numbered_file_name("a.tar.gz", 2), "a.tar (2).gz");
+        assert_eq!(numbered_file_name("README", 3), "README (3)");
+    }
+
+    #[test]
+    fn previews_fit_their_box_without_growing() {
+        assert_eq!(fit((1024, 512), (360, 270)), (360, 180));
+        assert_eq!(fit((100, 1000), (360, 270)), (27, 270));
+        assert_eq!(fit((20, 10), (360, 270)), (20, 10));
+        assert_eq!(fit((4000, 1), (360, 270)), (360, 1));
     }
 }

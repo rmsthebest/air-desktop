@@ -369,12 +369,6 @@ async fn make_preview(user: &CoreUser, id: AttachmentId, declared_image: bool) {
     }
     let bytes = match user.load_attachment(id).await {
         Ok(AttachmentContent::Ready(bytes)) if declared_image || is_webp(&bytes) => bytes,
-        // An own image whose thumbnail failed when sent: tried once too.
-        Ok(AttachmentContent::Uploading(bytes) | AttachmentContent::UploadFailed(bytes))
-            if declared_image =>
-        {
-            bytes
-        }
         Ok(_) => return,
         Err(err) => {
             error!("failed to load a downloaded attachment: {err:#}");
@@ -426,6 +420,10 @@ pub(super) async fn retry(
         // Done meanwhile: reported all the same, so the view catches up.
         Downloaded::NotNeeded => match user.attachment_status(id).await? {
             Some(AttachmentStatus::Ready) => Ok(id),
+            // Left so by a quit mid-download: the loop resets it.
+            Some(AttachmentStatus::Downloading) => {
+                Err(Failure::Shown("Already downloading".into()))
+            }
             _ => Err(Failure::Shown("That file can't be downloaded".into())),
         },
         Downloaded::Busy => Err(Failure::Shown("Already downloading".into())),

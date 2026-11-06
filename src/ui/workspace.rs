@@ -405,12 +405,11 @@ impl Workspace {
             _ = this.update_in(cx, |this, window, cx| {
                 match this.sendable_chat(window, cx) {
                     Some(open) if open == chat => this.attach(chat, paths, window, cx),
-                    Some(_) => show_refusal(
+                    _ => show_refusal(
                         "Another chat was opened meanwhile; nothing was sent".into(),
                         window,
                         cx,
                     ),
-                    None => {}
                 }
             });
         })

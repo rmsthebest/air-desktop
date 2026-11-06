@@ -642,10 +642,9 @@ file, as above), not off it.
 
 ## Gate 12c — gate 12b fixes (`69a351b..286d1f8`): PASS
 
-Fixed (all low):
+Fixed in `6c68979` (all low):
 - Only declared images wait for a preview slot, and freed slots go
   newest first.
-- An own image whose thumbnail failed when sent is tried once too.
 - The file dialog sends to the chat open when it was opened; if another
   chat was opened meanwhile, nothing is sent and the user is told.
 - `s` on a file the core can't download says so.
@@ -657,3 +656,16 @@ Deferred:
   with undecodable bytes is read only once.
 - A test that a confirmed drop goes to the chat the dialog named needs a
   session seam in the workspace tests.
+
+## Gate 12d — gate 12c fixes (`286d1f8..6c68979`): PASS
+
+Fixed (all low): an unreachable branch removed (the core refuses an
+image it can't decode at upload, and stores its thumbnail with it); `s`
+on a download left mid-way by a quit says "Already downloading"; a file
+dialog answered after the chat changed or closed always tells the user.
+
+Accepted: a WebP not declared an image that misses a preview slot stays
+a file card (fails closed).
+
+Deferred: tests for `retry` per status and for a file dialog answered
+after the chat changed (need a core-backed seam in workspace tests).

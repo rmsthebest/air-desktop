@@ -162,7 +162,9 @@ struct Notifier<D> {
     /// The notification last clicked. Servers close it right after, as if
     /// dismissed; that close marks nothing: a click opens one chat, and
     /// the others of a shared one still have activity to alert.
-    clicked: Option<u32>,
+    /// With the newest `seq` it showed then: what was shown in it after
+    /// the click is still the user's to dismiss.
+    clicked: Option<(u32, u64)>,
 }
 
 impl<D: Desktop + Send> Notifier<D> {
@@ -258,10 +260,6 @@ impl<D: Desktop + Send> Notifier<D> {
             self.owner = self.desktop.owner().await.flatten();
         }
         self.seq += 1;
-        if self.clicked == Some(id) {
-            // Shown again since: a close from now on is the user's.
-            self.clicked = None;
-        }
         let previous = self.shown.insert(
             alert.chat,
             Shown {
@@ -370,8 +368,8 @@ impl<D: Desktop + Send> Notifier<D> {
             .collect();
         match reply.what {
             Replied::Clicked => {
-                if !chats.is_empty() {
-                    self.clicked = Some(reply.id);
+                if let Some(newest) = chats.iter().map(|(_, shown)| shown.seq).max() {
+                    self.clicked = Some((reply.id, newest));
                 }
                 chats
                     .iter()
@@ -386,12 +384,16 @@ impl<D: Desktop + Send> Notifier<D> {
                     self.shared = None;
                 }
                 self.closing.retain(|&id| id != reply.id);
-                let clicked = self.clicked.take_if(|id| *id == reply.id).is_some();
-                if reply.what == Replied::Expired || clicked {
+                if reply.what == Replied::Expired {
                     return Vec::new();
                 }
+                let seen = self
+                    .clicked
+                    .take_if(|(id, _)| *id == reply.id)
+                    .map(|(_, newest)| newest);
                 chats
                     .into_iter()
+                    .filter(|(_, shown)| seen.is_none_or(|newest| shown.seq > newest))
                     .filter_map(|(chat, shown)| {
                         Some(Outcome::Dismissed {
                             chat,
@@ -756,7 +758,18 @@ mod tests {
             user_does(&mut notifier, "New activity", Replied::Clicked),
             [Outcome::Open(second)]
         );
-        assert!(user_does(&mut notifier, "New activity", Replied::Dismissed).is_empty());
+        // Shown in it after the click, before the server's close: the
+        // click didn't see it, so that close marks it, and only it.
+        notifier
+            .handle(Notice::Show(alert_until(3, "later", 25)), &private)
+            .await;
+        assert_eq!(
+            user_does(&mut notifier, "New activity", Replied::Dismissed),
+            [Outcome::Dismissed {
+                chat: alert(3, "").chat,
+                until: DateTime::from_timestamp(25, 0).unwrap(),
+            }]
+        );
 
         // Closed by the user without our hearing of it: the next alert
         // gets a new shared notification, and only its chat is in it.
@@ -1047,18 +1060,21 @@ mod linux {
 
     const SERVICE: &str = "org.freedesktop.Notifications";
 
-    /// Replies waiting for the notifier. The user acts on one notification
-    /// at a time; beyond this, replies are dropped (a click is lost).
-    const REPLIES: usize = 32;
-
     /// Reads the service's signals as they come, whatever the notifier is
     /// doing: unread ones would fill zbus's queue, and then its reader
     /// waits, holding back the replies to our calls. The service signals
     /// about every app's notifications, and about our own closes.
-    async fn pump(mut signals: SignalStream<'static>, replies: mpsc::Sender<super::Reply>) {
+    ///
+    /// Unbounded: they wait only while the notifier is in a call, which
+    /// times out, and dropping one could lose the close of ours that keeps
+    /// a reused id from being rewritten.
+    async fn pump(
+        mut signals: SignalStream<'static>,
+        replies: mpsc::UnboundedSender<super::Reply>,
+    ) {
         while let Some(message) = signals.next().await {
             if let Some(reply) = reply_from(&message)
-                && let Err(mpsc::error::TrySendError::Closed(_)) = replies.try_send(reply)
+                && replies.send(reply).is_err()
             {
                 return;
             }
@@ -1078,7 +1094,7 @@ mod linux {
         proxy: Proxy<'static>,
         dbus: DBusProxy<'static>,
         /// What the user did with notifications, as the pump hears it.
-        replies: mpsc::Receiver<super::Reply>,
+        replies: mpsc::UnboundedReceiver<super::Reply>,
         _pump: Pump,
         /// The server renders a subset of HTML in bodies.
         markup: bool,
@@ -1101,7 +1117,7 @@ mod linux {
             .await?;
             // Subscribed before anything is shown, so no reply is missed.
             let signals = proxy.receive_all_signals().await?;
-            let (replies_tx, replies) = mpsc::channel(REPLIES);
+            let (replies_tx, replies) = mpsc::unbounded_channel();
             let pump = Pump(tokio::spawn(pump(signals, replies_tx)));
             let capabilities: Vec<String> = proxy.call("GetCapabilities", &()).await?;
             let markup = capabilities.iter().any(|c| c == "body-markup");
@@ -1264,7 +1280,10 @@ mod linux {
             };
             let id = desktop.notify(0, &alert, true).await.expect("shown");
             assert!(desktop.owner().await.flatten().is_some());
-            assert!(desktop.close(id).await);
+            // Called directly: `Desktop::close` takes any error reply as
+            // closed.
+            let bus = desktop.bus().await.unwrap();
+            bus.close(id).await.expect("closed");
         }
 
         #[test]

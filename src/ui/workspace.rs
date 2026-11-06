@@ -256,19 +256,27 @@ impl Workspace {
         // On Wayland the compositor may only mark the window as wanting
         // attention: gpui can't pass on the server's activation token.
         window.activate_window();
-        let already_open = self.chat_list.read(cx).selected() == Some(&chat);
+        let (already_open, listed) = {
+            let list = self.chat_list.read(cx);
+            (list.selected() == Some(&chat), list.chat(&chat).is_some())
+        };
         let was_hidden = self.unhide_settings(cx);
-        // A chat just added may not be listed yet.
+        // A chat just added may not be listed yet: it opens once it is.
         self.chat_list
             .update(cx, |list, cx| list.open_when_listed(chat, cx));
-        if Self::helix(cx) {
+        if !listed {
+            // Until then the list waits for keys, not another chat's
+            // composer.
+            self.focus_chat_list(&FocusChatList, window, cx);
+        } else if Self::helix(cx) {
             self.focus_messages(&FocusMessages, window, cx);
         } else {
             self.focus_composer(&FocusComposer, window, cx);
         }
-        // Otherwise `Opened` reports the chat once it is shown; reporting
-        // now would name the chat that was open before.
-        if already_open && was_hidden {
+        // When the chat opens now, `Opened` reports it; reporting before
+        // would name the chat that was open. Otherwise what the settings
+        // hid is on screen again, and is reported here.
+        if was_hidden && (already_open || !listed) {
             self.report_attention(window, cx);
         }
     }
@@ -1972,6 +1980,39 @@ mod tests {
         cx.simulate_keystrokes(&format!("{MOD}-1"));
         cx.run_until_parked();
         assert!(!workspace.read_with(cx, |workspace, _| workspace.settings_open));
+    }
+
+    #[gpui::test]
+    fn an_alert_for_a_chat_not_yet_listed_opens_it_once_listed(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let focus = focus_probe(&workspace, cx);
+        cx.simulate_keystrokes(&format!("{MOD}-1"));
+        cx.simulate_keystrokes(&format!("{MOD}-,"));
+        cx.run_until_parked();
+        let added = ChatId("just-added".into());
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_from_alert(added.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.settings_open));
+        assert_eq!(focus(cx), Focus::ChatList);
+
+        workspace.update(cx, |workspace, cx| {
+            let mut chats = workspace.chats(cx);
+            let mut new = chats[0].clone();
+            new.id = added.clone();
+            chats.push(new);
+            workspace.update_chat_list(cx, |list, cx| list.set_chats(chats, LoadState::Loaded, cx));
+        });
+        cx.run_until_parked();
+        let open = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .conversation
+                .read(cx)
+                .chat()
+                .map(|chat| chat.id.clone())
+        });
+        assert_eq!(open, Some(added));
     }
 
     #[gpui::test]

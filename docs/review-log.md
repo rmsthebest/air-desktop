@@ -783,3 +783,17 @@ Deferred (needs an account seam): a workspace test that opening from an
 alert with the settings open reports attention once, for the clicked chat.
 The e2e step pins that an alert's `until` covers what it shows; the path
 from notifier outcome to `set_chat_notified_until` has no test.
+
+## Gate 14b — gate 14 fixes (`1818cd1..7abe130`): PASS
+
+Fixed (low):
+- Signals are no longer dropped when the notifier is busy (the pump's
+  channel is unbounded; it fills only while a call runs, which times out).
+  A lost close of ours would have kept a reused id tracked (gate 9e).
+- The close after a click spares only what the click saw: what was shown
+  in the notification after it is still marked by that close (or by a
+  later real dismissal, on servers that keep clicked notifications).
+- An alert for a chat not yet listed, clicked with the settings open,
+  reports what the settings hid and focuses the chat list until the chat
+  opens. Test: `an_alert_for_a_chat_not_yet_listed_opens_it_once_listed`.
+- `desktop_notify_and_close` checks the close reply itself.

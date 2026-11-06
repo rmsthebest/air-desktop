@@ -409,6 +409,8 @@ mod tests {
             change(&tail[2], true, &themes()),
             Some(SettingsEvent::RemoveUsername("ada-2".into()))
         );
-        assert_eq!(change(&tail[2], false, &themes()), None);
+        for row in &tail {
+            assert_eq!(change(row, false, &themes()), None, "{row:?}");
+        }
     }
 }

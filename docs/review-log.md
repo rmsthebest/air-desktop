@@ -722,3 +722,19 @@ Fixed:
 
 Deferred (need an account seam in workspace tests): attention while the
 settings are open, and a username removal waiting for its confirm.
+
+## Gate 13b — gate 13 fixes (`2f3040b..73044cc`): PASS
+
+Fixed (low):
+- Hiding the conversation also forgets the last drawn range, so the
+  first frame after the settings close reports what is in view.
+- Opening a chat from the settings reports attention once, for the new
+  chat, not the old one first.
+- `shown_changed`'s doc back on it.
+- Tests: the theme test goes through the settings event (catches a
+  rewire to `:theme`'s appearance-changing path); stepping back does
+  nothing on every text row.
+
+Deferred: a `Conversation` test that hide then unhide still marks seen
+(needs drawn frames in a test window); the attention-order test (needs
+an account seam).

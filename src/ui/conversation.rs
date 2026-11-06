@@ -452,17 +452,20 @@ impl Conversation {
         }
     }
 
-    /// What is in view changed (or the window was activated): pages in
-    /// more near either end, and marks the newest message in view as seen.
     /// Hides or shows the conversation. While hidden, nothing in it is
     /// seen; once drawn again, what is in view is measured anew.
     pub fn set_hidden(&mut self, hidden: bool) {
         self.hidden = hidden;
         if hidden {
+            // Both, as `show` does: the next frame then reports what it
+            // draws even if it is what was drawn before.
             self.shown = None;
+            self.probes.borrow_mut().shown = None;
         }
     }
 
+    /// What is in view changed (or the window was activated): pages in
+    /// more near either end, and marks the newest message in view as seen.
     fn shown_changed(&mut self, shown: Option<Shown>, window: &mut Window, cx: &mut Context<Self>) {
         if self.hidden {
             return;

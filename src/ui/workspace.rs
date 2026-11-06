@@ -91,7 +91,9 @@ impl Workspace {
                         // After a back/forward step this is the jumplist's current
                         // entry, which `push` ignores.
                         this.jumps.push(id.clone());
-                        this.hide_settings(window, cx);
+                        // Reported below, once the new chat is shown: not
+                        // the old one first.
+                        this.unhide_settings(cx);
                         let (messages, compose) = match &this.session {
                             Some(session) => (
                                 cx.new(|cx| Messages::open(session, id, cx)),
@@ -304,13 +306,22 @@ impl Workspace {
     }
 
     fn hide_settings(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.settings_open {
-            self.settings_open = false;
-            self.conversation
-                .update(cx, |conversation, _| conversation.set_hidden(false));
+        if self.unhide_settings(cx) {
             self.report_attention(window, cx);
-            cx.notify();
         }
+    }
+
+    /// Hides the settings without reporting attention, for a caller that
+    /// reports once it has shown what replaces them. Whether they were shown.
+    fn unhide_settings(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.settings_open {
+            return false;
+        }
+        self.settings_open = false;
+        self.conversation
+            .update(cx, |conversation, _| conversation.set_hidden(false));
+        cx.notify();
+        true
     }
 
     /// Closes the settings, back to the open chat if there is one.
@@ -1935,11 +1946,11 @@ mod tests {
 
     #[gpui::test]
     fn a_theme_from_settings_changes_only_its_half(cx: &mut TestAppContext) {
-        let (_workspace, cx) = setup(cx);
-        cx.update(|window, cx| {
+        let (workspace, cx) = setup(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
             SettingsStore::update(cx, |settings| settings.appearance = Appearance::Light).unwrap();
             let dark = theme::by_mode(cx).dark.last().cloned().unwrap();
-            theme::set_theme(&dark, window, cx).unwrap();
+            workspace.settings_changed(SettingsEvent::Theme(dark.clone()), window, cx);
             let settings = SettingsStore::get(cx);
             assert_eq!(settings.dark_theme, dark);
             assert_eq!(settings.light_theme, theme::DEFAULT_LIGHT);

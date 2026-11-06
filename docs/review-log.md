@@ -508,3 +508,25 @@ Fixed:
 - **`:kick` without members said nothing, or "No member matches" while
   loading (low).** Refused as "That needs an account" / "Still loading
   the members".
+
+## Gate 10c — gate 10b fixes (`03ce28e..570ab43`): BLOCK
+
+Fixed:
+- **A name ending in `#<tag>` redirected a removal (high).** A member named
+  `Mallory #<grace's tag>` got that completion, and the trailing tag won:
+  Grace was removed, unconfirmed. Now a query is a tag only when all of it
+  is `#<hex>`; completion shows `Name #tag` but inserts the name only if it
+  resolves back to that member (else the tag); `:kick` resolves first and
+  confirms "Remove <name> (#tag)?", then removes exactly that core id.
+  `every_completion_finds_its_member_whatever_the_names`.
+- **Quadratic alike-name count (low).** Counted with a map. The session
+  still loads every member (the pane caps rows); accepted: groups that
+  large aren't expected yet, and upstream loads them all too.
+- **A failed load looked loaded (low).** Recorded; `:kick` refuses with
+  "Couldn't load the members".
+- **`tags_grow_until_unique` couldn't fail (test).** Now tests the length
+  rule on chosen hashes sharing ten digits.
+
+Deferred:
+- A test of the "Still loading" refusal needs a session; covered by
+  reading, with the e2e for the loaded path.

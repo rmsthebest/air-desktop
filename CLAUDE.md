@@ -67,7 +67,10 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     groups refuse everything but delete). Contacts and members are picked
     by name with `matches_name` (never guessed); members also by `#tag`,
     a hash prefix of the user id grown until unique in the group, so a
-    copied name can't shield anyone from removal. Delete ends a group for
+    copied name can't shield anyone from removal. A query is a tag only
+    when all of it is `#<hex>`, so names can't smuggle one in; completion
+    inserts a name only if it finds that member again, else the tag; and
+    `:kick` confirms with the resolved name and tag. Delete ends a group for
     every member and erases it on all the user's devices (the dialog says
     so).
     The self chat is a group in the core but never one here

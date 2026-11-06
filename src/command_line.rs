@@ -43,8 +43,9 @@ pub struct Candidates {
     pub chats: Vec<String>,
     /// Contacts' names (one-to-one chats).
     pub contacts: Vec<String>,
-    /// The open group's members, other than the user.
-    pub members: Vec<String>,
+    /// The open group's members other than the user: what to insert, and
+    /// what to show (and match) for it.
+    pub members: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -239,12 +240,22 @@ pub fn complete(input: &str, candidates: &Candidates) -> Vec<(String, String)> {
     let Some(spec) = spec(name) else {
         return Vec::new();
     };
+    let arg_typed = normalize(arg.trim_start());
+    if spec.arg == Arg::Member {
+        // Matched on what is shown, which names the member.
+        return candidates
+            .members
+            .iter()
+            .filter(|(_, shown)| normalize(shown).contains(&arg_typed))
+            .map(|(insert, shown)| (format!("{name} {insert}"), shown.clone()))
+            .collect();
+    }
     let candidates: Vec<String> = match spec.arg {
         Arg::None | Arg::Text => return Vec::new(),
         Arg::Theme => candidates.themes.clone(),
         Arg::Chat => candidates.chats.clone(),
         Arg::Contact => candidates.contacts.clone(),
-        Arg::Member => candidates.members.clone(),
+        Arg::Member => unreachable!("completed above"),
         Arg::Appearance => ["system", "light", "dark"].map(String::from).to_vec(),
         Arg::Keymap => ["standard", "helix"].map(String::from).to_vec(),
         Arg::Notifications => ["full", "private", "off"].map(String::from).to_vec(),
@@ -365,7 +376,7 @@ mod tests {
         let candidates = Candidates {
             themes: vec!["Air Dark".to_string(), "Air Light".to_string()],
             contacts: vec!["Grace Hopper".to_string()],
-            members: vec!["Alan Turing".to_string()],
+            members: vec![("#1a2b3c4d".to_string(), "Alan Turing #1a2b3c4d".to_string())],
             ..Candidates::default()
         };
         let first = |input| -> Vec<String> {
@@ -378,7 +389,7 @@ mod tests {
         assert_eq!(first(":theme dark"), ["theme Air Dark"]);
         // Invites complete from contacts, removals from members.
         assert_eq!(first(":invite gr"), ["invite Grace Hopper"]);
-        assert_eq!(first(":kick al"), ["kick Alan Turing"]);
+        assert_eq!(first(":kick al"), ["kick #1a2b3c4d"]);
         assert!(first(":kick gr").is_empty());
         assert!(first(":q x").is_empty());
         assert!(first(":nope x").is_empty());

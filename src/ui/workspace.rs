@@ -383,7 +383,7 @@ impl Workspace {
             members: self
                 .members
                 .as_ref()
-                .map(|(members, _)| removal_candidates(members.read(cx).members()))
+                .map(|(members, _)| members.read(cx).candidates())
                 .unwrap_or_default(),
         };
         let previous_focus = window.focused(cx);
@@ -499,12 +499,32 @@ impl Workspace {
                     return;
                 };
                 let members = members.clone();
-                // Started only once `contact_op` lets it.
-                self.contact_op(
+                let removal = match members.read(cx).resolve(&query) {
+                    Ok(removal) => removal,
+                    Err(refusal) => return show_refusal(refusal, window, cx),
+                };
+                // Names are peer-chosen: the tag shows who it really is.
+                let title = format!("Remove {} (#{})?", removal.name, removal.tag);
+                let removal = std::cell::RefCell::new(Some(removal));
+                self.confirm(
+                    title,
+                    "They stop getting the group's messages.".into(),
+                    "Remove",
+                    move |this, window, cx| {
+                        let Some(removal) = removal.borrow_mut().take() else {
+                            return;
+                        };
+                        let members = members.clone();
+                        // Started only once `contact_op` lets it.
+                        this.contact_op(
+                            window,
+                            cx,
+                            move |_, cx| members.read(cx).remove(removal, cx),
+                            |name, _, window, cx| show_info(format!("Removing {name}"), window, cx),
+                        );
+                    },
                     window,
                     cx,
-                    move |_, cx| members.read(cx).remove(&query, cx),
-                    |name, _, window, cx| show_info(format!("Removing {name}"), window, cx),
                 );
             }
             Command::Rename(title) => {
@@ -832,25 +852,6 @@ fn which_key_rows(window: &Window, os: OperatingSystem) -> Vec<(String, String)>
     rows.sort();
     rows.dedup();
     rows
-}
-
-/// What `:kick` completes: names, or `Name #tag` where names are alike.
-fn removal_candidates(members: &[crate::model::Member]) -> Vec<String> {
-    let others: Vec<_> = members.iter().filter(|member| !member.own).collect();
-    others
-        .iter()
-        .map(|member| {
-            let alike = others
-                .iter()
-                .filter(|other| other.name == member.name)
-                .count();
-            if alike > 1 {
-                format!("{} #{}", member.name, member.tag)
-            } else {
-                member.name.to_string()
-            }
-        })
-        .collect()
 }
 
 fn format_keystrokes(keystrokes: &[Keystroke], os: OperatingSystem) -> String {

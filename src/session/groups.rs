@@ -21,7 +21,7 @@ use super::chats::model_id;
 use super::contacts::{Failure, on_tokio};
 use super::messages::core_chat_id;
 use super::{Session, SessionEvent};
-use crate::command_line::{NameMatch, matches_name};
+use crate::command_line::{NameMatch, matches_name, normalize};
 use crate::model::{ChatId, Member, UserId};
 use crate::runtime::Tokio;
 
@@ -220,6 +220,13 @@ pub(super) async fn invite(
     Ok(name.clone())
 }
 
+/// A member `:kick` resolved, removed once the user confirms.
+pub struct Removal {
+    pub name: SharedString,
+    pub tag: SharedString,
+    id: CoreUserId,
+}
+
 /// The members of one group, kept up to date.
 pub struct Members {
     user: CoreUser,
@@ -228,6 +235,8 @@ pub struct Members {
     /// The core's id of each member, in the same order.
     core_ids: Vec<CoreUserId>,
     loaded: bool,
+    /// The last load failed: what is shown may be stale.
+    failed: bool,
     /// The latest load; a newer one replaces (cancels) it.
     load: Option<Task<()>>,
     _changes: Subscription,
@@ -262,6 +271,7 @@ impl Members {
             members: Vec::new(),
             core_ids: Vec::new(),
             loaded: false,
+            failed: false,
             load: None,
             _changes: changes,
         };
@@ -277,25 +287,39 @@ impl Members {
         self.loaded
     }
 
-    /// Removes the member `query` names (see [`resolve_removal`]).
-    /// Resolves to their name.
+    /// Who `query` names, if the user may remove them (see
+    /// [`resolve_removal`]): their name, tag and core id.
+    pub fn resolve(&self, query: &str) -> Result<Removal, String> {
+        if self.failed {
+            return Err("Couldn't load the members; reopen the group".into());
+        }
+        if !self.loaded {
+            return Err("Still loading the members".into());
+        }
+        let ix = resolve_removal(&self.members, query)?;
+        Ok(Removal {
+            name: self.members[ix].name.clone(),
+            tag: self.members[ix].tag.clone(),
+            id: self.core_ids[ix].clone(),
+        })
+    }
+
+    /// What `:kick` completes (see [`removal_candidates`]).
+    pub fn candidates(&self) -> Vec<(String, String)> {
+        removal_candidates(&self.members)
+    }
+
+    /// Removes the member `resolve` found. Resolves to their name.
     pub fn remove(
         &self,
-        query: &str,
+        removal: Removal,
         cx: &App,
     ) -> impl Future<Output = Result<SharedString, String>> + use<> {
-        let target = if self.loaded {
-            resolve_removal(&self.members, query)
-                .map(|ix| (self.members[ix].name.clone(), self.core_ids[ix].clone()))
-        } else {
-            Err("Still loading the members".to_string())
-        };
         let (user, chat) = (self.user.clone(), self.chat);
         on_tokio(cx, "remove the member", async move {
-            let (name, id) = target.map_err(Failure::Shown)?;
             active_group(&user, chat).await?;
-            user.remove_users(chat, vec![id]).await?;
-            Ok(name)
+            user.remove_users(chat, vec![removal.id]).await?;
+            Ok(removal.name)
         })
     }
 
@@ -305,6 +329,7 @@ impl Members {
         self.load = Some(cx.spawn(async move |this, cx| {
             let loaded = load.await;
             _ = this.update(cx, |this, cx| {
+                this.failed = loaded.is_err();
                 match loaded {
                     Ok(Some(loaded)) => (this.members, this.core_ids) = loaded.into_iter().unzip(),
                     // The chat is gone; the workspace closes it.
@@ -318,17 +343,31 @@ impl Members {
     }
 }
 
+/// The tag in `query`, if all of it is one: `#` and hex digits. Only then
+/// is it read as a tag; anything else is matched against names, so a
+/// (peer-chosen) name can't smuggle in another member's tag.
+fn as_tag(query: &str) -> Option<&str> {
+    let tag = query.trim().strip_prefix('#')?;
+    (!tag.is_empty() && tag.chars().all(|c| c.is_ascii_hexdigit())).then_some(tag)
+}
+
 /// Which member `query` names (their index), if the user may remove them:
-/// by name (see [`matches_name`]), or by `#tag` as the last word (`#tag`
-/// or `Name #tag`, as completion offers when names are alike). Never the
-/// user.
+/// by `#tag` (see [`as_tag`]) or else by name (see [`matches_name`]).
+/// Never the user.
 fn resolve_removal(members: &[Member], query: &str) -> Result<usize, String> {
+    let ix = find_member(members, query)?;
+    if !members[ix].can_remove {
+        return Err(format!(
+            "You can't remove {} from this group",
+            members[ix].name
+        ));
+    }
+    Ok(ix)
+}
+
+fn find_member(members: &[Member], query: &str) -> Result<usize, String> {
     let others: Vec<_> = (0..members.len()).filter(|&ix| !members[ix].own).collect();
-    let tag = query
-        .split_whitespace()
-        .next_back()
-        .and_then(|word| word.strip_prefix('#'));
-    let ix = if let Some(tag) = tag {
+    let ix = if let Some(tag) = as_tag(query) {
         let tag = tag.to_lowercase();
         let mut tagged = others
             .iter()
@@ -354,13 +393,30 @@ fn resolve_removal(members: &[Member], query: &str) -> Result<usize, String> {
             }
         }
     };
-    if !members[ix].can_remove {
-        return Err(format!(
-            "You can't remove {} from this group",
-            members[ix].name
-        ));
-    }
     Ok(ix)
+}
+
+/// What `:kick` completes, with the member's name as help: their name if
+/// it finds them again, else their `#tag` (alike names, or a name that
+/// reads as a tag). Never the user.
+fn removal_candidates(members: &[Member]) -> Vec<(String, String)> {
+    let mut alike: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for member in members.iter().filter(|member| !member.own) {
+        *alike.entry(normalize(&member.name)).or_default() += 1;
+    }
+    members
+        .iter()
+        .filter(|member| !member.own)
+        .map(|member| {
+            let unique = alike[&normalize(&member.name)] == 1;
+            let insert = if unique && as_tag(&member.name).is_none() {
+                member.name.to_string()
+            } else {
+                format!("#{}", member.tag)
+            };
+            (insert, format!("{} #{}", member.name, member.tag))
+        })
+        .collect()
 }
 
 /// The group's members, the user first, then by name. `None` without a chat.
@@ -403,15 +459,20 @@ pub(super) async fn load(user: &CoreUser, chat: CoreChatId) -> Option<Vec<(Membe
 /// member's shares.
 fn identify(members: &mut [(Member, CoreUserId)]) {
     let hashes: Vec<String> = members.iter().map(|(_, id)| id_hash(id)).collect();
-    let unique = |len: usize| {
-        let tags: std::collections::HashSet<_> = hashes.iter().map(|hash| &hash[..len]).collect();
-        tags.len() == hashes.len()
-    };
-    let len = (TAG_LEN..64).find(|&len| unique(len)).unwrap_or(64);
+    let len = tag_len(&hashes);
     for ((member, _), hash) in members.iter_mut().zip(hashes) {
         member.tag = hash[..len].to_string().into();
         member.id = UserId(hash.into());
     }
+}
+
+/// The fewest digits, from [`TAG_LEN`] up, that tell `hashes` apart.
+fn tag_len(hashes: &[String]) -> usize {
+    let unique = |len: usize| {
+        let tags: std::collections::HashSet<_> = hashes.iter().map(|hash| &hash[..len]).collect();
+        tags.len() == hashes.len()
+    };
+    (TAG_LEN..64).find(|&len| unique(len)).unwrap_or(64)
 }
 
 /// Hex SHA-256 of the user id's wire form (uuid and domain).
@@ -470,8 +531,8 @@ mod tests {
             |query| resolve_removal(&members, query).map(|ix| members[ix].tag.to_string());
         assert!(removed("grace").is_err(), "never guessed");
         assert_eq!(removed("#5E6F7A8B").as_deref(), Ok("5e6f7a8b"));
-        // As completion offers it.
-        assert_eq!(removed("Grace #1a2b3c4d").as_deref(), Ok("1a2b3c4d"));
+        // A tag is only ever the whole query.
+        assert!(removed("Grace #1a2b3c4d").is_err());
         // Not the user, nor those the policy protects.
         assert!(removed("you").is_err());
         assert!(removed("#00000000").is_err());
@@ -501,19 +562,32 @@ mod tests {
 
     #[test]
     fn tags_grow_until_unique() {
-        let mut members: Vec<_> = (0..300)
-            .map(|_| {
-                let id = CoreUserId::random("example.com".parse().unwrap());
-                (member("", "", false, true), id)
-            })
-            .collect();
-        identify(&mut members);
-        let tags: std::collections::HashSet<_> = members
-            .iter()
-            .map(|(member, _)| member.tag.clone())
-            .collect();
-        assert_eq!(tags.len(), members.len());
-        assert!(tags.iter().all(|tag| tag.len() >= TAG_LEN));
+        let hash = |prefix: &str| format!("{prefix:0<64}");
+        assert_eq!(tag_len(&[hash("1a2b3c4d"), hash("5e6f7a8b")]), TAG_LEN);
+        // Sharing ten digits, they need eleven.
+        assert_eq!(tag_len(&[hash("1a2b3c4d5e1"), hash("1a2b3c4d5e2")]), 11);
+    }
+
+    #[test]
+    fn every_completion_finds_its_member_whatever_the_names() {
+        let grace = member("Grace", "1a2b3c4d", false, true);
+        let members = [
+            member("You", "00000000", true, false),
+            grace.clone(),
+            member("Grace", "5e6f7a8b", false, true),
+            // Names chosen to point completion at Grace.
+            member("Mallory #1a2b3c4d", "9c0d1e2f", false, true),
+            member("#1a2b3c4d", "3f4e5d6c", false, true),
+            member("Alan", "7b8a9f0e", false, true),
+        ];
+        let candidates = removal_candidates(&members);
+        assert_eq!(candidates.len(), members.len() - 1, "never the user");
+        for (insert, _) in &candidates {
+            let ix = resolve_removal(&members, insert).unwrap();
+            let expected = candidates.iter().position(|(i, _)| i == insert).unwrap() + 1;
+            assert_eq!(ix, expected, "{insert:?} found someone else");
+        }
+        assert!(candidates.contains(&("Alan".into(), "Alan #7b8a9f0e".into())));
     }
 
     #[test]

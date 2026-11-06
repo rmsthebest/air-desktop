@@ -570,3 +570,16 @@ Fixed:
 Deferred:
 - A behaviour test for the splice case needs a live message window (the
   mock one only appends); the rule is one line next to the cursor shift.
+
+## Gate 11b — gate 11 fixes (`baf147a..0785445`): PASS
+
+Fixed:
+- **Retracting missed an own variant (low).** Retracting deletes every
+  own reaction that labels the same, as the view shows them as one (e2e:
+  a `👍` + zero-width space variant goes with `👍`).
+- **An invisible picker kept its keys (low).** The picker closes whenever
+  the cursor's message can't take reactions (deleted in place, too).
+- **"Don't race" overstated (low).** The doc says what two quick presses
+  do.
+- Tests: the add/retract decision is `model::gave`, tested; every quick
+  reaction labels as itself.

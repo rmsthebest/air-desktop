@@ -220,7 +220,7 @@ impl Conversation {
                 match event {
                     MessagesEvent::Opened => this.scroll_to_start(cx),
                     MessagesEvent::Spliced { old, count, paged } => {
-                        this.splice(old.clone(), *count, *paged)
+                        this.splice(old.clone(), *count, *paged, cx)
                     }
                     MessagesEvent::ScrolledToBottom => this.list.scroll_to_end(),
                 }
@@ -254,7 +254,7 @@ impl Conversation {
         }
     }
 
-    fn splice(&mut self, old: Range<usize>, count: usize, paged: bool) {
+    fn splice(&mut self, old: Range<usize>, count: usize, paged: bool, cx: &App) {
         let append = old.is_empty() && old.start == self.list.item_count();
         if append && paged && self.list.is_following_tail() {
             // Paged in below the bottom of the view: stay on what is shown
@@ -268,8 +268,8 @@ impl Conversation {
         }
         self.list.splice(old.clone(), count);
         self.cursor = self.cursor.and_then(|ix| shift(ix, &old, count));
-        // Its message gone, the picker goes too.
-        self.reacting &= self.cursor.is_some();
+        // Its message gone (or deleted), the picker goes too.
+        self.reacting &= self.reactable(cx).is_some();
     }
 
     /// The open chat's summary changed; its messages stay as they are.
@@ -507,8 +507,8 @@ impl Conversation {
 
     fn set_cursor(&mut self, cursor: Option<usize>, cx: &mut Context<Self>) {
         self.cursor = cursor;
-        // Follows the cursor; there is nothing to react to without one.
-        self.reacting &= cursor.is_some();
+        // Follows the cursor, while there is something to react to.
+        self.reacting &= self.reactable(cx).is_some();
         if let Some(ix) = cursor {
             // Revealing it pages in more, as scrolling does.
             self.list.scroll_to_reveal_item(ix);
@@ -542,10 +542,7 @@ impl Conversation {
             return;
         };
         let id = message.id.clone();
-        let given = message
-            .reactions
-            .iter()
-            .any(|reaction| reaction.own && reaction.label == crate::model::reaction_label(emoji));
+        let given = crate::model::gave(&message.reactions, emoji);
         let Some(toggle) = messages.read(cx).set_reaction(&id, emoji, !given, cx) else {
             crate::ui::show_refusal("Reactions need an account".into(), window, cx);
             return;

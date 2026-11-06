@@ -566,6 +566,19 @@ async fn e2e_two_users_connect_by_username_and_talk() {
         m.plain_text() == "hi ada" && m.reactions.is_empty()
     })
     .await;
+    // A variant stored under another raw string (say, from another of
+    // Ada's clients) shows as the same reaction, and is retracted with it.
+    ada.send_reaction(ada_chat, hi, "👍\u{200B}".into())
+        .await
+        .unwrap();
+    next_message(&mut bob_updates, |m| {
+        m.plain_text() == "hi ada" && !m.reactions.is_empty()
+    })
+    .await;
+    messages::set_reaction(&ada, ada_chat, hi, "👍".into(), false)
+        .await
+        .unwrap();
+    assert!(ada.message_reactions(hi).await.unwrap().is_empty());
     // Only messages of the chat named take reactions.
     let elsewhere = aircoreclient::MessageId::new(uuid::Uuid::new_v4());
     assert!(refused(

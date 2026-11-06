@@ -263,9 +263,10 @@ impl Messages {
     }
 
     /// Adds `emoji` to the message's reactions, or retracts it (`add`
-    /// false). The caller decides from what it shows, so presses in quick
-    /// succession don't race on what is stored; adding twice is a no-op in
-    /// the core. `None` for fixed messages (no account). Runs detached, as
+    /// false): every reaction of the user's that labels the same, as the
+    /// view shows them as one. The caller decides from what it shows: two
+    /// presses before the first lands both add, the second a no-op in the
+    /// core, leaving the reaction on. `None` for fixed messages (no account). Runs detached, as
     /// sends do.
     pub fn set_reaction(
         &self,
@@ -1034,8 +1035,15 @@ pub(super) async fn set_reaction(
     }
     if add {
         user.send_reaction(chat, message, emoji).await?;
-    } else {
-        user.delete_reaction(chat, message, emoji).await?;
+        return Ok(());
+    }
+    let label = crate::model::reaction_label(&emoji);
+    let stored = user.message_reactions(message).await?;
+    let own = stored.into_iter().filter(|(raw, users)| {
+        users.contains(user.user_id()) && crate::model::reaction_label(raw) == label
+    });
+    for (raw, _) in own {
+        user.delete_reaction(chat, message, raw).await?;
     }
     Ok(())
 }

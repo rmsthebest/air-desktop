@@ -204,6 +204,15 @@ pub fn reaction_label(emoji: &str) -> SharedString {
     if label.is_empty() { "?".into() } else { label }
 }
 
+/// Whether the user gave `emoji` (as it is labelled) among `reactions`:
+/// what a picker key retracts rather than adds.
+pub fn gave(reactions: &[Reaction], emoji: &str) -> bool {
+    let label = reaction_label(emoji);
+    reactions
+        .iter()
+        .any(|reaction| reaction.own && reaction.label == label)
+}
+
 /// What a message's reactions show, from `(emoji, reactors)` in order of
 /// first appearance; `me` is the user. Emoji that look the same once
 /// labelled are counted together, each reactor once (a peer could react
@@ -812,13 +821,23 @@ mod tests {
                 own: true
             }
         );
-        // The picker's emoji keep their variation selector.
-        assert_eq!(reaction_label("❤️").as_ref(), QUICK_REACTIONS[1]);
         assert_eq!(shown[1].label.as_ref(), "n…");
         assert_eq!(shown[2].label.as_ref(), "?");
         assert_eq!(shown.len(), MAX_REACTIONS + 1);
         assert!(shown.last().is_some_and(|r| r.label == "🙏" && r.own));
         assert_eq!(more, 3 + 40 + 1 - shown.len());
+    }
+
+    #[test]
+    fn a_picker_key_retracts_only_what_the_user_gave() {
+        // Every quick reaction labels as itself (❤️ keeps its selector).
+        for emoji in QUICK_REACTIONS {
+            assert_eq!(reaction_label(emoji).as_ref(), emoji);
+        }
+        let (shown, _) = reactions([("👍\u{200B}", &["me"][..]), ("😂", &["peer"][..])], &"me");
+        assert!(gave(&shown, "👍"), "a variant of the user's counts");
+        assert!(!gave(&shown, "😂"), "a peer's is added to, not retracted");
+        assert!(!gave(&shown, "🙏"));
     }
 
     #[test]

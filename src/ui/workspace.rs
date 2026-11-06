@@ -12,15 +12,17 @@ use gpui_kit::{
 
 use crate::actions::{
     self, AcceptRequest, AddContact, DeclineRequest, FindChat, FocusChatList, FocusComposer,
-    FocusConversation, FocusMessages, FocusNextPane, JumpBack, JumpForward, NextChat,
-    NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette, PickTheme, PrevChat, PrevUnreadChat,
-    SelectFirst, SelectLast, ShowShortcuts, ToggleAppearance, ToggleDetails, ToggleHelixMode,
+    FocusConversation, FocusMessages, FocusNextPane, InviteToGroup, JumpBack, JumpForward,
+    NewGroup, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette, PickTheme,
+    PrevChat, PrevUnreadChat, SelectFirst, SelectLast, ShowShortcuts, ToggleAppearance,
+    ToggleDetails, ToggleHelixMode,
 };
-use crate::command_line::{self, Command, NameMatch, matches_name};
+use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, Request, UserId, mock};
 use crate::session::Session;
 use crate::session::chats::{Chats, LoadState};
 use crate::session::composer::Composer;
+use crate::session::groups::Members;
 use crate::session::messages::Messages;
 use crate::settings::{Appearance, KeymapMode, Notifications, SettingsStore};
 use crate::theme;
@@ -31,6 +33,8 @@ use crate::ui::details_pane::details_pane;
 use crate::ui::nav_rail::{Account, nav_rail};
 use crate::ui::palette::{self, Scope};
 use crate::ui::{key_context, show_error, show_info, show_refusal, update_settings};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::ButtonVariant;
 
 const CHAT_LIST_MIN: f32 = 240.;
 const CHAT_LIST_MAX: f32 = 480.;
@@ -48,6 +52,8 @@ pub struct Workspace {
     /// A contact operation in flight; another waits for it to finish, so a
     /// repeated key press doesn't send a request twice.
     contact_task: Option<Task<()>>,
+    /// The open group's members.
+    members: Option<(Entity<Members>, Subscription)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -88,6 +94,14 @@ impl Workspace {
                                 cx.new(|_| Composer::fixed()),
                             ),
                         };
+                        this.members = match &this.session {
+                            Some(session) if chat.is_group => {
+                                let members = cx.new(|cx| Members::open(session, id, cx));
+                                let redraw = cx.observe(&members, |_, _, cx| cx.notify());
+                                Some((members, redraw))
+                            }
+                            _ => None,
+                        };
                         this.conversation.update(cx, |conversation, cx| {
                             conversation.show(chat, messages, compose, window, cx)
                         });
@@ -101,6 +115,7 @@ impl Workspace {
                         cx.notify();
                     }
                     ChatListEvent::Closed => {
+                        this.members = None;
                         this.conversation
                             .update(cx, |conversation, cx| conversation.close(window, cx));
                         this.report_attention(window, cx);
@@ -146,6 +161,7 @@ impl Workspace {
             jumps: JumpList::default(),
             command_line: None,
             contact_task: None,
+            members: None,
             _subscriptions: subscriptions,
         };
         this.report_attention(window, cx);
@@ -343,16 +359,37 @@ impl Workspace {
         self.prompt("contact ", window, cx);
     }
 
+    fn new_group(&mut self, _: &NewGroup, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt("group ", window, cx);
+    }
+
+    fn invite_to_group(&mut self, _: &InviteToGroup, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_group(window, cx).is_some() {
+            self.prompt("invite ", window, cx);
+        }
+    }
+
     /// Opens the command line with `initial` typed.
     fn prompt(&mut self, initial: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let themes = theme::available(cx);
-        let chats = self
-            .chats(cx)
-            .into_iter()
-            .map(|c| c.title.to_string())
-            .collect();
+        let chats = self.chats(cx);
+        let candidates = Candidates {
+            themes: theme::available(cx),
+            chats: chats.iter().map(|chat| chat.title.to_string()).collect(),
+            contacts: chats
+                .iter()
+                .filter(|chat| !chat.is_group && !chat.is_self_chat && chat.request.is_none())
+                .map(|chat| chat.title.to_string())
+                .collect(),
+            members: self
+                .members
+                .iter()
+                .flat_map(|(members, _)| members.read(cx).members())
+                .filter(|member| !member.own)
+                .map(|member| member.name.to_string())
+                .collect(),
+        };
         let previous_focus = window.focused(cx);
-        let view = cx.new(|cx| CommandLine::new(themes, chats, initial, window, cx));
+        let view = cx.new(|cx| CommandLine::new(candidates, initial, window, cx));
         let subscription = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
             this.command_line = None;
             if let Some(focus) = &previous_focus {
@@ -438,7 +475,134 @@ impl Workspace {
                 |session, cx| session.remove_username(&username, cx),
                 |(), _, _, _| {},
             ),
+            Command::Group(title) => self.contact_op(
+                window,
+                cx,
+                |session, cx| session.create_group(&title, cx),
+                |chat, this, window, cx| this.open_when_listed(chat, window, cx),
+            ),
+            Command::Invite(query) => {
+                let Some(chat) = self.open_group(window, cx) else {
+                    return;
+                };
+                self.contact_op(
+                    window,
+                    cx,
+                    |session, cx| session.invite(&chat, &query, cx),
+                    |name, _, window, cx| show_info(format!("Invited {name}"), window, cx),
+                );
+            }
+            Command::Kick(query) => {
+                if self.open_group(window, cx).is_none() {
+                    return;
+                }
+                let Some((members, _)) = &self.members else {
+                    return;
+                };
+                let removal = members.read(cx).remove(&query, cx);
+                self.contact_op(
+                    window,
+                    cx,
+                    |_, _| removal,
+                    |name, _, window, cx| show_info(format!("Removing {name}"), window, cx),
+                );
+            }
+            Command::Rename(title) => {
+                let Some(chat) = self.open_group(window, cx) else {
+                    return;
+                };
+                self.contact_op(
+                    window,
+                    cx,
+                    |session, cx| session.rename_group(&chat, &title, cx),
+                    |(), _, _, _| {},
+                );
+            }
+            Command::Leave => {
+                let Some(chat) = self.open_group(window, cx) else {
+                    return;
+                };
+                self.confirm(
+                    "Leave this group?",
+                    "You stop getting its messages. The chat stays in your list, \
+                     ended, until you delete it.",
+                    "Leave",
+                    move |this, window, cx| {
+                        let chat = chat.clone();
+                        this.contact_op(
+                            window,
+                            cx,
+                            |session, cx| session.leave_group(&chat, cx),
+                            |(), _, _, _| {},
+                        );
+                    },
+                    window,
+                    cx,
+                );
+            }
+            Command::DeleteChat => {
+                let Some(chat) = self.open_group(window, cx) else {
+                    return;
+                };
+                self.confirm(
+                    "Delete this group?",
+                    "You leave it, and its messages are erased from this device.",
+                    "Delete",
+                    move |this, window, cx| {
+                        let chat = chat.clone();
+                        this.contact_op(
+                            window,
+                            cx,
+                            |session, cx| session.delete_group(&chat, cx),
+                            |(), _, _, _| {},
+                        );
+                    },
+                    window,
+                    cx,
+                );
+            }
         }
+    }
+
+    /// The open chat, if it is a group; tells the user otherwise.
+    fn open_group(&self, window: &mut Window, cx: &mut App) -> Option<ChatId> {
+        let list = self.chat_list.read(cx);
+        let chat = list.selected_index().map(|ix| &list.chats()[ix]);
+        match chat {
+            Some(chat) if chat.is_group => Some(chat.id.clone()),
+            _ => {
+                show_refusal("Open a group first".into(), window, cx);
+                None
+            }
+        }
+    }
+
+    /// Asks before something that can't be undone. Dialogs render outside
+    /// the workspace, so `run` reaches it through a weak handle.
+    fn confirm(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        ok: &'static str,
+        run: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.weak_entity();
+        let run = std::rc::Rc::new(run);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (this, run) = (this.clone(), run.clone());
+            alert
+                .confirm()
+                .title(title)
+                .description(description)
+                .ok_text(ok)
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    _ = this.update(cx, |this, cx| run(this, window, cx));
+                    true
+                })
+        });
     }
 
     fn send_contact_request(
@@ -500,7 +664,7 @@ impl Workspace {
         F: Future<Output = Result<T, String>> + 'static,
     {
         let Some(session) = &self.session else {
-            show_refusal("Contacts need an account".into(), window, cx);
+            show_refusal("That needs an account".into(), window, cx);
             return;
         };
         if self.contact_task.is_some() {
@@ -719,6 +883,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_helix_mode))
             .on_action(cx.listener(Self::open_command_line))
             .on_action(cx.listener(Self::add_contact))
+            .on_action(cx.listener(Self::new_group))
+            .on_action(cx.listener(Self::invite_to_group))
             .on_action(cx.listener(Self::accept_request))
             .on_action(cx.listener(Self::decline_request))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
@@ -766,7 +932,15 @@ impl Render for Workspace {
                                     .size(px(300.))
                                     .size_range(px(240.)..px(420.))
                                     .visible(settings.details_open && open_chat.is_some())
-                                    .child(details_pane(open_chat.as_ref(), cx)),
+                                    .child(details_pane(
+                                        open_chat.as_ref(),
+                                        self.members
+                                            .as_ref()
+                                            .map(|(members, _)| members.read(cx))
+                                            .filter(|members| members.is_loaded())
+                                            .map(Members::members),
+                                        cx,
+                                    )),
                             ),
                     ),
             )
@@ -1363,6 +1537,34 @@ mod tests {
         );
         cx.simulate_keystrokes("space d");
         assert!(cx.update(|_, cx| SettingsStore::get(cx).details_open));
+    }
+
+    #[gpui::test]
+    fn leaving_or_deleting_a_group_asks_first(cx: &mut TestAppContext) {
+        let (_, cx) = setup(cx);
+        enable_helix(cx);
+        let run = |line: &str, cx: &mut VisualTestContext| {
+            cx.simulate_keystrokes(":");
+            cx.run_until_parked();
+            cx.simulate_input(line);
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+        };
+        let asking = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| window.has_active_dialog(cx))
+        };
+        // Not in a one-to-one chat: refused before anything is asked.
+        run("o grace", cx);
+        run("leave", cx);
+        assert!(!asking(cx));
+        run("o design", cx);
+        for command in ["leave", "delete-chat"] {
+            run(command, cx);
+            assert!(asking(cx), "{command} didn't ask");
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(!asking(cx));
+        }
     }
 
     #[gpui::test]

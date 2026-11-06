@@ -23,6 +23,19 @@ pub struct UserId(pub SharedString);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageId(pub SharedString);
 
+/// A member of a group, as the details pane lists them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Member {
+    pub id: UserId,
+    /// One bounded line; "You" for the user.
+    pub name: SharedString,
+    pub own: bool,
+    /// Being removed: the removal isn't committed yet.
+    pub removing: bool,
+    /// The room policy lets the user remove them.
+    pub can_remove: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatSummary {
     pub id: ChatId,

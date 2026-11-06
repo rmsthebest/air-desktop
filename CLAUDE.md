@@ -59,6 +59,15 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     privacy-pass tokens arrive in the background, so the first username
     or contact request can fail and succeed on retry.
   - `pending.rs`: the merged change set both workers wake on.
+  - `groups.rs`: create / invite / remove / rename / leave / delete, run
+    detached like contact operations, and the `Members` entity (an open
+    group's members, reloaded on its chat's or any user's change;
+    `can_remove` is upstream's `can_kick` on the room policy, which for
+    the core's trusted default lets any member remove another). Contacts
+    and members are picked by name with `matches_name` (never guessed).
+    The self chat is a group in the core but never one here
+    (`is_group` false, operations refuse it). Invites need the contact's
+    `encrypted_group_profiles` feature, as upstream.
   - `alerts.rs`: desktop notifications ("alerts"; database notifications
     are the core's). Port of upstream `notifications/` + `NotificationPolicy`:
     the queue and username listeners hand over what processing stored; at
@@ -108,7 +117,10 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   takes its place); focusing the composer there focuses the messages.
 - Contacts are added from the command line (`:contact <username>`, which
   `AddContact` prefills); a new chat opens once the list has it
-  (`ChatList::open_when_listed`).
+  (`ChatList::open_when_listed`). Groups likewise: `:group <name>`
+  (`NewGroup`), `:invite`/`:kick` (complete contacts/members), `:rename`,
+  and `:leave`/`:delete-chat` behind a confirm dialog (`Workspace::confirm`
+  reaches the workspace through a weak handle).
 - Normal-mode letter bindings must never live in a context that contains a
   text input (they'd steal typing): use `ChatList`/`MessageList`, or
   `Workspace && helix && !Input`.

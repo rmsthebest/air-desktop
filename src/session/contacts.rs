@@ -173,7 +173,7 @@ impl From<anyhow::Error> for Failure {
     }
 }
 
-fn on_tokio<T: Send + 'static, F>(
+pub(super) fn on_tokio<T: Send + 'static, F>(
     cx: &App,
     what: &'static str,
     future: F,

@@ -9,7 +9,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{Context, Entity, IntoElement, Render, Subscription, Window, div};
 
 use crate::actions::{CommandCancel, CommandComplete};
-use crate::command_line::complete;
+use crate::command_line::{Candidates, complete};
 
 pub enum CommandLineEvent {
     Submit(String),
@@ -18,8 +18,7 @@ pub enum CommandLineEvent {
 
 pub struct CommandLine {
     input: Entity<InputState>,
-    themes: Vec<String>,
-    chats: Vec<String>,
+    candidates: Candidates,
     completions: Vec<(String, String)>,
     /// Completion that Tab accepts next.
     selected: usize,
@@ -30,8 +29,7 @@ impl EventEmitter<CommandLineEvent> for CommandLine {}
 
 impl CommandLine {
     pub fn new(
-        themes: Vec<String>,
-        chats: Vec<String>,
+        candidates: Candidates,
         initial: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -48,8 +46,7 @@ impl CommandLine {
                     window,
                     |this, input, event: &InputEvent, _, cx| match event {
                         InputEvent::Change => {
-                            this.completions =
-                                complete(&input.read(cx).value(), &this.themes, &this.chats);
+                            this.completions = complete(&input.read(cx).value(), &this.candidates);
                             this.selected = 0;
                             cx.notify();
                         }
@@ -62,11 +59,10 @@ impl CommandLine {
                 ),
             ];
         input.read(cx).focus_handle(cx).focus(window, cx);
-        let completions = complete(initial, &themes, &chats);
+        let completions = complete(initial, &candidates);
         Self {
             input,
-            themes,
-            chats,
+            candidates,
             completions,
             selected: 0,
             _subscriptions: subscriptions,

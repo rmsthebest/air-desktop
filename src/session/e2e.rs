@@ -19,12 +19,12 @@ use super::chats::{self, Update};
 use super::contacts::{self, Failure};
 use super::pending::Pending;
 use super::queue::{self, ConnectionStatus, QueueEvent};
-use super::{composer, messages};
+use super::{composer, groups, messages};
 use crate::model::{Message, MessageStatus, Quote};
 use crate::settings::Notifications;
-use aircoreclient::ChatType;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::clients::store::{ClientRecord, ClientRecordState};
+use aircoreclient::{ChatStatus, ChatType};
 use gpui::SharedString;
 
 fn sign_up(code: Option<&str>) -> SignUp {
@@ -548,6 +548,98 @@ async fn e2e_two_users_connect_by_username_and_talk() {
         m.plain_text() == "hi ada" && m.sender_name == "Robert"
     })
     .await;
+
+    // Ada starts a group and invites Bob by (the start of) his name.
+    let group = groups::create(&ada, "Engines").await.unwrap();
+    assert!(refused(groups::create(&ada, "  ").await));
+    let invited = eventually("Bob's features are known", async || {
+        groups::invite(ada.clone(), group, "rob".into()).await.ok()
+    })
+    .await;
+    assert_eq!(invited, "Robert");
+    assert!(refused(
+        groups::invite(ada.clone(), group, "robert".into()).await
+    ));
+    let bob_group = eventually("Bob joins the group", async || {
+        for id in bob.ordered_chat_ids().await.unwrap() {
+            if let Some(chat) = bob.chat(&id).await
+                && matches!(chat.chat_type, ChatType::Group(_))
+                && !bob.chat_is_self_group(&chat.group_id).await.unwrap()
+            {
+                return Some(id);
+            }
+        }
+        None
+    })
+    .await;
+
+    // Both see both members, themselves first. Groups are created with the
+    // core's trusted policy: any member may remove another.
+    let members = |user: CoreUser, chat| async move {
+        let members = groups::load(&user, chat).await.unwrap_or_default();
+        members
+            .into_iter()
+            .map(|(member, _)| (member.name.to_string(), member.own, member.can_remove))
+            .collect::<Vec<_>>()
+    };
+    let ada_view = vec![
+        ("You".to_string(), true, false),
+        ("Robert".to_string(), false, true),
+    ];
+    assert_eq!(members(ada.clone(), group).await, ada_view);
+    let bob_view = vec![
+        ("You".to_string(), true, false),
+        ("Ada Lovelace".to_string(), false, true),
+    ];
+    eventually("Bob sees Ada in the group", async || {
+        let seen = members(bob.clone(), bob_group).await;
+        (seen == bob_view).then_some(())
+    })
+    .await;
+
+    // A rename reaches Bob.
+    groups::rename(&ada, group, "Difference Engines")
+        .await
+        .unwrap();
+    eventually("Bob sees the new name", async || {
+        let chat = bob.chat(&bob_group).await?;
+        (chat.attributes()?.title == "Difference Engines").then_some(())
+    })
+    .await;
+
+    // Ada removes Bob: his group ends, and he can only delete it.
+    let (_, (_, bob_id)) = groups::load(&ada, group)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(member, _)| !member.own)
+        .unwrap();
+    ada.remove_users(group, vec![bob_id]).await.unwrap();
+    eventually("Bob is removed", async || {
+        let chat = bob.chat(&bob_group).await?;
+        matches!(chat.status(), ChatStatus::Inactive(_)).then_some(())
+    })
+    .await;
+    assert_eq!(
+        members(ada.clone(), group).await,
+        [("You".to_string(), true, false)]
+    );
+    assert!(refused(groups::leave(&bob, bob_group).await));
+    groups::delete(&bob, bob_group).await.unwrap();
+    assert!(bob.chat(&bob_group).await.is_none());
+    // Groups-only operations refuse a one-to-one chat and the self chat.
+    assert!(refused(groups::leave(&ada, ada_chat).await));
+    let ada_self = eventually("Ada has a self chat", async || {
+        for id in ada.ordered_chat_ids().await.unwrap() {
+            let chat = ada.chat(&id).await?;
+            if ada.chat_is_self_group(&chat.group_id).await.unwrap() {
+                return Some(id);
+            }
+        }
+        None
+    })
+    .await;
+    assert!(refused(groups::leave(&ada, ada_self).await));
 
     // A removed username is no longer listened to or reported.
     contacts::remove_username(ada.clone(), name.clone())

@@ -9,6 +9,7 @@ pub mod composer;
 mod contacts;
 #[cfg(test)]
 mod e2e;
+pub mod groups;
 pub mod messages;
 mod pending;
 mod preview;

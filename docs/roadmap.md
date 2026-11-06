@@ -4,7 +4,7 @@ Milestones 1–7 follow the original plan (scaffold through polish). The
 "later" list and the review gates' deferred items are ordered here as
 milestones. Each one ends with a review gate (see CLAUDE.md).
 
-8. **Groups and members.** Create a group, invite contacts, remove members
+8. **Groups and members** (done). Create a group, invite contacts, remove members
    (as the room policy allows), rename, leave and delete. Members are shown
    in the details pane. Keyboard and `:` commands for each.
 9. **Reactions.** Show reactions under messages, and add or retract one

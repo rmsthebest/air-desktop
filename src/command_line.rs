@@ -23,6 +23,28 @@ pub enum Command {
     /// Accept or decline the open chat's contact request.
     Accept,
     Decline,
+    /// Create a group with this name.
+    Group(String),
+    /// Invite a contact to the open group, by name as typed.
+    Invite(String),
+    /// Remove a member from the open group, by name as typed.
+    Kick(String),
+    /// Rename the open group.
+    Rename(String),
+    Leave,
+    /// Delete the open group (after confirming).
+    DeleteChat,
+}
+
+/// What arguments complete from.
+#[derive(Default)]
+pub struct Candidates {
+    pub themes: Vec<String>,
+    pub chats: Vec<String>,
+    /// Contacts' names (one-to-one chats).
+    pub contacts: Vec<String>,
+    /// The open group's members, other than the user.
+    pub members: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -33,6 +55,8 @@ enum Arg {
     Appearance,
     Keymap,
     Notifications,
+    Contact,
+    Member,
     /// Free text, not completed (e.g. a username).
     Text,
 }
@@ -93,6 +117,36 @@ const SPECS: &[Spec] = &[
         names: &["decline"],
         arg: Arg::None,
         help: "Decline the open contact request",
+    },
+    Spec {
+        names: &["group"],
+        arg: Arg::Text,
+        help: "Create a group with this name",
+    },
+    Spec {
+        names: &["invite"],
+        arg: Arg::Contact,
+        help: "Invite a contact to the open group",
+    },
+    Spec {
+        names: &["kick", "remove"],
+        arg: Arg::Member,
+        help: "Remove a member from the open group",
+    },
+    Spec {
+        names: &["rename"],
+        arg: Arg::Text,
+        help: "Rename the open group",
+    },
+    Spec {
+        names: &["leave"],
+        arg: Arg::None,
+        help: "Leave the open group",
+    },
+    Spec {
+        names: &["delete-chat"],
+        arg: Arg::None,
+        help: "Delete the open group",
     },
     Spec {
         names: &["username"],
@@ -160,13 +214,19 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "decline" => Command::Decline,
         "username" => Command::AddUsername(need("a username")?),
         "remove-username" => Command::RemoveUsername(need("a username")?),
+        "group" => Command::Group(need("a name")?),
+        "invite" => Command::Invite(need("a contact")?),
+        "kick" => Command::Kick(need("a member")?),
+        "rename" => Command::Rename(need("a name")?),
+        "leave" => Command::Leave,
+        "delete-chat" => Command::DeleteChat,
         other => unreachable!("spec {other} has no parser"),
     })
 }
 
 /// Completions for the current input, each a full replacement line, plus a
 /// short description for display.
-pub fn complete(input: &str, themes: &[String], chats: &[String]) -> Vec<(String, String)> {
+pub fn complete(input: &str, candidates: &Candidates) -> Vec<(String, String)> {
     let input = input.trim_start_matches(':').trim_start();
     let Some((name, arg)) = input.split_once(char::is_whitespace) else {
         return SPECS
@@ -181,8 +241,10 @@ pub fn complete(input: &str, themes: &[String], chats: &[String]) -> Vec<(String
     };
     let candidates: Vec<String> = match spec.arg {
         Arg::None | Arg::Text => return Vec::new(),
-        Arg::Theme => themes.to_vec(),
-        Arg::Chat => chats.to_vec(),
+        Arg::Theme => candidates.themes.clone(),
+        Arg::Chat => candidates.chats.clone(),
+        Arg::Contact => candidates.contacts.clone(),
+        Arg::Member => candidates.members.clone(),
         Arg::Appearance => ["system", "light", "dark"].map(String::from).to_vec(),
         Arg::Keymap => ["standard", "helix"].map(String::from).to_vec(),
         Arg::Notifications => ["full", "private", "off"].map(String::from).to_vec(),
@@ -290,6 +352,9 @@ mod tests {
             ":notifications loud",
             ":contact",
             ":accept now",
+            ":group",
+            ":group  ",
+            ":leave now",
         ] {
             assert!(parse(input).is_err(), "{input:?} should fail");
         }
@@ -297,19 +362,26 @@ mod tests {
 
     #[test]
     fn completes_names_then_arguments() {
-        let themes = vec!["Air Dark".to_string(), "Air Light".to_string()];
-        let names: Vec<_> = complete(":th", &themes, &[])
-            .into_iter()
-            .map(|c| c.0)
-            .collect();
-        assert_eq!(names, ["theme"]);
-        let args: Vec<_> = complete(":theme dark", &themes, &[])
-            .into_iter()
-            .map(|c| c.0)
-            .collect();
-        assert_eq!(args, ["theme Air Dark"]);
-        assert!(complete(":q x", &themes, &[]).is_empty());
-        assert!(complete(":nope x", &themes, &[]).is_empty());
+        let candidates = Candidates {
+            themes: vec!["Air Dark".to_string(), "Air Light".to_string()],
+            contacts: vec!["Grace Hopper".to_string()],
+            members: vec!["Alan Turing".to_string()],
+            ..Candidates::default()
+        };
+        let first = |input| -> Vec<String> {
+            complete(input, &candidates)
+                .into_iter()
+                .map(|c| c.0)
+                .collect()
+        };
+        assert_eq!(first(":th"), ["theme"]);
+        assert_eq!(first(":theme dark"), ["theme Air Dark"]);
+        // Invites complete from contacts, removals from members.
+        assert_eq!(first(":invite gr"), ["invite Grace Hopper"]);
+        assert_eq!(first(":kick al"), ["kick Alan Turing"]);
+        assert!(first(":kick gr").is_empty());
+        assert!(first(":q x").is_empty());
+        assert!(first(":nope x").is_empty());
     }
 
     #[test]
@@ -321,7 +393,9 @@ mod tests {
                     Arg::Appearance => format!("{name} dark"),
                     Arg::Keymap => format!("{name} helix"),
                     Arg::Notifications => format!("{name} private"),
-                    Arg::Theme | Arg::Chat | Arg::Text => format!("{name} x"),
+                    Arg::Theme | Arg::Chat | Arg::Contact | Arg::Member | Arg::Text => {
+                        format!("{name} x")
+                    }
                 };
                 assert!(parse(&line).is_ok(), "{line:?} should parse");
             }

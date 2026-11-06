@@ -19,6 +19,8 @@ airapiclient = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c56
 mimi_content = { git = "https://github.com/phnx-im/mimi-content", rev = "9690d8f28a5470695b9fb715e284d7ea59d97fc0" }
 
 anyhow = "1"
+# Room policy, for who may remove whom in a group (at the rev Air pins).
+mimi-room-policy = { git = "https://github.com/phnx-im/mimi-room-policy", rev = "603f3e07372119560ce9d60252e5df2f6cbd1e18" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 directories = "6"
 # Air's markdown flavour; previews are flattened from it.
@@ -27,6 +29,8 @@ pulldown-cmark = { version = "0.13", default-features = false }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Room policy ids are TLS-serialized user ids.
+tls_codec = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
 tokio-stream = "0.1"
 tracing = "0.1"

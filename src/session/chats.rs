@@ -315,7 +315,8 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
             let name = user.user_profile(peer).await.display_name.to_string();
             (name, request(&chat.chat_type, chat.status()), false)
         }
-        ChatType::Group(attributes) => (attributes.title.clone(), None, true),
+        // The self chat is a group of the user's devices, not one to manage.
+        ChatType::Group(attributes) => (attributes.title.clone(), None, !is_self_chat),
     };
     let title = if is_self_chat {
         "Notes to self".to_string()

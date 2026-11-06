@@ -105,7 +105,9 @@ pub fn change(row: &Row, forward: bool, themes: &Themes) -> Option<SettingsEvent
         Row::Notifications(current) => {
             SettingsEvent::Notifications(step(&[Full, Private, Off], current, forward)?)
         }
-        // Text and lists aren't stepped: either key edits.
+        // Text and lists aren't stepped: only the forward key (enter,
+        // right) acts on them, so stepping back never starts a removal.
+        _ if !forward => return None,
         Row::DisplayName(name) => SettingsEvent::EditDisplayName(name.clone()),
         Row::Username(name) => SettingsEvent::RemoveUsername(name.clone()),
         Row::AddUsername => SettingsEvent::AddUsername,
@@ -401,10 +403,12 @@ mod tests {
                 Row::AddUsername
             ]
         );
-        // A username row removes that username, never another.
+        // A username row removes that username, never another, and only
+        // on the forward key.
         assert_eq!(
             change(&tail[2], true, &themes()),
             Some(SettingsEvent::RemoveUsername("ada-2".into()))
         );
+        assert_eq!(change(&tail[2], false, &themes()), None);
     }
 }

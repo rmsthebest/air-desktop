@@ -703,3 +703,22 @@ one (mock mode only).
 
 Still deferred: the file-dialog seam test (same chat, another chat, no
 chat) and the core-backed `retry` test.
+
+## Gate 13 — settings screen, milestone 11 (`7f64842..2f3040b`): PASS
+
+Fixed:
+- **The chat behind the settings counted as looked at (medium).** While
+  the settings are shown, attention reports no open chat (alerts show,
+  and other devices aren't told to stay quiet), and the hidden
+  conversation marks nothing as seen; it measures what is in view anew
+  once drawn again.
+- **Left on a username offered its removal (low).** Only the forward key
+  (enter, right) acts on text and list rows.
+- **Tab couldn't reach the settings (low)** from the chat list.
+- **No word after removing a username (low)**, from the screen or
+  `:remove-username`.
+- Tests: stepping back on a username does nothing; a theme from the
+  settings changes only its half and keeps the appearance.
+
+Deferred (need an account seam in workspace tests): attention while the
+settings are open, and a username removal waiting for its confirm.

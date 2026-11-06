@@ -91,7 +91,7 @@ impl Workspace {
                         // After a back/forward step this is the jumplist's current
                         // entry, which `push` ignores.
                         this.jumps.push(id.clone());
-                        this.settings_open = false;
+                        this.hide_settings(window, cx);
                         let (messages, compose) = match &this.session {
                             Some(session) => (
                                 cx.new(|cx| Messages::open(session, id, cx)),
@@ -188,10 +188,12 @@ impl Workspace {
     fn report_attention(&self, window: &Window, cx: &mut App) {
         let Some(session) = &self.session else { return };
         let active = window.is_window_active();
+        // Behind the settings screen, the chat isn't being looked at.
         let open = self
             .conversation
             .read(cx)
             .chat()
+            .filter(|_| !self.settings_open)
             .map(|chat| chat.id.clone());
         session.update(cx, |session, _| {
             session.set_attention(active, open.as_ref())
@@ -260,7 +262,7 @@ impl Workspace {
 
     fn focus_messages(&mut self, _: &FocusMessages, window: &mut Window, cx: &mut Context<Self>) {
         if self.has_open_chat(cx) {
-            self.hide_settings(cx);
+            self.hide_settings(window, cx);
             self.conversation.focus_handle(cx).focus(window, cx);
         }
     }
@@ -271,7 +273,7 @@ impl Workspace {
             return;
         };
         let request = list.chats()[ix].request.is_some();
-        self.hide_settings(cx);
+        self.hide_settings(window, cx);
         // A contact request's chat has no composer until it is accepted.
         if request {
             self.conversation.focus_handle(cx).focus(window, cx);
@@ -294,20 +296,26 @@ impl Workspace {
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = true;
+        self.conversation
+            .update(cx, |conversation, _| conversation.set_hidden(true));
+        self.report_attention(window, cx);
         self.settings_view.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
-    fn hide_settings(&mut self, cx: &mut Context<Self>) {
+    fn hide_settings(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.settings_open {
             self.settings_open = false;
+            self.conversation
+                .update(cx, |conversation, _| conversation.set_hidden(false));
+            self.report_attention(window, cx);
             cx.notify();
         }
     }
 
     /// Closes the settings, back to the open chat if there is one.
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.hide_settings(cx);
+        self.hide_settings(window, cx);
         if self.has_open_chat(cx) {
             self.focus_messages(&FocusMessages, window, cx);
         } else {
@@ -352,7 +360,7 @@ impl Workspace {
                             window,
                             cx,
                             move |session, cx| session.remove_username(&name, cx),
-                            |(), _, _, _| {},
+                            |(), _, window, cx| show_info("Username removed".into(), window, cx),
                         );
                     },
                     window,
@@ -364,7 +372,9 @@ impl Workspace {
     }
 
     fn focus_next_pane(&mut self, _: &FocusNextPane, window: &mut Window, cx: &mut Context<Self>) {
-        if self.chat_list.focus_handle(cx).is_focused(window) {
+        if self.chat_list.focus_handle(cx).is_focused(window) && self.settings_open {
+            self.settings_view.focus_handle(cx).focus(window, cx);
+        } else if self.chat_list.focus_handle(cx).is_focused(window) {
             self.focus_messages(&FocusMessages, window, cx);
         } else {
             self.focus_chat_list(&FocusChatList, window, cx);
@@ -710,7 +720,7 @@ impl Workspace {
                 window,
                 cx,
                 |session, cx| session.remove_username(&username, cx),
-                |(), _, _, _| {},
+                |(), _, window, cx| show_info("Username removed".into(), window, cx),
             ),
             Command::Group(title) => self.contact_op(
                 window,
@@ -1921,6 +1931,21 @@ mod tests {
         cx.simulate_keystrokes(&format!("{MOD}-1"));
         cx.run_until_parked();
         assert!(!workspace.read_with(cx, |workspace, _| workspace.settings_open));
+    }
+
+    #[gpui::test]
+    fn a_theme_from_settings_changes_only_its_half(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+        cx.update(|window, cx| {
+            SettingsStore::update(cx, |settings| settings.appearance = Appearance::Light).unwrap();
+            let dark = theme::by_mode(cx).dark.last().cloned().unwrap();
+            theme::set_theme(&dark, window, cx).unwrap();
+            let settings = SettingsStore::get(cx);
+            assert_eq!(settings.dark_theme, dark);
+            assert_eq!(settings.light_theme, theme::DEFAULT_LIGHT);
+            // Unlike `:theme`, the appearance stays as chosen.
+            assert_eq!(settings.appearance, Appearance::Light);
+        });
     }
 
     #[gpui::test]

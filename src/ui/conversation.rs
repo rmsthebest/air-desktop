@@ -65,6 +65,9 @@ pub struct Conversation {
     probes: Rc<RefCell<Probes>>,
     /// The messages in view, as of the last drawn frame.
     shown: Option<Shown>,
+    /// Not on screen (the settings screen is in its place): nothing it
+    /// last showed counts as seen.
+    hidden: bool,
     /// Message under the normal-mode cursor.
     cursor: Option<usize>,
     /// The reaction picker is open, for the message under the cursor.
@@ -175,6 +178,7 @@ impl Conversation {
             list,
             probes: Rc::default(),
             shown: None,
+            hidden: false,
             cursor: None,
             reacting: false,
             focus_handle: cx.focus_handle(),
@@ -450,7 +454,19 @@ impl Conversation {
 
     /// What is in view changed (or the window was activated): pages in
     /// more near either end, and marks the newest message in view as seen.
+    /// Hides or shows the conversation. While hidden, nothing in it is
+    /// seen; once drawn again, what is in view is measured anew.
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.hidden = hidden;
+        if hidden {
+            self.shown = None;
+        }
+    }
+
     fn shown_changed(&mut self, shown: Option<Shown>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hidden {
+            return;
+        }
         self.shown = shown.clone();
         let (Some(shown), Some(messages)) = (shown, self.messages.clone()) else {
             return;

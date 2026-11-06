@@ -405,12 +405,13 @@ impl Workspace {
             _ = this.update_in(cx, |this, window, cx| {
                 let list = this.chat_list.read(cx);
                 let open = list.selected_index().map(|ix| list.chats()[ix].id.clone());
-                if open.as_ref() != Some(&chat) {
-                    show_refusal(
-                        "Another chat was opened meanwhile; nothing was sent".into(),
-                        window,
-                        cx,
-                    );
+                let changed = match open {
+                    Some(open) if open == chat => None,
+                    Some(_) => Some("Another chat was opened meanwhile; nothing was sent"),
+                    None => Some("The chat was closed; nothing was sent"),
+                };
+                if let Some(refusal) = changed {
+                    show_refusal(refusal.into(), window, cx);
                     return;
                 }
                 // Still that chat; `sendable_chat` tells why if it can't

@@ -692,3 +692,14 @@ assumes one instance); a data-directory lock is for later.
 
 Deferred: a core-backed test of `retry` on a stale downloading
 attachment versus a claimed one.
+
+## Gate 12g — gate 12f fixes (`35c3afb..785d78c`): PASS
+
+Fixed (low): a file dialog answered with no chat open says the chat was
+closed, not that another was opened.
+
+Accepted: without an account, `s` on a downloading file says files need
+one (mock mode only).
+
+Still deferred: the file-dialog seam test (same chat, another chat, no
+chat) and the core-backed `retry` test.

@@ -256,10 +256,21 @@ impl Workspace {
         // On Wayland the compositor may only mark the window as wanting
         // attention: gpui can't pass on the server's activation token.
         window.activate_window();
-        self.unhide_settings(cx);
-        self.jump_to_chat(chat, window, cx);
-        // In case the chat was open already (no `Opened` to report it).
-        self.report_attention(window, cx);
+        let already_open = self.chat_list.read(cx).selected() == Some(&chat);
+        let was_hidden = self.unhide_settings(cx);
+        // A chat just added may not be listed yet.
+        self.chat_list
+            .update(cx, |list, cx| list.open_when_listed(chat, cx));
+        if Self::helix(cx) {
+            self.focus_messages(&FocusMessages, window, cx);
+        } else {
+            self.focus_composer(&FocusComposer, window, cx);
+        }
+        // Otherwise `Opened` reports the chat once it is shown; reporting
+        // now would name the chat that was open before.
+        if already_open && was_hidden {
+            self.report_attention(window, cx);
+        }
     }
 
     fn update_chat_list(

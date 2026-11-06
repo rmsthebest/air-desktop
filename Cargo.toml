@@ -56,6 +56,7 @@ zbus = { version = "5", default-features = false, features = ["async-io"] }
 gpui-pre = { version = "=0.3.11", features = ["test-support"] }
 gpui-pre-platform = { version = "=0.3.11", features = ["test-support"] }
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 # Mirrors the [patch] sections of the pinned Air workspace (patches do not
 # propagate to dependents). Keep in sync when bumping the Air rev.

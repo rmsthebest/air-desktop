@@ -96,6 +96,11 @@ impl ChatList {
         self.chats.iter().find(|chat| &chat.id == id)
     }
 
+    /// The open chat.
+    pub fn selected(&self) -> Option<&ChatId> {
+        self.selected.as_ref()
+    }
+
     pub fn selected_index(&self) -> Option<usize> {
         let selected = self.selected.as_ref()?;
         self.chats.iter().position(|chat| &chat.id == selected)

@@ -134,7 +134,11 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   never newer), and a closed notification is forgotten so no rewrite
   brings it back. `private` mode keeps one shared notification for all
   chats, closed once none needs it. While the server can't be told, no
-  id is replaced or closed; failed closes retry every 30 s.
+  id is replaced or closed; failed closes retry every 30 s. Signals are
+  read by a pump task (unread ones would stall zbus's reader). A close
+  that follows a click marks nothing. The fake screen can't catch wire
+  types: `notify_args`' signature is pinned, and
+  `cargo test desktop_notify_and_close -- --ignored` uses the real server.
 - The local server rate-limits sign-ups: back-to-back e2e runs fail with
   "Rate limited"/"Too Many Requests" at sign-up or the first requests.
 - `src/markdown.rs` — bounded message markdown parse (size/depth caps; only

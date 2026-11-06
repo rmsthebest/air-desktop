@@ -738,3 +738,48 @@ Fixed (low):
 Deferred: a `Conversation` test that hide then unhide still marks seen
 (needs drawn frames in a test window); the attention-order test (needs
 an account seam).
+
+## Gate 14 — notification actions, milestone 12 (`115dd15..1818cd1`): BLOCK
+
+Milestone 12 also closed earlier deferrals: retrying closes on a timer
+(gate 9d), dunst reusing a closed notification's id (gate 9e; closed
+notifications are now forgotten on `NotificationClosed`), and an old
+`replaces_id` after a failed owner lookup (gate 10; nothing is replaced
+or closed while the server is unknown).
+
+Fixed:
+- **Every notification failed on real desktops (high).** The actions
+  were a fixed-size array, which zvariant sends as a struct
+  (`(susss(ss)a{sv}i)`), so servers refused `Notify`. Now a `Vec`. The
+  arguments come from `notify_args`, whose signature a unit test pins,
+  and an ignored test (`desktop_notify_and_close`) shows and closes one on
+  the machine's real server. It failed on the old code against Plasma.
+- **Unread signals could stall the connection (low).** A pump task reads
+  the service's signals as they come and keeps only replies we act on
+  (bounded, extra ones dropped), so zbus's queue never fills and holds
+  back method replies.
+- **The close retry could be put off forever (low).** Its deadline is
+  kept across loop passes. Covered in
+  `replies_reach_the_session_and_failed_closes_retry_meanwhile` (paused
+  time; it fails with a restarting timer).
+- **A click counted as a dismissal (low).** Servers close a clicked
+  notification as dismissed; that close now marks nothing, so a shared
+  notification's other chats stay unnotified.
+- **A click could report the previous chat as looked at (low).** Attention
+  is reported directly only when the clicked chat was already open behind
+  the settings; otherwise `Opened` reports it.
+- **Clicking an alert for a chat not yet listed did nothing (low).** It
+  opens once listed.
+- Tests: an edit under `private` changes nothing on screen, but changes
+  what a dismissal marks; a shared notification closed without our
+  hearing of it doesn't bring its chats back; signal parsing.
+
+Accepted: on Wayland the window may only be marked as wanting attention,
+since gpui can't activate with the server's token. A notification shown
+while the server was unknown is forgotten if the server turns out to have
+restarted.
+
+Deferred (needs an account seam): a workspace test that opening from an
+alert with the settings open reports attention once, for the clicked chat.
+The e2e step pins that an alert's `until` covers what it shows; the path
+from notifier outcome to `set_chat_notified_until` has no test.

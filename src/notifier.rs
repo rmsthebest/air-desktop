@@ -95,8 +95,15 @@ pub async fn run(
     mut outcome: impl FnMut(Outcome) + Send,
 ) {
     let mut notifier = Notifier::new(desktop);
+    // Kept across passes: replies about other apps' notifications mustn't
+    // keep putting it off.
+    let mut retry_at = None;
     loop {
-        let retrying = !notifier.closing.is_empty();
+        retry_at = match retry_at {
+            _ if notifier.closing.is_empty() => None,
+            None => Some(tokio::time::Instant::now() + RETRY_CLOSE),
+            due => due,
+        };
         tokio::select! {
             notice = notices.next() => {
                 let attention = *attention.borrow();
@@ -106,8 +113,18 @@ pub async fn run(
                 notifier.replied(reply).into_iter().for_each(&mut outcome);
             }
             // Stale text mustn't wait for the next alert to go.
-            () = tokio::time::sleep(RETRY_CLOSE), if retrying => notifier.retry().await,
+            () = sleep_until(retry_at) => {
+                retry_at = None;
+                notifier.retry().await;
+            }
         }
+    }
+}
+
+async fn sleep_until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -142,6 +159,10 @@ struct Notifier<D> {
     /// Which server runs couldn't be told for this notice: the ids above
     /// may be another app's by now, so none is replaced or closed.
     unsure: bool,
+    /// The notification last clicked. Servers close it right after, as if
+    /// dismissed; that close marks nothing: a click opens one chat, and
+    /// the others of a shared one still have activity to alert.
+    clicked: Option<u32>,
 }
 
 impl<D: Desktop + Send> Notifier<D> {
@@ -155,6 +176,7 @@ impl<D: Desktop + Send> Notifier<D> {
             owner: None,
             stalled: false,
             unsure: false,
+            clicked: None,
         }
     }
 
@@ -236,6 +258,10 @@ impl<D: Desktop + Send> Notifier<D> {
             self.owner = self.desktop.owner().await.flatten();
         }
         self.seq += 1;
+        if self.clicked == Some(id) {
+            // Shown again since: a close from now on is the user's.
+            self.clicked = None;
+        }
         let previous = self.shown.insert(
             alert.chat,
             Shown {
@@ -343,19 +369,25 @@ impl<D: Desktop + Send> Notifier<D> {
             .map(|(chat, shown)| (*chat, *shown))
             .collect();
         match reply.what {
-            Replied::Clicked => chats
-                .iter()
-                .max_by_key(|(_, shown)| shown.seq)
-                .map(|(chat, _)| Outcome::Open(*chat))
-                .into_iter()
-                .collect(),
+            Replied::Clicked => {
+                if !chats.is_empty() {
+                    self.clicked = Some(reply.id);
+                }
+                chats
+                    .iter()
+                    .max_by_key(|(_, shown)| shown.seq)
+                    .map(|(chat, _)| Outcome::Open(*chat))
+                    .into_iter()
+                    .collect()
+            }
             Replied::Dismissed | Replied::Expired => {
                 self.shown.retain(|_, shown| shown.id != reply.id);
                 if self.shared == Some(reply.id) {
                     self.shared = None;
                 }
                 self.closing.retain(|&id| id != reply.id);
-                if reply.what == Replied::Expired {
+                let clicked = self.clicked.take_if(|id| *id == reply.id).is_some();
+                if reply.what == Replied::Expired || clicked {
                     return Vec::new();
                 }
                 chats
@@ -465,6 +497,17 @@ mod tests {
         Alert {
             until: DateTime::from_timestamp(at, 0),
             ..alert(chat, body)
+        }
+    }
+
+    impl Alert {
+        /// As `private` shows it.
+        fn private(self, at: i64) -> Self {
+            Self {
+                title: "Air".into(),
+                until: DateTime::from_timestamp(at, 0),
+                ..self
+            }
         }
     }
 
@@ -674,11 +717,14 @@ mod tests {
         notifier
             .handle(Notice::Show(alert_until(2, "other", 20)), &private)
             .await;
-        // A click opens the newest; a dismissal marks every chat in it.
-        assert_eq!(
-            user_does(&mut notifier, "New activity", Replied::Clicked),
-            [Outcome::Open(second)]
-        );
+        // An edit under `private` changes nothing on screen, only what a
+        // dismissal marks.
+        notifier
+            .handle(Notice::Refresh(alert_until(1, "secret!", 15)), &private)
+            .await;
+        let on_screen: Vec<_> = notifier.desktop.visible.values().cloned().collect();
+        assert_eq!(on_screen, [(alert(2, "New activity").private(20), false)]);
+        // A dismissal marks every chat in it.
         let mut marked = user_does(&mut notifier, "New activity", Replied::Dismissed);
         marked.sort_by_key(|outcome| match outcome {
             Outcome::Dismissed { until, .. } => *until,
@@ -689,7 +735,7 @@ mod tests {
             [
                 Outcome::Dismissed {
                     chat: first,
-                    until: DateTime::from_timestamp(10, 0).unwrap(),
+                    until: DateTime::from_timestamp(15, 0).unwrap(),
                 },
                 Outcome::Dismissed {
                     chat: second,
@@ -698,8 +744,26 @@ mod tests {
             ]
         );
 
-        // The next alert gets a new shared notification, and only its
-        // chat is in it: the dismissed ones don't come back with it.
+        // A click opens the newest chat, and the close the server sends
+        // after it marks nothing: the other chat's activity is unseen.
+        notifier
+            .handle(Notice::Show(alert_until(1, "secret", 10)), &private)
+            .await;
+        notifier
+            .handle(Notice::Show(alert_until(2, "other", 20)), &private)
+            .await;
+        assert_eq!(
+            user_does(&mut notifier, "New activity", Replied::Clicked),
+            [Outcome::Open(second)]
+        );
+        assert!(user_does(&mut notifier, "New activity", Replied::Dismissed).is_empty());
+
+        // Closed by the user without our hearing of it: the next alert
+        // gets a new shared notification, and only its chat is in it.
+        notifier
+            .handle(Notice::Show(alert_until(1, "secret", 10)), &private)
+            .await;
+        notifier.desktop.visible.clear();
         notifier
             .handle(Notice::Show(alert_until(3, "new", 30)), &private)
             .await;
@@ -713,6 +777,98 @@ mod tests {
             .handle(Notice::Show(alert_until(4, "hello", 40)), &full)
             .await;
         assert_eq!(bodies(&notifier), ["New activity", "hello"]);
+    }
+
+    /// A screen the test can look at while `run` owns it, and replies the
+    /// test sends.
+    struct Watched {
+        screen: Arc<std::sync::Mutex<Screen>>,
+        replies: tokio::sync::mpsc::UnboundedReceiver<Reply>,
+    }
+
+    impl Watched {
+        /// The screen's calls never wait, so they finish under the lock.
+        fn now<T>(&self, call: impl FnOnce(&mut Screen) -> T) -> T {
+            call(&mut self.screen.lock().unwrap())
+        }
+    }
+
+    fn at_once<T>(future: impl Future<Output = T>) -> T {
+        use futures_util::FutureExt;
+        future.now_or_never().expect("the screen never waits")
+    }
+
+    impl Desktop for Watched {
+        async fn notify(&mut self, replaces: u32, alert: &Alert, quiet: bool) -> Option<u32> {
+            self.now(|screen| at_once(screen.notify(replaces, alert, quiet)))
+        }
+        async fn close(&mut self, id: u32) -> bool {
+            self.now(|screen| at_once(screen.close(id)))
+        }
+        async fn owner(&mut self) -> Option<Owner> {
+            self.now(|screen| at_once(screen.owner()))
+        }
+        async fn reply(&mut self) -> Reply {
+            match self.replies.recv().await {
+                Some(reply) => reply,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replies_reach_the_session_and_failed_closes_retry_meanwhile() {
+        use std::time::Duration;
+        let screen = Arc::new(std::sync::Mutex::new(Screen::default()));
+        let (replies_tx, replies) = tokio::sync::mpsc::unbounded_channel();
+        let notices = Arc::new(NoticeQueue::default());
+        let (_attention, attention) = watch::channel(Attention::default());
+        let (outcomes_tx, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
+        let desktop = Watched {
+            screen: screen.clone(),
+            replies,
+        };
+        let running = tokio::spawn(run(notices.clone(), attention, desktop, move |outcome| {
+            _ = outcomes_tx.send(outcome)
+        }));
+        let (first, second) = (alert(1, "").chat, alert(2, "").chat);
+        notices.push(Notice::Show(alert(1, "hi")));
+        notices.push(Notice::Show(alert(2, "stale")));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let (from, hi) = {
+            let screen = screen.lock().unwrap();
+            let hi = screen.visible.iter().find(|(_, (a, _))| a.chat == first);
+            (screen.server.unwrap().to_string(), *hi.unwrap().0)
+        };
+        let reply = |id, what| Reply {
+            from: from.clone(),
+            id,
+            what,
+        };
+        replies_tx.send(reply(hi, Replied::Clicked)).unwrap();
+        assert_eq!(outcomes.recv().await, Some(Outcome::Open(first)));
+
+        // Closing the stale one fails; replies about other apps'
+        // notifications keep coming, and the retry still comes due.
+        screen.lock().unwrap().down = true;
+        notices.push(Notice::Dismiss(Dismiss::Chat(second)));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        screen.lock().unwrap().down = false;
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            replies_tx.send(reply(999, Replied::Expired)).unwrap();
+        }
+        let left: Vec<_> = {
+            let screen = screen.lock().unwrap();
+            screen
+                .visible
+                .values()
+                .map(|(a, _)| a.body.clone())
+                .collect()
+        };
+        assert_eq!(left, ["hi"]);
+        running.abort();
     }
 
     #[tokio::test]
@@ -730,10 +886,9 @@ mod tests {
             .visible
             .insert(1, (alert(7, "theirs"), false));
         notifier.desktop.lookup_down = true;
+        // Shown anew; the old id would be closed now, were the server
+        // known.
         notifier.handle(Notice::Show(alert(1, "new")), &full).await;
-        notifier
-            .handle(Notice::Dismiss(Dismiss::Chat(alert(2, "").chat)), &full)
-            .await;
         assert_eq!(bodies(&notifier), ["new", "theirs"]);
         // Once it can be told, the old id is forgotten, not closed.
         notifier.desktop.lookup_down = false;
@@ -779,6 +934,7 @@ mod linux {
     use zbus::zvariant::Value;
     use zbus::{Connection, Message, Proxy};
 
+    use tokio::sync::mpsc;
     use tracing::{info, warn};
 
     use crate::session::alerts::Alert;
@@ -850,12 +1006,8 @@ mod linux {
                 let Some(bus) = self.bus.as_mut() else {
                     return std::future::pending().await;
                 };
-                match bus.signals.next().await {
-                    Some(message) => {
-                        if let Some(reply) = reply_from(&message) {
-                            return reply;
-                        }
-                    }
+                match bus.replies.recv().await {
+                    Some(reply) => return reply,
                     // The connection is gone; the next alert reconnects.
                     None => self.bus = None,
                 }
@@ -895,11 +1047,39 @@ mod linux {
 
     const SERVICE: &str = "org.freedesktop.Notifications";
 
+    /// Replies waiting for the notifier. The user acts on one notification
+    /// at a time; beyond this, replies are dropped (a click is lost).
+    const REPLIES: usize = 32;
+
+    /// Reads the service's signals as they come, whatever the notifier is
+    /// doing: unread ones would fill zbus's queue, and then its reader
+    /// waits, holding back the replies to our calls. The service signals
+    /// about every app's notifications, and about our own closes.
+    async fn pump(mut signals: SignalStream<'static>, replies: mpsc::Sender<super::Reply>) {
+        while let Some(message) = signals.next().await {
+            if let Some(reply) = reply_from(&message)
+                && let Err(mpsc::error::TrySendError::Closed(_)) = replies.try_send(reply)
+            {
+                return;
+            }
+        }
+    }
+
+    /// Stops the pump with its connection.
+    struct Pump(tokio::task::JoinHandle<()>);
+
+    impl Drop for Pump {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     struct Bus {
         proxy: Proxy<'static>,
         dbus: DBusProxy<'static>,
-        /// The service's signals: what the user did with notifications.
-        signals: SignalStream<'static>,
+        /// What the user did with notifications, as the pump hears it.
+        replies: mpsc::Receiver<super::Reply>,
+        _pump: Pump,
         /// The server renders a subset of HTML in bodies.
         markup: bool,
     }
@@ -921,12 +1101,15 @@ mod linux {
             .await?;
             // Subscribed before anything is shown, so no reply is missed.
             let signals = proxy.receive_all_signals().await?;
+            let (replies_tx, replies) = mpsc::channel(REPLIES);
+            let pump = Pump(tokio::spawn(pump(signals, replies_tx)));
             let capabilities: Vec<String> = proxy.call("GetCapabilities", &()).await?;
             let markup = capabilities.iter().any(|c| c == "body-markup");
             Ok(Self {
                 proxy,
                 dbus,
-                signals,
+                replies,
+                _pump: pump,
                 markup,
             })
         }
@@ -947,31 +1130,8 @@ mod linux {
             } else {
                 alert.body.clone()
             };
-            let mut hints: HashMap<&str, Value> = HashMap::new();
-            // GNOME 46+ matches notifications to apps by pid.
-            hints.insert("sender-pid", Value::from(std::process::id()));
-            hints.insert("desktop-entry", Value::from(APP_ID));
-            hints.insert("category", Value::from("im.received"));
-            if quiet {
-                hints.insert("suppress-sound", Value::from(true));
-                hints.insert("urgency", Value::from(0u8));
-            }
-            bounded(self.proxy.call(
-                "Notify",
-                &(
-                    "Air",
-                    replaces,
-                    APP_ID,
-                    alert.title.as_str(),
-                    body.as_str(),
-                    // Clicking the notification; servers without actions
-                    // ignore it.
-                    [DEFAULT_ACTION, "Open"],
-                    hints,
-                    -1i32,
-                ),
-            ))
-            .await
+            let args = notify_args(replaces, &alert.title, &body, quiet);
+            bounded(self.proxy.call("Notify", &args)).await
         }
 
         async fn close(&self, id: u32) -> zbus::Result<()> {
@@ -980,6 +1140,47 @@ mod linux {
     }
 
     const DEFAULT_ACTION: &str = "default";
+
+    /// `Notify`'s arguments, `susssasa{sv}i` as the spec has it.
+    type NotifyArgs<'a> = (
+        &'a str,
+        u32,
+        &'a str,
+        &'a str,
+        &'a str,
+        Vec<&'a str>,
+        HashMap<&'a str, Value<'a>>,
+        i32,
+    );
+
+    fn notify_args<'a>(
+        replaces: u32,
+        title: &'a str,
+        body: &'a str,
+        quiet: bool,
+    ) -> NotifyArgs<'a> {
+        let mut hints: HashMap<&str, Value> = HashMap::new();
+        // GNOME 46+ matches notifications to apps by pid.
+        hints.insert("sender-pid", Value::from(std::process::id()));
+        hints.insert("desktop-entry", Value::from(APP_ID));
+        hints.insert("category", Value::from("im.received"));
+        if quiet {
+            hints.insert("suppress-sound", Value::from(true));
+            hints.insert("urgency", Value::from(0u8));
+        }
+        (
+            "Air",
+            replaces,
+            APP_ID,
+            title,
+            body,
+            // Clicking the notification; servers without actions ignore it.
+            // A Vec: a fixed-size array would be sent as a struct.
+            vec![DEFAULT_ACTION, "Open"],
+            hints,
+            -1,
+        )
+    }
 
     /// The spec's close reasons.
     const EXPIRED: u32 = 1;
@@ -1047,6 +1248,33 @@ mod linux {
             .unwrap()
             .build(body)
             .unwrap()
+        }
+
+        /// Shows and closes a notification on this machine's desktop.
+        #[tokio::test]
+        #[ignore = "needs a desktop session's notification server"]
+        async fn desktop_notify_and_close() {
+            use crate::notifier::Desktop as _;
+            let mut desktop = super::Dbus::default();
+            let alert = crate::session::alerts::Alert {
+                chat: aircoreclient::ChatId::new(uuid::Uuid::from_u128(1)),
+                title: "air-desktop test".into(),
+                body: "closes by itself".into(),
+                until: None,
+            };
+            let id = desktop.notify(0, &alert, true).await.expect("shown");
+            assert!(desktop.owner().await.flatten().is_some());
+            assert!(desktop.close(id).await);
+        }
+
+        #[test]
+        fn notify_is_called_as_the_spec_declares_it() {
+            let args = super::notify_args(3, "Grace", "hi", true);
+            let call = Message::method_call("/org/freedesktop/Notifications", "Notify")
+                .unwrap()
+                .build(&args)
+                .unwrap();
+            assert_eq!(call.body().signature().to_string(), "(susssasa{sv}i)");
         }
 
         #[test]

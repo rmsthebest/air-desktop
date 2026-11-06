@@ -590,3 +590,28 @@ Accepted (documented on `set_reaction`): a failed retract can be partial
 (pressing again finishes it); a retract on a stale view does nothing.
 The picker-closes-on-delete behaviour test stays deferred (needs a live
 message window).
+
+## Gate 12 — attachments, milestone 10 (`845e79a..cde7df9`): BLOCK
+
+Fixed:
+- **Sent files weren't queued (high).** After the upload the message is
+  enqueued with the outbound service, and a failed send marked failed,
+  as upstream; before, it went out only on the next wake (up to 60 s)
+  and a failed one showed "sending" forever.
+- **Peer-controlled preview memory (medium).** A decoded preview is kept
+  at most at twice its drawn box (720×540, 1.5 MiB); at most 64 previews
+  per window, past that images show as file cards.
+- **Dropped files sent unasked (medium).** A drop asks first, naming the
+  chat and the files; files are sent one after another, in order.
+- **Stuck downloads (medium).** `s` on a waiting file downloads it now
+  (an arrival the loop missed, say); a downloaded image without a
+  preview gets one when shown.
+- **Concurrent downloads of one file (low).** One download per
+  attachment at a time (`IN_FLIGHT`), shared by the loop and `s`.
+- **Misplaced doc comments (low).** Moved back.
+- Tests: the attachment-part parser (`declared`), and the decode keeping
+  at most the drawn size.
+
+Deferred:
+- A `#[gpui::test]` for releasing preview textures: the test platform's
+  atlas doesn't expose what it holds.

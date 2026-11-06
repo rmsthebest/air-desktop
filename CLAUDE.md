@@ -92,14 +92,20 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     the original where the core says it fits (≤ 8 MiB), decoded by us as
     WebP under limits (1024² edge, 16 MiB) into a gpui `RenderImage`:
     never a failed thumbnail's original, never undecoded bytes. The
-    message worker caches decoded pictures per attachment; the `Messages`
-    entity drops a picture's GPU texture when it leaves the window.
+    message worker caches decoded pictures per attachment (kept at most
+    at twice the drawn box, at most 64 per window); the `Messages` entity
+    drops a picture's GPU texture when it leaves the window. The core
+    doesn't notify when a download's content lands: the downloader
+    reports it. After an upload the message must be enqueued with the
+    outbound service (a failed one marked failed), as upstream. One
+    download per attachment at a time (`IN_FLIGHT`).
     Files are never opened: `s` on one saves a copy to the downloads
     directory under `model::file_name` (one component, not hidden,
     bounded), never replacing a file (`create_new`, numbered), 0600.
-    Save and retry check the message is in the open chat. Sending:
-    `:attach <path>`, the file dialog (`AttachFile`) or dropping files on
-    the chat.
+    Save and download-now (`s` on a failed or waiting file) check the
+    message is in the open chat. Sending: `:attach <path>`, the file
+    dialog (`AttachFile`) or dropping files on the chat (confirmed
+    first); several files go one after another.
   - `alerts.rs`: desktop notifications ("alerts"; database notifications
     are the core's). Port of upstream `notifications/` + `NotificationPolicy`:
     the queue and username listeners hand over what processing stored; at

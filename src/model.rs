@@ -335,6 +335,9 @@ impl std::fmt::Debug for Picture {
     }
 }
 
+/// The box an image preview is drawn in, in pixels.
+pub const PREVIEW_BOX: (u32, u32) = (360, 270);
+
 /// An image's size on screen: fit into `max` keeping its aspect ratio,
 /// never scaled up, never collapsing to nothing.
 pub fn fit(size: (u32, u32), max: (u32, u32)) -> (u32, u32) {

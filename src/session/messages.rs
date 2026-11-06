@@ -319,7 +319,8 @@ impl Messages {
         }))
     }
 
-    /// Downloads the message's file again after a failure.
+    /// Downloads the message's file now: again after a failure, or one
+    /// still waiting.
     pub fn retry_download(
         &self,
         id: &MessageId,
@@ -1048,8 +1049,15 @@ impl Worker {
                     Body::Attachment => match attachments::declared(content.content()) {
                         Some(declared) => {
                             let cached = |id| self.pictures.get(&id).cloned();
-                            match attachments::load(&self.user, message.id(), declared, cached)
-                                .await
+                            let may_decode = self.pictures.len() < attachments::MAX_PICTURES;
+                            match attachments::load(
+                                &self.user,
+                                message.id(),
+                                declared,
+                                cached,
+                                may_decode,
+                            )
+                            .await
                             {
                                 Some((id, shown)) => {
                                     attachment = Some(id);

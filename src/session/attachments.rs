@@ -8,9 +8,10 @@
 //! Images are drawn only from a preview the core made (or checked to be a
 //! small WebP), decoded here under limits.
 
+use std::collections::HashSet;
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::{DbEntityId, DbNotification, DbOperation};
@@ -56,6 +57,36 @@ const MAX_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 /// Memory a preview's decoder may take: a 1024² RGBA image is 4 MiB.
 const MAX_DECODE_ALLOC: u64 = 16 * 1024 * 1024;
 
+/// A decoded preview is kept at most this large: the box it is drawn in,
+/// at twice the pixels for high-density screens (1.5 MiB as BGRA).
+const MAX_KEPT: (u32, u32) = (model::PREVIEW_BOX.0 * 2, model::PREVIEW_BOX.1 * 2);
+
+/// Previews decoded per window at most (each at most [`MAX_KEPT`]); past
+/// that, images show as plain file cards. Peers choose how many images a
+/// chat has.
+pub(super) const MAX_PICTURES: usize = 64;
+
+/// Attachments being downloaded: one download per attachment at a time,
+/// whoever asks (the core doesn't refuse a second).
+static IN_FLIGHT: LazyLock<Mutex<HashSet<AttachmentId>>> = LazyLock::new(Default::default);
+
+/// Holds an attachment in [`IN_FLIGHT`] until dropped.
+struct Claim(AttachmentId);
+
+impl Claim {
+    fn take(id: AttachmentId) -> Option<Self> {
+        let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
+        in_flight.insert(id).then_some(Self(id))
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
+        in_flight.remove(&self.0);
+    }
+}
+
 /// What a message's attachment part declares. All of it is the sender's
 /// word.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +94,8 @@ pub(super) struct Declared {
     pub(super) name: SharedString,
     pub(super) description: Option<SharedString>,
     pub(super) size: u64,
+    /// Declared as an image (it has dimensions), as upstream decides.
+    pub(super) image: bool,
 }
 
 /// The attachment declared in `content`, if it is an attachment message.
@@ -77,24 +110,33 @@ pub(super) fn declared(content: &MimiContent) -> Option<Declared> {
     else {
         return None;
     };
-    parts.iter().find_map(|part| match part {
-        NestedPart::ExternalPart {
-            disposition: Disposition::Attachment,
-            url,
-            description,
-            filename,
-            size,
-            ..
-        } if url.parse::<AttachmentUrl>().is_ok() => Some(Declared {
+    parts
+        .iter()
+        .find_map(|part| match part {
+            NestedPart::ExternalPart {
+                disposition: Disposition::Attachment,
+                url,
+                description,
+                filename,
+                size,
+                ..
+            } => Some((
+                url.parse::<AttachmentUrl>().ok()?,
+                filename,
+                description,
+                size,
+            )),
+            _ => None,
+        })
+        .map(|(url, filename, description, size)| Declared {
             name: match model::preview_line(filename) {
                 name if name.is_empty() => "file".into(),
                 name => name,
             },
             description: Some(model::preview_line(description)).filter(|d| !d.is_empty()),
             size: *size,
-        }),
-        _ => None,
-    })
+            image: url.dimensions().is_some(),
+        })
 }
 
 /// The message's attachment as the view shows it. `None` when the core has
@@ -104,6 +146,7 @@ pub(super) async fn load(
     message: MessageId,
     declared: Declared,
     cached: impl Fn(AttachmentId) -> Option<Picture>,
+    may_decode: bool,
 ) -> Option<(AttachmentId, Attachment)> {
     let id = user
         .attachment_infos_for_message(message)
@@ -121,7 +164,8 @@ pub(super) async fn load(
     let image = if state.is_local() {
         match cached(id) {
             Some(picture) => Some(picture),
-            None => preview(user, id).await,
+            None if may_decode => preview(user, id, declared.image).await,
+            None => None,
         }
     } else {
         None
@@ -155,8 +199,15 @@ fn state_of(status: AttachmentStatus) -> AttachmentState {
 /// core found it small enough to serve as one. Never the original of a
 /// failed (or missing) thumbnail, as upstream would: that is exactly the
 /// file the core's decoder refused.
-async fn preview(user: &CoreUser, id: AttachmentId) -> Option<Picture> {
-    let bytes = match user.attachment_thumbnail(id).await {
+async fn preview(user: &CoreUser, id: AttachmentId, image: bool) -> Option<Picture> {
+    let mut thumbnail = user.attachment_thumbnail(id).await;
+    if image && matches!(thumbnail, Ok(None)) {
+        // Downloaded, but the preview wasn't made (the app quit in
+        // between, say): make it now, as upstream does on demand.
+        make_preview(user, id).await;
+        thumbnail = user.attachment_thumbnail(id).await;
+    }
+    let bytes = match thumbnail {
         Ok(Some(AttachmentThumbnail::Ready { bytes })) => bytes,
         Ok(Some(AttachmentThumbnail::OriginalFits)) => match user.load_attachment(id).await {
             Ok(
@@ -186,9 +237,10 @@ async fn preview(user: &CoreUser, id: AttachmentId) -> Option<Picture> {
 }
 
 /// Decodes a WebP preview into the BGRA frame gpui draws, refusing
-/// anything larger than a preview can be. Our own decoder, with its own
-/// limits: the core's checks were made by another decoder (libwebp), which
-/// could read a crafted file differently.
+/// anything larger than a preview can be, and keeps it no larger than it
+/// is drawn. Our own decoder, with its own limits: the core's checks were
+/// made by another decoder (libwebp), which could read a crafted file
+/// differently.
 pub(crate) fn decode(bytes: &[u8]) -> Option<Picture> {
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::WebP);
     let mut limits = image::Limits::default();
@@ -202,6 +254,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Picture> {
             debug!("not drawing a preview: {err}");
             return None;
         }
+    };
+    let image = if image.width() > MAX_KEPT.0 || image.height() > MAX_KEPT.1 {
+        image.thumbnail(MAX_KEPT.0, MAX_KEPT.1)
+    } else {
+        image
     };
     let mut pixels = image.into_rgba8();
     for pixel in pixels.pixels_mut() {
@@ -254,31 +311,43 @@ pub(super) async fn download_all(user: CoreUser, changed: impl Fn(AttachmentId) 
     futures_util::stream::iter(pending)
         .chain(arrivals)
         .for_each_concurrent(CONCURRENT_DOWNLOADS, |id| async move {
-            if download(user, id).await {
+            if download(user, id, false).await == Downloaded::Yes {
                 changed(id);
             }
         })
         .await;
 }
 
-/// Downloads `id` if it is pending, then makes its preview. Whether it
-/// was downloaded.
-async fn download(user: &CoreUser, id: AttachmentId) -> bool {
+#[derive(Debug, PartialEq)]
+enum Downloaded {
+    Yes,
+    /// Not pending (or failed, when retrying), or already downloading.
+    Skipped,
+    Failed,
+}
+
+/// Downloads `id` if it is pending (or, `retry`, failed), unless it is
+/// already downloading, then makes its preview.
+async fn download(user: &CoreUser, id: AttachmentId, retry: bool) -> Downloaded {
+    let Some(_claim) = Claim::take(id) else {
+        return Downloaded::Skipped;
+    };
     match user.attachment_status(id).await {
         Ok(Some(AttachmentStatus::Pending)) => {}
-        Ok(_) => return false,
+        Ok(Some(AttachmentStatus::DownloadFailed)) if retry => {}
+        Ok(_) => return Downloaded::Skipped,
         Err(err) => {
             error!("failed to read an attachment's status: {err:#}");
-            return false;
+            return Downloaded::Failed;
         }
     }
     let (_progress, task) = user.download_attachment(id);
     if let Err(err) = task.await {
         warn!("failed to download an attachment: {err:#}");
-        return false;
+        return Downloaded::Failed;
     }
     make_preview(user, id).await;
-    true
+    Downloaded::Yes
 }
 
 /// Makes the core's thumbnail for a downloaded WebP image (the only image
@@ -325,25 +394,21 @@ async fn attachment_in(
     }
 }
 
-/// Retries the failed download of `message`'s attachment, at the user's
-/// request. Resolves to the attachment, for the caller to report (see
-/// [`previewed`]).
+/// Downloads `message`'s attachment now, at the user's request: a failed
+/// download again, or a pending one the download loop hasn't reached (it
+/// can miss an arrival when changes pile up). Resolves to the attachment,
+/// for the caller to report (see [`previewed`]).
 pub(super) async fn retry(
     user: CoreUser,
     chat: ChatId,
     message: MessageId,
 ) -> Result<AttachmentId, Failure> {
     let id = attachment_in(&user, chat, message).await?;
-    match user.attachment_status(id).await? {
-        Some(AttachmentStatus::DownloadFailed) => {}
-        _ => return Err(Failure::Shown("Nothing to retry".into())),
+    match download(&user, id, true).await {
+        Downloaded::Yes => Ok(id),
+        Downloaded::Skipped => Err(Failure::Shown("Already downloading".into())),
+        Downloaded::Failed => Err(Failure::Shown("The download failed again".into())),
     }
-    // A failed download keeps what it needs to start over.
-    let (_progress, task) = user.download_attachment(id);
-    task.await
-        .map_err(|_| Failure::Shown("The download failed again".into()))?;
-    make_preview(&user, id).await;
-    Ok(id)
 }
 
 /// Sends the file at `path` to `chat`. Returns once the message is stored
@@ -364,12 +429,22 @@ pub(super) async fn send(user: CoreUser, chat: ChatId, path: PathBuf) -> Result<
         .upload_chat_attachment(chat, &path, MarkChatAsRead::Yes)
         .await?;
     let (_, _progress, task) = started.map_err(|err| Failure::Shown(refused(err)))?;
+    // As upstream: once uploaded, the message is ours to queue for
+    // sending; a failed send ours to mark failed.
     tokio::spawn(async move {
+        let outbound = user.outbound_service();
         match task.await {
-            Ok(_) => {}
+            Ok(message) => {
+                if let Err(err) = outbound.enqueue_chat_message(message.id()).await {
+                    error!("failed to queue an attachment message: {err:#}");
+                }
+            }
             Err(UploadTaskError::Provision(err)) => warn!("upload refused: {}", refused(err)),
-            Err(UploadTaskError::Failed { error, .. }) => {
-                warn!("failed to send an attachment: {error:#}")
+            Err(UploadTaskError::Failed { message_id, error }) => {
+                warn!("failed to send an attachment: {error:#}");
+                if let Err(err) = outbound.fail_enqueued_chat_message(message_id).await {
+                    error!("failed to mark an attachment message failed: {err:#}");
+                }
             }
         }
     });
@@ -467,6 +542,71 @@ mod tests {
         bytes
     }
 
+    fn part(disposition: Disposition, url: &str, filename: &str) -> NestedPart {
+        NestedPart::ExternalPart {
+            disposition,
+            language: String::new(),
+            content_type: "application/octet-stream".into(),
+            url: url.into(),
+            expires: 0,
+            size: 8,
+            enc_alg: mimi_content::content_container::EncryptionAlgorithm::None,
+            key: Vec::new(),
+            nonce: Vec::new(),
+            aad: Vec::new(),
+            hash_alg: Default::default(),
+            content_hash: Vec::new(),
+            description: String::new(),
+            filename: filename.into(),
+        }
+    }
+
+    fn content(disposition: Disposition, parts: Vec<NestedPart>) -> MimiContent {
+        MimiContent {
+            nested_part: NestedPart::MultiPart {
+                disposition,
+                language: String::new(),
+                part_semantics: mimi_content::content_container::PartSemantics::ProcessAll,
+                parts,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_a_well_formed_attachment_part_is_declared() {
+        let url = "air:///attachment/9b2d2b6e-3f6c-4d2a-8a4e-0c1d2e3f4a5b";
+        let image_url = format!("{url}?width=40&height=30");
+        let declared = declared(&content(
+            Disposition::Attachment,
+            vec![
+                part(Disposition::Attachment, "https://evil.example/x", "first"),
+                part(Disposition::Attachment, &image_url, "\u{202E}\u{200B}"),
+            ],
+        ))
+        .expect("the valid part counts");
+        // The malformed part is skipped; a blank name is still a name.
+        assert_eq!(declared.name, "file");
+        assert!(declared.image);
+
+        let plain = declared_of(Disposition::Attachment, url);
+        assert!(!plain.unwrap().image);
+        // Not an attachment message, or no attachment part in it.
+        assert!(declared_of(Disposition::Render, url).is_none());
+        let inline = content(
+            Disposition::Attachment,
+            vec![part(Disposition::Inline, url, "x")],
+        );
+        assert!(super::declared(&inline).is_none());
+    }
+
+    fn declared_of(disposition: Disposition, url: &str) -> Option<Declared> {
+        declared(&content(
+            disposition,
+            vec![part(Disposition::Attachment, url, "a.txt")],
+        ))
+    }
+
     #[test]
     fn previews_are_decoded_only_within_bounds() {
         let picture = decode(&webp(3, 2)).expect("a small preview is drawn");
@@ -475,8 +615,11 @@ mod tests {
         let bytes = picture.0.as_bytes(0).unwrap();
         assert_eq!(&bytes[..4], &[30, 20, 10, 255]);
 
-        // What the core's decoder passed, ours still bounds.
+        // What the core's decoder passed, ours still bounds; what it
+        // keeps is no larger than drawn.
         assert!(decode(&webp(MAX_PREVIEW_EDGE + 1, 1)).is_none());
+        let kept = decode(&webp(MAX_PREVIEW_EDGE, MAX_PREVIEW_EDGE)).unwrap();
+        assert_eq!(kept.size(), (MAX_KEPT.1, MAX_KEPT.1));
         // Not WebP, or not an image at all.
         let mut png = Vec::new();
         image::RgbaImage::new(2, 2)

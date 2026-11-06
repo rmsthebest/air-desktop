@@ -58,9 +58,6 @@ pub enum ConversationEvent {
     Attach(Vec<std::path::PathBuf>),
 }
 
-/// The box an image preview is fitted into, in pixels.
-const MAX_IMAGE: (u32, u32) = (360, 270);
-
 pub struct Conversation {
     chat: Option<ChatSummary>,
     messages: Option<Entity<Messages>>,
@@ -642,11 +639,11 @@ impl Conversation {
             crate::ui::show_refusal(text.into(), window, cx)
         };
         match attachment.state {
-            AttachmentState::DownloadFailed => {
+            AttachmentState::DownloadFailed | AttachmentState::Pending => {
                 let Some(retry) = messages.retry_download(&message.id, cx) else {
                     return refuse("Files need an account", window, cx);
                 };
-                crate::ui::show_info("Downloading again".into(), window, cx);
+                crate::ui::show_info("Downloading".into(), window, cx);
                 cx.spawn_in(window, async move |_, cx| {
                     if let Err(refusal) = retry.await {
                         _ = cx.update(|window, cx| crate::ui::show_refusal(refusal, window, cx));
@@ -654,9 +651,7 @@ impl Conversation {
                 })
                 .detach();
             }
-            AttachmentState::Pending | AttachmentState::Downloading => {
-                refuse("Still downloading", window, cx)
-            }
+            AttachmentState::Downloading => refuse("Still downloading", window, cx),
             AttachmentState::Gone => refuse("That file is no longer available", window, cx),
             AttachmentState::Ready | AttachmentState::Uploading | AttachmentState::UploadFailed => {
                 let Some(save) = messages.save_attachment(&message.id, &attachment.name, cx) else {
@@ -1215,8 +1210,6 @@ fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElemen
         .into_any_element()
 }
 
-/// Reactions under a message: each kind once, with its count; the user's
-/// own outlined.
 /// A file as a card (name, size, what is happening to it), and an image's
 /// preview above it. The preview's size is known before it is drawn, so
 /// the list measures the message once.
@@ -1233,6 +1226,7 @@ fn render_attachment(attachment: &Attachment, under_cursor: bool) -> AnyElement 
     let hint = match attachment.state {
         _ if !under_cursor => None,
         AttachmentState::DownloadFailed => Some("s to retry"),
+        AttachmentState::Pending => Some("s to download now"),
         state if state.is_local() => Some("s to save"),
         _ => None,
     };
@@ -1248,7 +1242,7 @@ fn render_attachment(attachment: &Attachment, under_cursor: bool) -> AnyElement 
     v_flex()
         .gap_1()
         .children(attachment.image.as_ref().map(|picture| {
-            let (width, height) = crate::model::fit(picture.size(), MAX_IMAGE);
+            let (width, height) = crate::model::fit(picture.size(), crate::model::PREVIEW_BOX);
             img(ImageSource::Render(picture.0.clone()))
                 .w(px(width as f32))
                 .h(px(height as f32))
@@ -1271,6 +1265,8 @@ fn render_attachment(attachment: &Attachment, under_cursor: bool) -> AnyElement 
         .into_any_element()
 }
 
+/// Reactions under a message: each kind once, with its count; the user's
+/// own outlined.
 fn render_reactions(reactions: &[Reaction], more: usize, cx: &App) -> AnyElement {
     let theme = cx.theme();
     h_flex()

@@ -130,7 +130,9 @@ impl Workspace {
                 window,
                 |this, _, event, window, cx| match event {
                     ConversationEvent::Send(text) => this.send(text.clone(), window, cx),
-                    ConversationEvent::Attach(paths) => this.attach(paths.clone(), window, cx),
+                    ConversationEvent::Attach(paths) => {
+                        this.attach_dropped(paths.clone(), window, cx)
+                    }
                 },
             ),
             // Redraw the status line and which-key popup as keys are typed.
@@ -429,15 +431,58 @@ impl Workspace {
             show_refusal("That needs an account".into(), window, cx);
             return;
         };
-        for path in paths {
-            let send = session.read(cx).send_attachment(&chat, path, cx);
-            cx.spawn_in(window, async move |_, cx| {
+        let session = session.clone();
+        // One after another, so they arrive in the order given.
+        cx.spawn_in(window, async move |_, cx| {
+            for path in paths {
+                let Ok(send) = cx.update(|_, cx| session.read(cx).send_attachment(&chat, path, cx))
+                else {
+                    return;
+                };
                 if let Err(refusal) = send.await {
                     _ = cx.update(|window, cx| show_refusal(refusal, window, cx));
                 }
-            })
-            .detach();
+            }
+        })
+        .detach();
+    }
+
+    /// Files dropped on the chat: a drag released over the window by
+    /// mistake mustn't send them, so ask first.
+    fn attach_dropped(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if paths.is_empty() || self.sendable_chat(window, cx).is_none() {
+            return;
         }
+        const LISTED: usize = 5;
+        let mut names: Vec<String> = paths
+            .iter()
+            .take(LISTED)
+            .map(|path| {
+                let name = path.file_name().unwrap_or(path.as_os_str());
+                crate::model::preview_line(&name.to_string_lossy()).to_string()
+            })
+            .collect();
+        if paths.len() > LISTED {
+            names.push(format!("and {} more", paths.len() - LISTED));
+        }
+        let what = match paths.len() {
+            1 => "1 file".to_string(),
+            n => format!("{n} files"),
+        };
+        let title = format!("Send {what} to {}?", self.open_title(cx));
+        let paths = std::cell::RefCell::new(Some(paths));
+        self.confirm(
+            title,
+            names.join(", "),
+            "Send",
+            move |this, window, cx| {
+                if let Some(paths) = paths.borrow_mut().take() {
+                    this.attach(paths, window, cx);
+                }
+            },
+            window,
+            cx,
+        );
     }
 
     /// Opens the command line with `initial` typed.
@@ -904,8 +949,6 @@ impl Workspace {
     }
 }
 
-/// `(remaining keys, label)` for every binding that continues the pending
-/// prefix, skipping unbound (`null`) entries.
 /// A typed path with a leading `~` meaning the home directory.
 fn expand_home(path: &str) -> PathBuf {
     let home = || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
@@ -918,6 +961,8 @@ fn expand_home(path: &str) -> PathBuf {
     }
 }
 
+/// `(remaining keys, label)` for every binding that continues the pending
+/// prefix, skipping unbound (`null`) entries.
 fn which_key_rows(window: &Window, os: OperatingSystem) -> Vec<(String, String)> {
     let Some(pending) = window.pending_input_keystrokes() else {
         return Vec::new();

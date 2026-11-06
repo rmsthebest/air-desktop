@@ -62,7 +62,10 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   - `alerts.rs`: desktop notifications ("alerts"; database notifications
     are the core's). Port of upstream `notifications/` + `NotificationPolicy`:
     the queue and username listeners hand over what processing stored; at
-    most one alert per chat (newest wins), sibling-suppressed and muted
+    most one alert per chat, its text from the core's notification rebuild
+    set (newest unread, unnotified entry from others), so edits and remote
+    deletes rewrite (`Notice::Refresh`) or dismiss a shown alert.
+    Sibling-suppressed chats are marked notified (so dismissed); muted
     chats skipped. `Attention` (window active, open chat, `notifications`
     setting) decides what is shown and the suppression reported to the
     user's other devices (re-reported when it changes). The workspace
@@ -70,9 +73,11 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 - `src/notifier.rs` — shows alerts via `org.freedesktop.Notifications`
   (zbus 5 on async-io, gpui's own copy). Replaces a chat's notification
   instead of stacking, closes it on dismissal, escapes bodies when the
-  server renders markup. No-op off Linux. Dismissals travel on their own
-  unbounded channel and are never dropped (stale alerts can reveal deleted
-  or read text); alerts on a bounded one.
+  server renders markup. No-op off Linux. Notices travel in order through
+  `alerts::NoticeQueue`: alerts are capped, dismissals always taken and drop
+  the queued notices they make stale. The notifier re-applies `Attention`
+  at show time. The D-Bus side sits behind the `notifier::Desktop` trait
+  (tests use a fake screen).
 - The local server rate-limits sign-ups: back-to-back e2e runs fail with
   "Rate limited"/"Too Many Requests" at sign-up or the first requests.
 - `src/markdown.rs` — bounded message markdown parse (size/depth caps; only
@@ -117,6 +122,9 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 - An action handler runs inside its entity's update: don't `read` that
   entity again from code it calls (panics). Pass data in instead.
 - Entity events are delivered after the current update, not synchronously.
+
+## Roadmap
+`docs/roadmap.md` lists the milestones after 7, in order.
 
 ## Commands
 - `just check` — fmt check, clippy `-D warnings`, tests.

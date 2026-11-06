@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 use super::account::{self, SignUp, SignUpError};
-use super::alerts::{self, Alert, Alerts, Attention, Dismiss};
+use super::alerts::{Alert, Alerts, Attention, Dismiss, Notice, NoticeQueue};
 use super::chats::{self, Update};
 use super::contacts::{self, Failure};
 use super::pending::Pending;
@@ -78,7 +78,7 @@ async fn e2e_sign_up_connect_and_reload() {
 
     // The queue listener connects and reports it.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (alerts, _attention, _shows, _dismissals) = alerts();
+    let (alerts, _attention, _notices) = alerts();
     let listener = tokio::spawn(queue::run(user.clone(), alerts, move |status| {
         let _ = tx.send(status);
     }));
@@ -369,8 +369,8 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     let dir = tempfile::tempdir().unwrap();
     let ada = new_account(dir.path(), "Ada Lovelace", ada_code).await;
     let bob = new_account(dir.path(), "Bob", bob_code).await;
-    let (ada_alerts, _, mut ada_notices, _) = alerts();
-    let (bob_alerts, bob_attention, mut bob_notices, mut bob_dismissals) = alerts();
+    let (ada_alerts, _, ada_notices) = alerts();
+    let (bob_alerts, bob_attention, bob_notices) = alerts();
     let _queues = [
         listen_queue(&ada, ada_alerts.clone()).await,
         listen_queue(&bob, bob_alerts).await,
@@ -447,7 +447,7 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     })
     .await;
     // The request alerted Ada, naming who asked.
-    let alert = next_alert(&mut ada_notices, |alert| alert.chat == request).await;
+    let alert = next_alert(&ada_notices, |alert| alert.chat == request).await;
     assert_eq!(alert.title, "New contact request from Bob");
 
     let ada_chat = contacts::accept_request(ada.clone(), request)
@@ -480,7 +480,7 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
     let got = next_message(&mut bob_updates, |m| m.plain_text() == "hi bob").await;
     assert_eq!(got.sender_name, "Ada Lovelace");
-    let alert = next_alert(&mut bob_notices, |alert| alert.body == "hi bob").await;
+    let alert = next_alert(&bob_notices, |alert| alert.body == "hi bob").await;
     assert_eq!(
         (alert.chat, alert.title.as_str()),
         (bob_chat, "Ada Lovelace")
@@ -499,38 +499,46 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     // an earlier event, or shares barrier's, where only the newest message
     // of a chat is put into words. Either way "quiet" can't alert, though
     // "barrier" may.
-    let mut last = None;
+    let mut loud = None;
     for text in ["quiet", "barrier", "loud"] {
         let sent = composer::send(&ada, ada_chat, text.into(), None).await;
         assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
-        last = Some(next_message(&mut bob_updates, |m| m.plain_text() == text).await);
+        loud = Some(next_message(&mut bob_updates, |m| m.plain_text() == text).await);
         if text == "barrier" {
             bob_attention.send_replace(looking(None));
         }
     }
-    let alert = next_alert(&mut bob_notices, |alert| {
+    let alert = next_alert(&bob_notices, |alert| {
         assert_ne!(alert.body, "quiet", "the open chat alerted");
         alert.body == "loud"
     })
     .await;
     assert_eq!(alert.chat, bob_chat);
 
-    // Once Bob has read the rest, a message Ada deletes takes its alert
-    // down: deleted text mustn't stay on screen.
-    let loud = messages::core_message_id(&last.unwrap().id).unwrap();
-    messages::mark_as_read(bob.clone(), bob_chat, loud).await;
-    let sent = composer::send(&ada, ada_chat, "secret".into(), None).await;
-    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
-    next_alert(&mut bob_notices, |alert| alert.body == "secret").await;
-    let secret = next_message(&mut ada_updates, |m| m.own && m.plain_text() == "secret").await;
-    ada.delete_message_for_everyone(ada_chat, messages::core_message_id(&secret.id).unwrap())
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while bob_dismissals.recv().await != Some(Dismiss::Chat(bob_chat)) {}
-    })
-    .await
-    .expect("the deleted message's alert stayed");
+    // A message Ada deletes leaves Bob's alert: it falls back to what is
+    // still unread, so deleted text doesn't stay on screen. Once Bob has
+    // read everything, a deletion takes the alert down.
+    for (text, read_first) in [("secret", false), ("secret again", true)] {
+        if read_first {
+            let read = messages::core_message_id(&loud.as_ref().unwrap().id).unwrap();
+            messages::mark_as_read(bob.clone(), bob_chat, read).await;
+        }
+        let sent = composer::send(&ada, ada_chat, text.into(), None).await;
+        assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+        next_alert(&bob_notices, |alert| alert.body == text).await;
+        let message = next_message(&mut ada_updates, |m| m.own && m.plain_text() == text).await;
+        let id = messages::core_message_id(&message.id).unwrap();
+        ada.delete_message_for_everyone(ada_chat, id).await.unwrap();
+        let notice = next_notice(&bob_notices, |n| notice_chat(n) == Some(bob_chat)).await;
+        if read_first {
+            assert_eq!(notice, Notice::Dismiss(Dismiss::Chat(bob_chat)));
+        } else {
+            assert!(
+                matches!(&notice, Notice::Refresh(alert) if alert.body == "loud"),
+                "{notice:?}"
+            );
+        }
+    }
 
     // Bob's rename reaches the messages Ada already has from him.
     let mut profile = bob.own_user_profile().await.unwrap();
@@ -575,31 +583,45 @@ async fn listen_queue(user: &CoreUser, alerts: Alerts) -> Aborting {
 }
 
 /// Alerts as the session sets them up, minus the desktop notifier.
-fn alerts() -> (
-    Alerts,
-    watch::Sender<Attention>,
-    mpsc::Receiver<Alert>,
-    mpsc::UnboundedReceiver<Dismiss>,
-) {
+fn alerts() -> (Alerts, watch::Sender<Attention>, Arc<NoticeQueue>) {
     let (attention, attention_rx) = watch::channel(Attention::default());
-    let (shows_tx, shows) = mpsc::channel(alerts::ALERTS_BUFFER);
-    let (dismissals_tx, dismissals) = mpsc::unbounded_channel();
-    let alerts = Alerts::new(attention_rx, shows_tx, dismissals_tx);
-    (alerts, attention, shows, dismissals)
+    let notices = Arc::new(NoticeQueue::default());
+    (
+        Alerts::new(attention_rx, notices.clone()),
+        attention,
+        notices,
+    )
 }
 
-/// The next alert shown that matches, skipping others.
-async fn next_alert(shows: &mut mpsc::Receiver<Alert>, matches: impl Fn(&Alert) -> bool) -> Alert {
+/// The next notice that matches, skipping others.
+async fn next_notice(notices: &NoticeQueue, matches: impl Fn(&Notice) -> bool) -> Notice {
     tokio::time::timeout(Duration::from_secs(20), async {
-        while let Some(alert) = shows.recv().await {
-            if matches(&alert) {
-                return alert;
+        loop {
+            let notice = notices.next().await;
+            if matches(&notice) {
+                return notice;
             }
         }
-        panic!("the alerts stopped")
     })
     .await
-    .expect("no matching alert within 20s")
+    .expect("no matching notice within 20s")
+}
+
+/// The next alert shown that matches, skipping other notices.
+async fn next_alert(notices: &NoticeQueue, matches: impl Fn(&Alert) -> bool) -> Alert {
+    let shown = |notice: &Notice| matches!(notice, Notice::Show(alert) if matches(alert));
+    match next_notice(notices, shown).await {
+        Notice::Show(alert) => alert,
+        _ => unreachable!("only shows match"),
+    }
+}
+
+fn notice_chat(notice: &Notice) -> Option<aircoreclient::ChatId> {
+    match notice {
+        Notice::Show(alert) | Notice::Refresh(alert) => Some(alert.chat),
+        Notice::Dismiss(Dismiss::Chat(chat)) => Some(*chat),
+        Notice::Dismiss(Dismiss::All) => None,
+    }
 }
 
 /// A message window on `chat` that follows the user's changes.

@@ -5,89 +5,91 @@
 //! build doesn't have.
 //!
 //! Each chat has at most one notification on screen: a new alert replaces
-//! it, and a dismissal closes it.
+//! it, a refresh rewrites it quietly, and a dismissal closes it.
 
-use tokio::sync::{mpsc, watch};
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::session::alerts::{Alert, Attention, Dismiss};
+use aircoreclient::ChatId;
+use tokio::sync::watch;
 
-/// Runs until the session drops its senders. Dismissals go first, and an
-/// alert for the chat the user is looking at by the time it is shown is
-/// dropped (it may have been built just before they opened it).
+use crate::session::alerts::{Alert, Attention, Dismiss, Notice, NoticeQueue};
+
+/// Where notifications appear.
+pub trait Desktop {
+    /// Shows `alert`, replacing notification `replaces` (0 for none);
+    /// `quiet` for a rewrite that shouldn't draw attention. Returns the new
+    /// notification's id, or `None` if it couldn't be shown.
+    fn notify(
+        &mut self,
+        replaces: u32,
+        alert: &Alert,
+        quiet: bool,
+    ) -> impl Future<Output = Option<u32>> + Send;
+    fn close(&mut self, id: u32) -> impl Future<Output = ()> + Send;
+}
+
+/// The platform's notifications.
+pub fn system() -> impl Desktop + Send {
+    #[cfg(target_os = "linux")]
+    return linux::Dbus::default();
+    #[cfg(not(target_os = "linux"))]
+    return Unsupported;
+}
+
+/// Runs until aborted (the session drops it). Notices are handled in the
+/// order they were sent. The attention is checked again at show time: the
+/// user may have opened the chat, or asked to be shown less, meanwhile.
 pub async fn run(
-    mut shows: mpsc::Receiver<Alert>,
-    mut dismissals: mpsc::UnboundedReceiver<Dismiss>,
+    notices: Arc<NoticeQueue>,
     attention: watch::Receiver<Attention>,
+    desktop: impl Desktop + Send,
 ) {
-    let mut notifier = Notifier::default();
+    let mut notifier = Notifier {
+        desktop,
+        shown: HashMap::new(),
+    };
     loop {
-        tokio::select! {
-            biased;
-            Some(dismiss) = dismissals.recv() => notifier.dismiss(dismiss).await,
-            Some(alert) = shows.recv() => {
-                if attention.borrow().watched() != Some(alert.chat) {
-                    notifier.show(alert).await;
-                }
-            }
-            else => return,
-        }
+        let notice = notices.next().await;
+        let attention = *attention.borrow();
+        notifier.handle(notice, &attention).await;
     }
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-struct Notifier {
-    /// Connected on the first alert, and again after a failure.
-    bus: Option<linux::Bus>,
-    /// When connecting last failed: retried after [`RETRY`], warned once.
-    failed_at: Option<tokio::time::Instant>,
-    /// The server's id of each chat's notification.
-    shown: std::collections::HashMap<aircoreclient::ChatId, u32>,
+struct Notifier<D> {
+    desktop: D,
+    /// The desktop's id of each chat's notification.
+    shown: HashMap<ChatId, u32>,
 }
 
-/// How long a missing notification service is left alone.
-#[cfg(target_os = "linux")]
-const RETRY: std::time::Duration = std::time::Duration::from_secs(60);
-
-#[cfg(target_os = "linux")]
-impl Notifier {
-    async fn show(&mut self, alert: Alert) {
-        use tracing::{info, warn};
-
-        if self.bus.is_none() {
-            if self.failed_at.is_some_and(|at| at.elapsed() < RETRY) {
-                return;
-            }
-            match linux::Bus::connect().await {
-                Ok(bus) => {
-                    if self.failed_at.take().is_some() {
-                        info!("desktop notifications available again");
-                    }
-                    self.bus = Some(bus);
+impl<D: Desktop + Send> Notifier<D> {
+    async fn handle(&mut self, notice: Notice, attention: &Attention) {
+        match notice {
+            Notice::Show(alert) => {
+                if let Some(alert) = attention.shown(alert) {
+                    self.show(alert, false).await;
                 }
-                Err(err) => {
-                    if self
-                        .failed_at
-                        .replace(tokio::time::Instant::now())
-                        .is_none()
-                    {
-                        warn!("desktop notifications unavailable: {err}");
-                    }
+            }
+            Notice::Refresh(alert) => {
+                if !self.shown.contains_key(&alert.chat) {
                     return;
                 }
+                let chat = alert.chat;
+                match attention.shown(alert) {
+                    Some(alert) => self.show(alert, true).await,
+                    None => self.dismiss(Dismiss::Chat(chat)).await,
+                }
             }
+            Notice::Dismiss(dismiss) => self.dismiss(dismiss).await,
         }
-        let Some(bus) = &self.bus else { return };
+    }
+
+    async fn show(&mut self, alert: Alert, quiet: bool) {
         let replaces = self.shown.get(&alert.chat).copied().unwrap_or(0);
-        match bus.notify(replaces, &alert).await {
-            Ok(id) => {
-                self.shown.insert(alert.chat, id);
-            }
-            Err(err) => {
-                warn!("failed to show a desktop notification: {err}");
-                self.bus = None;
-            }
-        }
+        match self.desktop.notify(replaces, &alert, quiet).await {
+            Some(id) => self.shown.insert(alert.chat, id),
+            None => self.shown.remove(&alert.chat),
+        };
     }
 
     async fn dismiss(&mut self, dismiss: Dismiss) {
@@ -95,24 +97,104 @@ impl Notifier {
             Dismiss::Chat(chat) => self.shown.remove(&chat).into_iter().collect(),
             Dismiss::All => self.shown.drain().map(|(_, id)| id).collect(),
         };
-        if let Some(bus) = &self.bus {
-            for id in ids {
-                // Fails if it is already gone, which is fine.
-                _ = bus.close(id).await;
-            }
+        for id in ids {
+            self.desktop.close(id).await;
         }
     }
 }
 
-/// Not implemented on this platform yet.
 #[cfg(not(target_os = "linux"))]
-#[derive(Default)]
-struct Notifier;
+struct Unsupported;
 
 #[cfg(not(target_os = "linux"))]
-impl Notifier {
-    async fn show(&mut self, _: Alert) {}
-    async fn dismiss(&mut self, _: Dismiss) {}
+impl Desktop for Unsupported {
+    async fn notify(&mut self, _: u32, _: &Alert, _: bool) -> Option<u32> {
+        None
+    }
+    async fn close(&mut self, _: u32) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Notifications;
+
+    /// What a desktop shows, by id.
+    #[derive(Default)]
+    struct Screen {
+        next_id: u32,
+        visible: HashMap<u32, Alert>,
+    }
+
+    impl Desktop for Screen {
+        async fn notify(&mut self, replaces: u32, alert: &Alert, _: bool) -> Option<u32> {
+            let id = if self.visible.contains_key(&replaces) {
+                replaces
+            } else {
+                self.next_id += 1;
+                self.next_id
+            };
+            self.visible.insert(id, alert.clone());
+            Some(id)
+        }
+        async fn close(&mut self, id: u32) {
+            self.visible.remove(&id);
+        }
+    }
+
+    fn alert(chat: u128, body: &str) -> Alert {
+        Alert {
+            chat: ChatId::new(uuid::Uuid::from_u128(chat)),
+            title: "Grace".into(),
+            body: body.into(),
+        }
+    }
+
+    fn bodies(notifier: &Notifier<Screen>) -> Vec<String> {
+        let mut bodies: Vec<_> = notifier
+            .desktop
+            .visible
+            .values()
+            .map(|alert| alert.body.clone())
+            .collect();
+        bodies.sort();
+        bodies
+    }
+
+    #[tokio::test]
+    async fn what_is_shown_follows_the_latest_notices_and_setting() {
+        let mut notifier = Notifier {
+            desktop: Screen::default(),
+            shown: HashMap::new(),
+        };
+        let full = Attention::default();
+        for notice in [
+            Notice::Show(alert(1, "secret")),
+            Notice::Show(alert(2, "hello")),
+            // Edited: rewritten in place, one notification per chat.
+            Notice::Refresh(alert(2, "hello!")),
+            // A rewrite never brings up a chat with nothing on screen.
+            Notice::Refresh(alert(3, "old")),
+            Notice::Dismiss(Dismiss::Chat(alert(1, "").chat)),
+        ] {
+            notifier.handle(notice, &full).await;
+        }
+        assert_eq!(bodies(&notifier), ["hello!"]);
+
+        // An alert built under "full" but shown after the switch to
+        // "private" reveals nothing.
+        let private = Attention {
+            content: Notifications::Private,
+            ..full
+        };
+        notifier
+            .handle(Notice::Dismiss(Dismiss::All), &private)
+            .await;
+        notifier
+            .handle(Notice::Show(alert(4, "the secret")), &private)
+            .await;
+        assert_eq!(bodies(&notifier), ["New activity"]);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -124,7 +206,64 @@ mod linux {
     use zbus::zvariant::Value;
     use zbus::{Connection, Proxy};
 
+    use tracing::{info, warn};
+
     use crate::session::alerts::Alert;
+
+    /// How long a missing notification service is left alone.
+    const RETRY: Duration = Duration::from_secs(60);
+
+    /// The session bus, connected on the first alert and again after a
+    /// failure; a missing service is warned about once and retried slowly.
+    #[derive(Default)]
+    pub(super) struct Dbus {
+        bus: Option<Bus>,
+        failed_at: Option<tokio::time::Instant>,
+    }
+
+    impl Dbus {
+        async fn bus(&mut self) -> Option<&Bus> {
+            if self.bus.is_none() {
+                if self.failed_at.is_some_and(|at| at.elapsed() < RETRY) {
+                    return None;
+                }
+                match Bus::connect().await {
+                    Ok(bus) => {
+                        if self.failed_at.take().is_some() {
+                            info!("desktop notifications available again");
+                        }
+                        self.bus = Some(bus);
+                    }
+                    Err(err) => {
+                        let now = tokio::time::Instant::now();
+                        if self.failed_at.replace(now).is_none() {
+                            warn!("desktop notifications unavailable: {err}");
+                        }
+                    }
+                }
+            }
+            self.bus.as_ref()
+        }
+    }
+
+    impl super::Desktop for Dbus {
+        async fn notify(&mut self, replaces: u32, alert: &Alert, quiet: bool) -> Option<u32> {
+            let result = self.bus().await?.notify(replaces, alert, quiet).await;
+            result
+                .inspect_err(|err| {
+                    warn!("failed to show a desktop notification: {err}");
+                    self.bus = None;
+                })
+                .ok()
+        }
+
+        async fn close(&mut self, id: u32) {
+            if let Some(bus) = &self.bus {
+                // Fails if it is already gone, which is fine.
+                _ = bus.close(id).await;
+            }
+        }
+    }
 
     /// Matches the window's app id, so the desktop can group them.
     const APP_ID: &str = "air-desktop";
@@ -138,14 +277,14 @@ mod linux {
             .map_err(|_| zbus::Error::Failure("timed out".into()))?
     }
 
-    pub(super) struct Bus {
+    struct Bus {
         proxy: Proxy<'static>,
         /// The server renders a subset of HTML in bodies.
         markup: bool,
     }
 
     impl Bus {
-        pub(super) async fn connect() -> zbus::Result<Self> {
+        async fn connect() -> zbus::Result<Self> {
             bounded(Self::connect_unbounded()).await
         }
 
@@ -163,7 +302,7 @@ mod linux {
             Ok(Self { proxy, markup })
         }
 
-        pub(super) async fn notify(&self, replaces: u32, alert: &Alert) -> zbus::Result<u32> {
+        async fn notify(&self, replaces: u32, alert: &Alert, quiet: bool) -> zbus::Result<u32> {
             // Peer text must not become markup: a link or image tag would
             // be live in some notification servers.
             let body = if self.markup {
@@ -176,6 +315,10 @@ mod linux {
             hints.insert("sender-pid", Value::from(std::process::id()));
             hints.insert("desktop-entry", Value::from(APP_ID));
             hints.insert("category", Value::from("im.received"));
+            if quiet {
+                hints.insert("suppress-sound", Value::from(true));
+                hints.insert("urgency", Value::from(0u8));
+            }
             bounded(self.proxy.call(
                 "Notify",
                 &(
@@ -192,7 +335,7 @@ mod linux {
             .await
         }
 
-        pub(super) async fn close(&self, id: u32) -> zbus::Result<()> {
+        async fn close(&self, id: u32) -> zbus::Result<()> {
             bounded(self.proxy.call("CloseNotification", &(id,))).await
         }
     }

@@ -368,3 +368,30 @@ Deferred:
 - **Re-reporting the suppression has no dedicated test.** The arm in
   `queue::listen_once` only compares two values. A useful test needs a
   sibling device, which the e2e setup doesn't have yet.
+
+## Gate 9b — gate 9 fixes (`5ccebf5..59cd278`): PASS
+
+Gate 9 marked "deleted or edited text stayed on screen" as fixed. That fix
+held only when nothing else in the chat was unread. Fixed now:
+- **Deleted or edited text stayed up beside other unread messages
+  (medium).** Alert text now comes from the chat's notification rebuild
+  set, not from the processed event. A chat that changed quietly gets its
+  alert rewritten from what is left (`Notice::Refresh`; ignored if nothing
+  is shown) or dismissed. An alerting chat is built from the set too, so a
+  send and a delete in one batch don't show the deleted text. The two-user
+  e2e test deletes a message while an older one is unread (the alert falls
+  back to it), and again after reading (the alert is dismissed).
+- **Dismissals could overtake older alerts (medium).** Alerts and
+  dismissals share the ordered `NoticeQueue`. Alerts are capped. A
+  dismissal is always taken and drops the queued notices it makes stale.
+  The notifier re-applies the attention (content and watched chat) at
+  show time. Covered in
+  `dismissals_are_kept_in_order_and_drop_what_they_make_stale`, and
+  `what_is_shown_follows_the_latest_notices_and_setting` (the notifier
+  against a fake screen).
+- **Sibling-suppressed chats kept their alert (low).** They are marked
+  notified and checked like quiet chats, so their alert is dismissed.
+- **CLAUDE.md overstated the guarantee (low).** Reworded.
+
+Not added: a pure unit test of the quiet/alerting split. It needs a
+`CoreUser`, and the e2e delete steps cover it.

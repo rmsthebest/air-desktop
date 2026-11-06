@@ -97,16 +97,15 @@ impl Session {
             };
             let (state_tx, state_rx) = watch::channel(initial);
 
-            let (shows_tx, shows_rx) = mpsc::channel(alerts::ALERTS_BUFFER);
-            let (dismissals_tx, dismissals_rx) = mpsc::unbounded_channel();
+            let notices = Arc::new(alerts::NoticeQueue::default());
             let (attention, attention_rx) = watch::channel(Attention {
                 content: SettingsStore::get(cx).notifications,
                 ..Attention::default()
             });
-            let alerts = Alerts::new(attention_rx.clone(), shows_tx, dismissals_tx);
+            let alerts = Alerts::new(attention_rx.clone(), notices.clone());
             let notifier = Tokio::spawn(
                 cx,
-                crate::notifier::run(shows_rx, dismissals_rx, attention_rx),
+                crate::notifier::run(notices, attention_rx, crate::notifier::system()),
             );
             let settings = cx.observe_global::<SettingsStore>(|this: &mut Self, cx| {
                 let content = SettingsStore::get(cx).notifications;

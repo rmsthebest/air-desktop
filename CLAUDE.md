@@ -75,8 +75,9 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   instead of stacking, closes it on dismissal, escapes bodies when the
   server renders markup. No-op off Linux. Notices travel in order through
   `alerts::NoticeQueue`, which keeps each chat's latest notices (bounded by
-  the chats, nothing dropped). The notifier forgets a notification's id
-  only once the server closed it, so a failed rewrite or close is retried. The notifier re-applies `Attention`
+  the chats, nothing dropped). A failed close is retried before each
+  later notice; a rewrite that gets a new id (the user closed the old one)
+  is closed at once. The notifier re-applies `Attention`
   at show time. The D-Bus side sits behind the `notifier::Desktop` trait
   (tests use a fake screen).
 - The local server rate-limits sign-ups: back-to-back e2e runs fail with

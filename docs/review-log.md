@@ -417,3 +417,27 @@ Deferred:
   fall back to an old reaction. Upstream desktop has the same limit. The
   fix belongs with milestone 9 (reactions): advance `notified_until` once
   an alert is shown, without losing the fallback for deletes.
+
+## Gate 9d — gate 9c fixes (`1b72cef..ee64c10`): PASS
+
+Fixed:
+- **A refresh brought back a notification the user had closed (medium).**
+  A rewrite that gets a new id means the old one was gone, so the new one
+  is closed at once. Covered in
+  `a_rewrite_never_brings_back_what_the_user_closed`.
+- **A failed close waited for another dismissal (low).** Pending closes are
+  retried before every notice (asserted in
+  `stale_text_goes_even_after_the_desktop_failed`). CLAUDE.md says exactly
+  that.
+- **Dismissing all against a hung service could stall for minutes (low).**
+  Closing stops at the first failure; the rest are retried with the next
+  notice.
+- **Every D-Bus error reply counted as "gone" (low).** Kept, and the
+  assumption is written down: the spec defines no other failure for
+  `CloseNotification`.
+
+Deferred:
+- **Retrying on a timer.** Closes are retried only when a notice arrives.
+  Listening to `NotificationClosed` and retrying on a timer belong with
+  milestone 12 (notification actions), which subscribes to the server's
+  signals anyway.

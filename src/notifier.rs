@@ -46,10 +46,7 @@ pub async fn run(
     attention: watch::Receiver<Attention>,
     desktop: impl Desktop + Send,
 ) {
-    let mut notifier = Notifier {
-        desktop,
-        shown: HashMap::new(),
-    };
+    let mut notifier = Notifier::new(desktop);
     loop {
         let notice = notices.next().await;
         let attention = *attention.borrow();
@@ -61,10 +58,22 @@ struct Notifier<D> {
     desktop: D,
     /// The desktop's id of each chat's notification.
     shown: HashMap<ChatId, u32>,
+    /// Notifications taken off our books whose close hasn't gone through
+    /// yet; retried, in order, before each notice.
+    closing: Vec<u32>,
 }
 
 impl<D: Desktop + Send> Notifier<D> {
+    fn new(desktop: D) -> Self {
+        Self {
+            desktop,
+            shown: HashMap::new(),
+            closing: Vec::new(),
+        }
+    }
+
     async fn handle(&mut self, notice: Notice, attention: &Attention) {
+        self.close_pending().await;
         match notice {
             Notice::Show(alert) => {
                 if let Some(alert) = attention.shown(alert) {
@@ -72,17 +81,19 @@ impl<D: Desktop + Send> Notifier<D> {
                 }
             }
             Notice::Refresh(alert) => {
-                if !self.shown.contains_key(&alert.chat) {
+                let Some(&replaces) = self.shown.get(&alert.chat) else {
                     return;
-                }
+                };
                 let chat = alert.chat;
                 let rewritten = match attention.shown(alert) {
                     Some(alert) => self.show(alert, true).await,
-                    None => false,
+                    None => None,
                 };
-                // What is on screen is stale: if it can't be rewritten, it
-                // goes.
-                if !rewritten {
+                // Kept only if rewritten in place. A new id means the old
+                // notification was gone (closed by the user, or expired),
+                // and a rewrite mustn't bring it back; no id means what is
+                // on screen is stale and couldn't be rewritten.
+                if rewritten != Some(replaces) {
                     self.dismiss(Dismiss::Chat(chat)).await;
                 }
             }
@@ -90,32 +101,31 @@ impl<D: Desktop + Send> Notifier<D> {
         }
     }
 
-    /// Returns whether it was shown. On failure, whatever the chat had on
+    /// Returns the notification's id. On failure, whatever the chat had on
     /// screen is still there and still tracked.
-    async fn show(&mut self, alert: Alert, quiet: bool) -> bool {
+    async fn show(&mut self, alert: Alert, quiet: bool) -> Option<u32> {
         let replaces = self.shown.get(&alert.chat).copied().unwrap_or(0);
-        match self.desktop.notify(replaces, &alert, quiet).await {
-            Some(id) => {
-                self.shown.insert(alert.chat, id);
-                true
-            }
-            None => false,
-        }
+        let id = self.desktop.notify(replaces, &alert, quiet).await?;
+        self.shown.insert(alert.chat, id);
+        Some(id)
     }
 
-    /// Forgets a notification only once it is gone, so a failed close is
-    /// tried again by the next dismissal.
     async fn dismiss(&mut self, dismiss: Dismiss) {
-        let chats: Vec<ChatId> = match dismiss {
-            Dismiss::Chat(chat) => vec![chat],
-            Dismiss::All => self.shown.keys().copied().collect(),
-        };
-        for chat in chats {
-            if let Some(&id) = self.shown.get(&chat)
-                && self.desktop.close(id).await
-            {
-                self.shown.remove(&chat);
+        match dismiss {
+            Dismiss::Chat(chat) => self.closing.extend(self.shown.remove(&chat)),
+            Dismiss::All => self.closing.extend(self.shown.drain().map(|(_, id)| id)),
+        }
+        self.close_pending().await;
+    }
+
+    /// Closes what is waiting to be closed, stopping at the first failure:
+    /// a desktop that just failed is likely to fail again right away.
+    async fn close_pending(&mut self) {
+        while let Some(&id) = self.closing.first() {
+            if !self.desktop.close(id).await {
+                return;
             }
+            self.closing.remove(0);
         }
     }
 }
@@ -190,10 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn what_is_shown_follows_the_latest_notices_and_setting() {
-        let mut notifier = Notifier {
-            desktop: Screen::default(),
-            shown: HashMap::new(),
-        };
+        let mut notifier = Notifier::new(Screen::default());
         let full = Attention::default();
         for notice in [
             Notice::Show(alert(1, "secret")),
@@ -208,13 +215,8 @@ mod tests {
         }
         assert_eq!(bodies(&notifier), ["hello!"]);
         // The rewrite didn't draw attention again.
-        assert!(
-            notifier
-                .desktop
-                .visible
-                .values()
-                .all(|(a, quiet)| *quiet == (a.body == "hello!"))
-        );
+        let (_, quiet) = notifier.desktop.visible.values().next().unwrap();
+        assert!(quiet);
 
         // An alert built under "full" but shown after the switch to
         // "private" reveals nothing.
@@ -233,10 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_text_goes_even_after_the_desktop_failed() {
-        let mut notifier = Notifier {
-            desktop: Screen::default(),
-            shown: HashMap::new(),
-        };
+        let mut notifier = Notifier::new(Screen::default());
         let full = Attention::default();
         notifier
             .handle(Notice::Show(alert(1, "secret")), &full)
@@ -263,6 +262,34 @@ mod tests {
         };
         notifier
             .handle(Notice::Refresh(alert(2, "hi!")), &off)
+            .await;
+        assert!(bodies(&notifier).is_empty());
+
+        // A failed close is retried with the next notice.
+        notifier
+            .handle(Notice::Show(alert(3, "secret")), &full)
+            .await;
+        notifier.desktop.down = true;
+        let third = alert(3, "").chat;
+        notifier
+            .handle(Notice::Dismiss(Dismiss::Chat(third)), &full)
+            .await;
+        notifier.desktop.down = false;
+        notifier.handle(Notice::Show(alert(4, "hi")), &full).await;
+        assert_eq!(bodies(&notifier), ["hi"]);
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_never_brings_back_what_the_user_closed() {
+        let mut notifier = Notifier::new(Screen::default());
+        let full = Attention::default();
+        notifier
+            .handle(Notice::Show(alert(1, "older")), &full)
+            .await;
+        // The user closes it by hand.
+        notifier.desktop.visible.clear();
+        notifier
+            .handle(Notice::Refresh(alert(1, "older")), &full)
             .await;
         assert!(bodies(&notifier).is_empty());
     }
@@ -333,7 +360,10 @@ mod linux {
                 return false;
             };
             match bus.close(id).await {
-                // An error reply means the server doesn't know the id: gone.
+                // An error reply (the spec's reply to an unknown id, or the
+                // service having gone away with its notifications) means
+                // it isn't on screen. Assumed for every error name: the
+                // spec defines no other failure for this call.
                 Ok(()) | Err(zbus::Error::MethodError(..)) => true,
                 Err(err) => {
                     warn!("failed to close a desktop notification: {err}");

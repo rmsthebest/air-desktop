@@ -1154,3 +1154,16 @@ Fixed (low):
 
 Deferred to milestone 20 (account seam): `invitations::load`'s filtering,
 and the one-deletion-at-a-time refusal with the abort-report test.
+
+## Gate 19c — gate 19b fixes (`86f0e6f..58881dc`): PASS
+
+Fixed (low):
+- Invite and device rows also load late, and moved a selection kept by
+  position: on Delete account, a token loading above it put the
+  selection on `GetInviteCode`, so enter spent it unasked. The selection
+  now follows its row (`reselect`: same username, device tag, code,
+  token, or kind of row), clamped where it was if the row is gone.
+  Test: a token loading above Delete account keeps the selection there.
+
+Deferred to milestone 20 (account seam): `Invitations::request` turning
+an unusual server code into `Failure::Shown`.

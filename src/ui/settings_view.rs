@@ -239,6 +239,32 @@ fn on_off_expired(delete: Option<bool>) -> String {
     .into()
 }
 
+/// Whether `a` and `b` are the same row, whatever value it shows.
+fn same_row(a: &Row, b: &Row) -> bool {
+    match (a, b) {
+        (Row::Username(a), Row::Username(b)) => a == b,
+        (Row::Device(a), Row::Device(b)) => a.tag == b.tag,
+        (Row::InviteCode { code: a, .. }, Row::InviteCode { code: b, .. }) => a == b,
+        (Row::GetInviteCode(a), Row::GetInviteCode(b)) => a == b,
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
+}
+
+/// Where the selection is in `rows`: on `anchor` wherever it moved, else
+/// (it's gone) at `selected`, clamped.
+fn reselect(rows: &[Row], selected: usize, anchor: Option<&Row>) -> usize {
+    let last = rows.len().saturating_sub(1);
+    let Some(anchor) = anchor else {
+        return selected.min(last);
+    };
+    if rows.get(selected).is_some_and(|row| same_row(row, anchor)) {
+        return selected;
+    }
+    rows.iter()
+        .position(|row| same_row(row, anchor))
+        .unwrap_or(selected.min(last))
+}
+
 /// Registered theme names by mode, sorted.
 #[derive(Default)]
 pub struct Themes {
@@ -249,6 +275,10 @@ pub struct Themes {
 pub struct SettingsView {
     focus_handle: FocusHandle,
     selected: usize,
+    /// The row last selected: rows load late (devices, invite codes) and
+    /// would move a selection kept by position onto another row, one
+    /// that may act at once (spend an invite token).
+    anchor: Option<Row>,
     /// `None` only in tests, on mock data.
     session: Option<Entity<Session>>,
     account: Option<AccountEntities>,
@@ -295,6 +325,7 @@ impl SettingsView {
         Self {
             focus_handle: cx.focus_handle(),
             selected: 0,
+            anchor: None,
             session,
             account,
             // Themes are read at startup only.
@@ -327,15 +358,26 @@ impl SettingsView {
         self.rows(cx).get(self.selected).cloned()
     }
 
-    fn select(&mut self, ix: isize, cx: &mut Context<Self>) {
-        let last = self.rows(cx).len().saturating_sub(1);
-        self.selected = ix.clamp(0, last as isize) as usize;
+    /// The rows, with the selection back on the anchored row.
+    fn current_rows(&mut self, cx: &App) -> Vec<Row> {
+        let rows = self.rows(cx);
+        self.selected = reselect(&rows, self.selected, self.anchor.as_ref());
+        self.anchor = rows.get(self.selected).cloned();
+        rows
+    }
+
+    /// Moves the selection by `by` rows (clamped).
+    fn select(&mut self, by: isize, cx: &mut Context<Self>) {
+        let rows = self.current_rows(cx);
+        let last = rows.len().saturating_sub(1) as isize;
+        self.selected = (self.selected as isize).saturating_add(by).clamp(0, last) as usize;
+        self.anchor = rows.get(self.selected).cloned();
         cx.notify();
     }
 
     fn change(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let rows = self.rows(cx);
-        let Some(row) = rows.get(self.selected.min(rows.len().saturating_sub(1))) else {
+        let rows = self.current_rows(cx);
+        let Some(row) = rows.get(self.selected) else {
             return;
         };
         if let Some(event) = change(row, forward, &self.themes) {
@@ -344,11 +386,8 @@ impl SettingsView {
     }
 
     fn remove(&mut self, cx: &mut Context<Self>) {
-        let rows = self.rows(cx);
-        if let Some(event) = rows
-            .get(self.selected.min(rows.len().saturating_sub(1)))
-            .and_then(remove)
-        {
+        let rows = self.current_rows(cx);
+        if let Some(event) = rows.get(self.selected).and_then(remove) {
             cx.emit(event);
         }
     }
@@ -466,9 +505,7 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.rows(cx);
-        // A removed username can leave the selection past the end.
-        self.selected = self.selected.min(rows.len().saturating_sub(1));
+        let rows = self.current_rows(cx);
         let focused = self.focus_handle.is_focused(window);
         let theme = cx.theme();
         let section = |title: &'static str| {
@@ -512,13 +549,9 @@ impl Render for SettingsView {
         v_flex()
             .key_context(key_context("Settings", cx))
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
-                this.select(this.selected as isize + 1, cx)
-            }))
-            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
-                this.select(this.selected as isize - 1, cx)
-            }))
-            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.select(0, cx)))
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.select(1, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.select(-1, cx)))
+            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.select(isize::MIN, cx)))
             .on_action(cx.listener(|this, _: &SelectLast, _, cx| this.select(isize::MAX, cx)))
             .on_action(cx.listener(|this, _: &SettingNext, _, cx| this.change(true, cx)))
             .on_action(cx.listener(|this, _: &SettingPrev, _, cx| this.change(false, cx)))
@@ -687,6 +720,32 @@ mod tests {
     }
 
     #[test]
+    fn the_selection_stays_on_its_row_when_rows_load() {
+        let account = |invites: Vec<InviteSlot>| AccountRows {
+            display_name: "Ada".into(),
+            invites,
+            ..AccountRows::default()
+        };
+        let before = rows(&Settings::default(), Some(&account(Vec::new())));
+        let last = before.len() - 1;
+        assert_eq!(before[last], Row::DeleteAccount);
+        // A token loads above Delete account: by position the selection
+        // would be on it, and enter would spend it unasked.
+        let after = rows(
+            &Settings::default(),
+            Some(&account(vec![InviteSlot::Token(7)])),
+        );
+        assert_eq!(after[last], Row::GetInviteCode(7));
+        let ix = reselect(&after, last, before.get(last));
+        assert_eq!(after[ix], Row::DeleteAccount);
+        // A row whose value changed is the same row.
+        let flipped = [Row::ReadReceipts(Some(true))];
+        assert_eq!(reselect(&flipped, 0, Some(&Row::ReadReceipts(None))), 0);
+        // A row that's gone leaves the selection where it was, clamped.
+        assert_eq!(reselect(&before, 99, Some(&Row::GetInviteCode(7))), last);
+    }
+
+    #[test]
     fn synced_settings_flip_and_codes_are_given_out_one_or_all() {
         let account = |invites: Vec<InviteSlot>| AccountRows {
             display_name: "Ada".into(),
@@ -699,8 +758,7 @@ mod tests {
         };
         // Until the stored settings load, there is nothing to flip: a
         // flip from the default could write the opposite of what is meant.
-        // The rows are there all the same, so the load moves no row (a
-        // selection is kept by position: it would land on another).
+        // The rows are there all the same, so the load moves no row.
         let unloaded = AccountRows {
             synced: None,
             ..account(Vec::new())

@@ -1242,3 +1242,28 @@ thumbnail's original never opens in the viewer, and one that
 Accepted (low): the viewer checks the file's size after taking the
 single-flight claim (the load is bounded anyway); an expansion replaces
 the composer's whole text (bounded by the input).
+
+## Gate 21b — gate 21 fixes (`b4ea001..71c3280`): PASS
+
+Fixed (medium):
+- Gate 21's `:contact-member` check over-corrected: refusing on any
+  contact-request chat with the member kept refusing after the request
+  expired (the core keeps the chat, deletes its record). It now checks
+  what the core does, `try_targeted_message_contact`.
+- `ui::last_told` kept everything told, so the Helix pass of the
+  reaction test could pass on the default pass's text. It now drains the
+  record.
+
+Fixed (low):
+- `set_value` emits no Change, so after a restored draft, an edit or a
+  send the shortcode check compared with stale text and a typed `:`
+  didn't expand. `set_composer_text` (also used by submit now) keeps it
+  in step; `shortcodes_expand_only_as_typed` covers that and undo.
+- A second `v` while an image opened dropped the first load's view task,
+  so nothing showed. The viewer has its own pending slot and refuses
+  while it's taken.
+
+Deferred to milestone 20: an e2e or seam test that `:contact-member`
+works again after a request through a group was retracted or expired.
+Accepted: `the_viewer_opens_one_image_at_a_time` tests only the guard;
+the session test is deferred with the account seam.

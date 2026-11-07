@@ -163,15 +163,17 @@ pub(super) async fn add_member_contact(
     if user.contact(&picked.id).await.is_some() {
         return Err(Failure::Shown(format!("{name} is already a contact")));
     }
-    for id in user.ordered_chat_ids().await? {
-        if let Some(found) = user.chat(&id).await
-            // In any status: the core refuses while its record exists.
-            && found.chat_type == ChatType::TargetedMessageConnection(picked.id.clone())
-        {
-            return Err(Failure::Shown(format!(
-                "You already sent {name} a contact request"
-            )));
-        }
+    // What the core checks: its record of an open request (an expired or
+    // retracted one leaves the chat but not the record).
+    if user
+        .try_targeted_message_contact(&picked.id)
+        .await
+        .map_err(anyhow::Error::from)?
+        .is_some()
+    {
+        return Err(Failure::Shown(format!(
+            "You already sent {name} a contact request"
+        )));
     }
     // Upstream's post-quantum choice is an experimental switch, off.
     let opened = user.add_contact_from_group(chat, picked.id, false).await?;

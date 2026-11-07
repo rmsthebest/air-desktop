@@ -86,6 +86,8 @@ pub struct Conversation {
     /// The message details or image being loaded; replaced by the next request,
     /// dropped (never shown) when the chat changes.
     details: Option<gpui::Task<()>>,
+    /// The image being opened (one at a time: another `v` waits for it).
+    viewing: Option<gpui::Task<()>>,
     /// The composer's text as last seen, to tell what an edit typed.
     typed: String,
 }
@@ -213,6 +215,7 @@ impl Conversation {
             _compose_subscription: None,
             _subscriptions: subscriptions,
             details: None,
+            viewing: None,
             typed: String::new(),
         }
     }
@@ -351,6 +354,8 @@ impl Conversation {
     }
 
     pub fn set_composer_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // `set_value` emits no Change: keep what shortcodes compare with.
+        self.typed = text.to_string();
         self.composer.update(cx, |composer, cx| {
             composer.set_value(text.to_string(), window, cx)
         });
@@ -412,8 +417,7 @@ impl Conversation {
         if text.trim().is_empty() || self.chat.is_none() {
             return;
         }
-        self.composer
-            .update(cx, |composer, cx| composer.set_value("", window, cx));
+        self.set_composer_text("", window, cx);
         match self.compose.clone().filter(|c| c.read(cx).is_live()) {
             Some(compose) => {
                 compose.update(cx, |compose, cx| compose.send(text, cx));
@@ -886,14 +890,17 @@ impl Conversation {
             };
             return crate::ui::show_refusal(refusal.into(), window, cx);
         }
+        if self.viewing.is_some() {
+            return crate::ui::show_refusal("Still opening an image".into(), window, cx);
+        }
         let name = attachment.name.clone();
         let Some(load) = messages.read(cx).full_picture(&message.id, cx) else {
             return crate::ui::show_refusal("Images need an account".into(), window, cx);
         };
-        self.details = Some(cx.spawn_in(window, async move |this, cx| {
+        self.viewing = Some(cx.spawn_in(window, async move |this, cx| {
             let picture = load.await;
             _ = this.update_in(cx, |this, window, cx| {
-                this.details = None;
+                this.viewing = None;
                 match picture {
                     Ok(picture) => show_image(name, picture, window, cx),
                     Err(refusal) => crate::ui::show_refusal(refusal, window, cx),

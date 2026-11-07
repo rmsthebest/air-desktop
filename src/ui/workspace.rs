@@ -3058,6 +3058,26 @@ mod tests {
     }
 
     #[gpui::test]
+    fn shortcodes_expand_only_as_typed(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.simulate_keystrokes("j enter");
+        // Text set without typing (a restored draft, an edit) still
+        // expands when its closing colon is typed.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.conversation.update(cx, |conversation, cx| {
+                conversation.set_composer_text("see you :wave", window, cx)
+            })
+        });
+        cx.simulate_keystrokes("end");
+        cx.simulate_input(":");
+        assert_eq!(composer_text(&workspace, cx), "see you 👋");
+        // Undo brings the shortcode back, and it stays as it is.
+        cx.simulate_keystrokes(&format!("{MOD}-z"));
+        cx.run_until_parked();
+        assert_eq!(composer_text(&workspace, cx), "see you :wave:");
+    }
+
+    #[gpui::test]
     fn retry_and_view_refuse_what_they_cannot_apply_to(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         cx.simulate_keystrokes(&format!("j enter {MOD}-m home"));

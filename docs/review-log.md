@@ -968,3 +968,10 @@ teardown-routing item.
 
 Fixed (low): marking and unmarking run in `spawn_blocking` (they fsync);
 the directory sync is Unix-only (Windows can't open a directory so).
+
+## Gate 15h — gate 15g fixes (`c694e33..a1ca068`): PASS
+
+Accepted (low): a failed unmark task (panic, runtime shutdown) is not
+logged; the mark it leaves is dropped by the next load's sweep, which
+finds nothing to remove. Windows doesn't sync the mark's directory, so a
+power loss there may lose a mark (the app targets Linux).

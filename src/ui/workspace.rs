@@ -838,9 +838,19 @@ impl Workspace {
             }
             SettingsEvent::CopyInviteCodes(codes) => self.copy_invite_codes(codes, window, cx),
             SettingsEvent::GetInviteCode(id) => self.get_invite_code(id, window, cx),
-            SettingsEvent::RemoveUsedCodes => {
-                self.invitation_op(|invitations, cx| invitations.clear_copied(cx), window, cx)
-            }
+            // Asked first: a code given out but not used yet is gone with it.
+            SettingsEvent::RemoveUsedCodes => self.confirm(
+                "Remove the codes you gave out?".into(),
+                "They're gone from this list for good, also any not used yet. \
+                 They still work for whoever has them."
+                    .into(),
+                "Remove",
+                |this, window, cx| {
+                    this.invitation_op(|invitations, cx| invitations.clear_copied(cx), window, cx)
+                },
+                window,
+                cx,
+            ),
             SettingsEvent::DeleteAccount => self.delete_account("", window, cx),
             SettingsEvent::Close => self.close_settings(window, cx),
         }

@@ -100,7 +100,8 @@ pub struct AccountRows {
     pub usernames: Vec<SharedString>,
     pub devices: Vec<Device>,
     pub max_devices: u32,
-    pub synced: SyncedSettings,
+    /// `None` until loaded: the rows wait, so nothing flips a default.
+    pub synced: Option<SyncedSettings>,
     pub invites: Vec<InviteSlot>,
 }
 
@@ -117,10 +118,10 @@ pub fn rows(settings: &Settings, account: Option<&AccountRows>) -> Vec<Row> {
         rows.push(Row::DisplayName(account.display_name.clone()));
         rows.extend(account.usernames.iter().cloned().map(Row::Username));
         rows.push(Row::AddUsername);
-        rows.push(Row::ReadReceipts(account.synced.read_receipts));
-        rows.push(Row::DeleteExpiredRequests(
-            account.synced.delete_expired_requests,
-        ));
+        if let Some(synced) = account.synced {
+            rows.push(Row::ReadReceipts(synced.read_receipts));
+            rows.push(Row::DeleteExpiredRequests(synced.delete_expired_requests));
+        }
         rows.extend(account.devices.iter().cloned().map(Row::Device));
         rows.push(Row::LinkDevice {
             count: account.devices.len(),
@@ -298,9 +299,7 @@ impl SettingsView {
             usernames: session.usernames().to_vec(),
             devices: devices.map(|d| d.devices().to_vec()).unwrap_or_default(),
             max_devices: devices.map_or(0, Devices::max_devices),
-            synced: account.map_or_else(SyncedSettings::default, |account| {
-                account.settings.read(cx).settings()
-            }),
+            synced: account.and_then(|account| account.settings.read(cx).settings()),
             invites: account
                 .map(|account| account.invitations.read(cx).slots().to_vec())
                 .unwrap_or_default(),
@@ -680,25 +679,33 @@ mod tests {
         let account = |invites: Vec<InviteSlot>| AccountRows {
             display_name: "Ada".into(),
             invites,
+            synced: Some(SyncedSettings {
+                read_receipts: false,
+                delete_expired_requests: false,
+            }),
             ..AccountRows::default()
         };
+        // Until the stored settings load, there is nothing to flip: a
+        // flip from the default could write the opposite of what is meant.
+        let unloaded = AccountRows {
+            synced: None,
+            ..account(Vec::new())
+        };
+        assert!(
+            !rows(&Settings::default(), Some(&unloaded))
+                .iter()
+                .any(|row| matches!(row, Row::ReadReceipts(_) | Row::DeleteExpiredRequests(_)))
+        );
         let all = rows(&Settings::default(), Some(&account(Vec::new())));
-        // Either key flips a synced setting; read receipts start on.
+        // Shown as stored, and flipped from it.
         let receipts = all
             .iter()
             .find(|row| matches!(row, Row::ReadReceipts(_)))
             .unwrap();
-        assert_eq!(receipts, &Row::ReadReceipts(true));
-        for forward in [true, false] {
-            assert_eq!(
-                change(receipts, forward, &themes()),
-                Some(SettingsEvent::ReadReceipts(false))
-            );
-            assert_eq!(
-                change(&Row::DeleteExpiredRequests(false), forward, &themes()),
-                Some(SettingsEvent::DeleteExpiredRequests(true))
-            );
-        }
+        assert_eq!(
+            change(receipts, true, &themes()),
+            Some(SettingsEvent::ReadReceipts(true))
+        );
         // Deleting the account is the last row, and only enter starts it
         // (it asks for the word, then confirms).
         assert_eq!(all.last(), Some(&Row::DeleteAccount));

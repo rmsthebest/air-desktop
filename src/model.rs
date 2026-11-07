@@ -804,14 +804,15 @@ pub enum InviteSlot {
 /// Longest invite code shown or copied; the server's are 8 characters.
 const MAX_INVITE_CODE: usize = 32;
 
-/// An invite code as the server sent it, reduced to letters and digits
-/// (bounded), so what is shown and copied can't carry anything else.
-pub fn invite_code(code: &str) -> SharedString {
-    code.chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(MAX_INVITE_CODE)
-        .collect::<String>()
-        .into()
+/// An invite code as the server sent it, if it is only letters and
+/// digits (bounded): what is shown and copied can't carry anything else,
+/// and is exactly the code the core stored (it is marked by it). Any
+/// other is left out, never altered: a changed code wouldn't work.
+pub fn invite_code(code: &str) -> Option<SharedString> {
+    let plain = !code.is_empty()
+        && code.len() <= MAX_INVITE_CODE
+        && code.chars().all(|c| c.is_ascii_alphanumeric());
+    plain.then(|| code.to_string().into())
 }
 
 /// What copying invite codes puts on the clipboard (upstream's wording,
@@ -1316,10 +1317,14 @@ mod tests {
 
     #[test]
     fn invite_codes_are_only_letters_and_digits() {
-        assert_eq!(invite_code("AB12cd34"), "AB12cd34");
-        // A server can't slip text, lines or bidi tricks into the clipboard.
-        assert_eq!(invite_code("AB\u{202E}12\nhttp://x"), "AB12httpx");
-        assert_eq!(invite_code(&"A".repeat(100)).len(), 32);
+        assert_eq!(invite_code("AB12cd34"), Some("AB12cd34".into()));
+        // A server can't slip text, lines or bidi tricks into the
+        // clipboard; such a code is left out, not changed into another.
+        for bad in ["AB\u{202E}12", "AB12\nhttp://x", "", "AB 12"] {
+            assert_eq!(invite_code(bad), None, "{bad:?}");
+        }
+        assert_eq!(invite_code(&"A".repeat(33)), None);
+        assert!(invite_code(&"A".repeat(32)).is_some());
         assert_eq!(
             invite_message(&["AB12".into()]),
             "Let's chat on Air. Use invite code AB12."

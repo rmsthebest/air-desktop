@@ -350,6 +350,10 @@ impl Session {
         cx: &mut Context<Self>,
     ) -> Task<Result<crate::model::AccountDeletion, String>> {
         use crate::model::AccountDeletion;
+        // One at a time: each tells its own outcome.
+        if self.deleting {
+            return Task::ready(Err("Your account is being deleted already".into()));
+        }
         self.deleting = true;
         let user = self.user.clone();
         let run = contacts::on_tokio(cx, "delete the account", async move {

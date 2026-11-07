@@ -7,7 +7,7 @@
 use aircoreclient::clients::CoreUser;
 use aircoreclient::{RequestInvitationCodeError, TokenId};
 use gpui_kit::{App, Context, Task};
-use tracing::error;
+use tracing::{error, warn};
 
 use super::contacts::{Failure, on_tokio};
 use crate::model::{InviteSlot, invite_code};
@@ -36,9 +36,15 @@ pub(super) async fn load(user: CoreUser) -> anyhow::Result<Loaded> {
     tokens.sort_unstable_by_key(|token| (token.created_at, token.id));
     let slots = codes
         .into_iter()
-        .map(|code| InviteSlot::Code {
-            code: invite_code(&code.code),
-            copied: code.copied,
+        .filter_map(|code| {
+            let shown = invite_code(&code.code);
+            if shown.is_none() {
+                warn!("left out an invite code that isn't plain letters and digits");
+            }
+            Some(InviteSlot::Code {
+                code: shown?,
+                copied: code.copied,
+            })
         })
         .chain(tokens.iter().map(|token| InviteSlot::Token(token.id)))
         .collect();
@@ -90,7 +96,9 @@ impl Invitations {
         on_tokio(cx, "get an invite code", async move {
             let token = token.ok_or_else(|| Failure::Shown("That slot is gone".into()))?;
             match user.request_invitation_code(token).await? {
-                Ok(code) => Ok(invite_code(&code.code)),
+                Ok(code) => invite_code(&code.code).ok_or_else(|| {
+                    Failure::Internal(anyhow::anyhow!("the server sent an unusual invite code"))
+                }),
                 Err(RequestInvitationCodeError::GlobalQuotaExceeded) => Err(Failure::Shown(
                     "Air is out of invite codes for now. Try again later.".into(),
                 )),

@@ -1115,3 +1115,25 @@ Accepted (low): muting can lose a race with alert processing that read
 the chat as unmuted just before, leaving that one alert up until the
 next rewrite or dismissal. Narrow and harmless; not worth re-reading
 the chat before every notice.
+
+## Gate 19 — milestone 17, account management (`ad08cae..522bce2`): PASS
+
+Fixed (low):
+- Invite codes were shown and marked copied in a cleaned-up form, while
+  the core marks the stored code exactly: a code that needed cleaning
+  never showed as given out, and a changed code would not work.
+  `model::invite_code` now leaves out (logs) any code that isn't plain
+  letters and digits, never alters one, so what is shown, copied and
+  marked is the stored code.
+- Removing the codes given out (one `l` on the row) deleted them all
+  unasked: it is confirmed now. Copying on `l` is kept: it only marks a
+  code given out, which loses nothing.
+- A second account deletion while one ran could report an abort twice:
+  it is refused while one runs.
+- The synced-setting rows flipped the core's default before the stored
+  values loaded: they show only once loaded.
+- Tests: the toggle test no longer restates `change` both ways; it
+  checks the rows wait for the load (fails if they show defaults).
+
+Deferred to milestone 20 (account seam): a test of the abort-report gate
+in `Session::check_deletion_abort` (needs a fake for the two core calls).

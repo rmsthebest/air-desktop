@@ -19,7 +19,8 @@ use crate::runtime::Tokio;
 
 pub struct AccountSettings {
     user: CoreUser,
-    settings: SyncedSettings,
+    /// `None` until first loaded: nothing is changed from a guess.
+    settings: Option<SyncedSettings>,
     /// The latest load; a newer one replaces (cancels) it.
     load: Option<Task<()>>,
     _changes: Subscription,
@@ -66,7 +67,7 @@ impl AccountSettings {
         });
         let mut settings = Self {
             user: session.read(cx).user().clone(),
-            settings: SyncedSettings::default(),
+            settings: None,
             load: None,
             _changes: changes,
         };
@@ -74,7 +75,7 @@ impl AccountSettings {
         settings
     }
 
-    pub fn settings(&self) -> SyncedSettings {
+    pub fn settings(&self) -> Option<SyncedSettings> {
         self.settings
     }
 
@@ -83,7 +84,7 @@ impl AccountSettings {
         self.load = Some(cx.spawn(async move |this, cx| {
             if let Ok(settings) = task.await {
                 _ = this.update(cx, |this, cx| {
-                    this.settings = settings;
+                    this.settings = Some(settings);
                     cx.notify();
                 });
             }

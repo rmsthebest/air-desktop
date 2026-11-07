@@ -79,8 +79,10 @@ pub enum Row {
         count: usize,
         max: u32,
     },
-    ReadReceipts(bool),
-    DeleteExpiredRequests(bool),
+    /// `None` until the stored value loads: shown, so rows below keep
+    /// their place, but nothing to flip (a default could be written).
+    ReadReceipts(Option<bool>),
+    DeleteExpiredRequests(Option<bool>),
     InviteCode {
         code: SharedString,
         copied: bool,
@@ -100,7 +102,7 @@ pub struct AccountRows {
     pub usernames: Vec<SharedString>,
     pub devices: Vec<Device>,
     pub max_devices: u32,
-    /// `None` until loaded: the rows wait, so nothing flips a default.
+    /// `None` until loaded: the rows show it, and nothing flips a default.
     pub synced: Option<SyncedSettings>,
     pub invites: Vec<InviteSlot>,
 }
@@ -118,10 +120,10 @@ pub fn rows(settings: &Settings, account: Option<&AccountRows>) -> Vec<Row> {
         rows.push(Row::DisplayName(account.display_name.clone()));
         rows.extend(account.usernames.iter().cloned().map(Row::Username));
         rows.push(Row::AddUsername);
-        if let Some(synced) = account.synced {
-            rows.push(Row::ReadReceipts(synced.read_receipts));
-            rows.push(Row::DeleteExpiredRequests(synced.delete_expired_requests));
-        }
+        rows.push(Row::ReadReceipts(account.synced.map(|s| s.read_receipts)));
+        rows.push(Row::DeleteExpiredRequests(
+            account.synced.map(|s| s.delete_expired_requests),
+        ));
         rows.extend(account.devices.iter().cloned().map(Row::Device));
         rows.push(Row::LinkDevice {
             count: account.devices.len(),
@@ -198,8 +200,8 @@ pub fn change(row: &Row, forward: bool, themes: &Themes) -> Option<SettingsEvent
             SettingsEvent::Notifications(step(&[Full, Private, Off], current, forward)?)
         }
         // On or off: either way flips it.
-        Row::ReadReceipts(on) => SettingsEvent::ReadReceipts(!on),
-        Row::DeleteExpiredRequests(on) => SettingsEvent::DeleteExpiredRequests(!on),
+        Row::ReadReceipts(on) => SettingsEvent::ReadReceipts(!(*on)?),
+        Row::DeleteExpiredRequests(on) => SettingsEvent::DeleteExpiredRequests(!(*on)?),
         // Text and lists aren't stepped: only the forward key (enter,
         // right) acts on them, so stepping back never starts a removal.
         _ if !forward => return None,
@@ -219,12 +221,22 @@ pub fn change(row: &Row, forward: bool, themes: &Themes) -> Option<SettingsEvent
     })
 }
 
-fn on_off(on: bool) -> String {
-    if on { "On" } else { "Off" }.into()
+fn on_off(on: Option<bool>) -> String {
+    match on {
+        Some(true) => "On",
+        Some(false) => "Off",
+        None => "…",
+    }
+    .into()
 }
 
-fn on_off_expired(delete: bool) -> String {
-    if delete { "Deleted" } else { "Kept" }.into()
+fn on_off_expired(delete: Option<bool>) -> String {
+    match delete {
+        Some(true) => "Deleted",
+        Some(false) => "Kept",
+        None => "…",
+    }
+    .into()
 }
 
 /// Registered theme names by mode, sorted.
@@ -687,16 +699,21 @@ mod tests {
         };
         // Until the stored settings load, there is nothing to flip: a
         // flip from the default could write the opposite of what is meant.
+        // The rows are there all the same, so the load moves no row (a
+        // selection is kept by position: it would land on another).
         let unloaded = AccountRows {
             synced: None,
             ..account(Vec::new())
         };
-        assert!(
-            !rows(&Settings::default(), Some(&unloaded))
-                .iter()
-                .any(|row| matches!(row, Row::ReadReceipts(_) | Row::DeleteExpiredRequests(_)))
-        );
+        let before = rows(&Settings::default(), Some(&unloaded));
         let all = rows(&Settings::default(), Some(&account(Vec::new())));
+        assert_eq!(before.len(), all.len());
+        for row in &before {
+            if matches!(row, Row::ReadReceipts(_) | Row::DeleteExpiredRequests(_)) {
+                assert_eq!(change(row, true, &themes()), None);
+                assert_eq!(change(row, false, &themes()), None);
+            }
+        }
         // Shown as stored, and flipped from it.
         let receipts = all
             .iter()

@@ -96,8 +96,15 @@ impl Invitations {
         on_tokio(cx, "get an invite code", async move {
             let token = token.ok_or_else(|| Failure::Shown("That slot is gone".into()))?;
             match user.request_invitation_code(token).await? {
+                // The token is spent and the core stored the code; it's left
+                // out on reload as any unusual code is. Say so, not "error".
                 Ok(code) => invite_code(&code.code).ok_or_else(|| {
-                    Failure::Internal(anyhow::anyhow!("the server sent an unusual invite code"))
+                    warn!("the server sent an invite code that isn't letters and digits");
+                    Failure::Shown(
+                        "The server sent an invite code this app won't show. \
+                         It used up one of your invites."
+                            .into(),
+                    )
                 }),
                 Err(RequestInvitationCodeError::GlobalQuotaExceeded) => Err(Failure::Shown(
                     "Air is out of invite codes for now. Try again later.".into(),

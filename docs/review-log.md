@@ -1137,3 +1137,20 @@ Fixed (low):
 
 Deferred to milestone 20 (account seam): a test of the abort-report gate
 in `Session::check_deletion_abort` (needs a fake for the two core calls).
+
+## Gate 19b — gate 19 fixes (`522bce2..86f0e6f`): PASS
+
+Fixed (low):
+- The settings selection is kept by position, so the synced rows
+  appearing on load moved it onto another row (a device, a username)
+  that Delete would then act on. The rows now show from the start, `…`
+  and not flippable until loaded, so the load moves no row. The test
+  checks the row count stays and the unloaded rows change nothing.
+- A code from the server that isn't plain letters and digits was a
+  generic error, though the token was spent: it is now told
+  (`Failure::Shown`, it cost an invite).
+- Test: removing given-out codes asks first (Escape removes nothing,
+  confirmed it runs); fails if the confirmation is dropped.
+
+Deferred to milestone 20 (account seam): `invitations::load`'s filtering,
+and the one-deletion-at-a-time refusal with the abort-report test.

@@ -2791,6 +2791,34 @@ mod tests {
     }
 
     #[gpui::test]
+    fn removing_given_out_codes_asks_first(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let asking = |cx: &mut VisualTestContext| cx.update(|w, cx| w.has_active_dialog(cx));
+        let told = |cx: &mut VisualTestContext| cx.update(|w, cx| w.notifications(cx).len());
+        let remove = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.settings_changed(SettingsEvent::RemoveUsedCodes, window, cx)
+            });
+            cx.run_until_parked();
+        };
+        let before = told(cx);
+        // Escape removes nothing. (Without an account, reaching the
+        // removal is told as a refusal: that's what shows it ran.)
+        remove(cx);
+        assert!(asking(cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert_eq!(told(cx), before);
+        // Confirmed, it runs.
+        remove(cx);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert_eq!(told(cx), before + 1);
+    }
+
+    #[gpui::test]
     fn helix_i_still_inserts_from_the_messages(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         let focused = focus_probe(&workspace, cx);

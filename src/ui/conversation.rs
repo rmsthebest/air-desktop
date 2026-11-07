@@ -894,7 +894,11 @@ impl Conversation {
             return crate::ui::show_refusal(refusal.into(), window, cx);
         }
         if self.viewing.is_some() {
-            return crate::ui::show_refusal("Still opening an image".into(), window, cx);
+            return crate::ui::show_refusal(
+                "Another image is still opening; try again in a moment".into(),
+                window,
+                cx,
+            );
         }
         let name = attachment.name.clone();
         let Some(load) = messages.read(cx).full_picture(&message.id, cx) else {

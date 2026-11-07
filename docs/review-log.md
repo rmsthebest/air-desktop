@@ -1294,3 +1294,13 @@ The gate 21c entry is corrected.
 Deferred to milestone 20 (account seam): a test that a chat change
 drops a pending view and that `v` in the next chat then starts a load
 (the session claim released, not only the view's slot).
+
+## Gate 21e — gate 21d fix (`e4c8b18..43d4a64`): PASS
+
+Fixed (low): the refusal while a decode left behind by a chat change
+still runs read "Still opening an image", as if the user had started
+one in the new chat; it says another image is still opening now.
+
+Accepted (low, as at gate 21): the viewer loads the whole attachment
+before its size check (bounded by what the core stores). Checking the
+size first waits for the account seam.

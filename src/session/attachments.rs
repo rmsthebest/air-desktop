@@ -327,7 +327,9 @@ pub(super) async fn full_picture(
     chat: ChatId,
     message: MessageId,
 ) -> Result<Picture, Failure> {
-    let viewing = Viewing::take().ok_or_else(|| Failure::Shown("Still opening an image".into()))?;
+    let viewing = Viewing::take().ok_or_else(|| {
+        Failure::Shown("Another image is still opening; try again in a moment".into())
+    })?;
     let id = attachment_in(&user, chat, message).await?;
     match user.attachment_thumbnail(id).await? {
         Some(AttachmentThumbnail::Ready { .. } | AttachmentThumbnail::OriginalFits) => {}

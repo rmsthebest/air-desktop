@@ -1366,3 +1366,14 @@ Fixed:
 - (low) The abort setup loop is bounded.
 - (low) `Claim` stays private; the tests hold one through a seam-only
   `attachments::hold`.
+
+## Gate 22b — gate 22 fixes (`1f04923..d1256f9`): PASS
+
+Fixed (low):
+- The seam modules' usage notes still said `cargo test seam -- --ignored`,
+  which without the feature runs nothing and passes; they name `just seam`.
+- A release built with `--features seam` (or `--all-features`) would ship
+  the core in test mode: such a binary refuses to start, and `Cargo.toml`
+  says so next to the feature.
+- `ui::last_told` panics when more than one toast was shown, so a doubled
+  one can't hide behind the last; `take_told` counts them.

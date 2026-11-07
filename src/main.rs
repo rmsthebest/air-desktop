@@ -35,6 +35,14 @@ fn main() {
         )
         .init();
 
+    // The `seam` feature (tests only) puts the core in test mode: fewer
+    // connection packages, shorter link codes, faster retries. Never run
+    // a binary built with it.
+    if cfg!(feature = "seam") {
+        eprintln!("air-desktop was built with the `seam` test feature and won't run");
+        std::process::exit(1);
+    }
+
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {

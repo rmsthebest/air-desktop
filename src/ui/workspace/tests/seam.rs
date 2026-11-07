@@ -1,7 +1,8 @@
 //! Workspace tests on a real session: Air's core talking to its in-process
 //! test server (`airserver_test_harness`), which needs Postgres and MinIO
 //! from Air's compose file. Ignored by default, like the session's seam
-//! tests: `cargo test seam -- --ignored`.
+//! tests: `just seam` (`cargo test --features seam seam -- --ignored`;
+//! without the feature nothing runs).
 
 use std::time::{Duration, Instant};
 

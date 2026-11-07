@@ -10,7 +10,8 @@ publish = false
 # Account seam tests (`just seam`). Off by default: the harness turns on the
 # core's `test_utils` feature, which changes its behaviour (5 connection
 # packages, 15 s link codes, 1 s retries), and the e2e tests must run the
-# production core.
+# production core. Never build a release with it (nor `--all-features`): a
+# binary built with it refuses to start.
 seam = ["dep:airserver_test_harness"]
 
 [dependencies]

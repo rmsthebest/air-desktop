@@ -5,7 +5,7 @@
 //! CLAUDE.md). Ignored by default; run with
 //!
 //! ```sh
-//! cargo test seam -- --ignored
+//! just seam   # cargo test --features seam seam -- --ignored
 //! ```
 
 use aircommon::identifiers::UserId as CoreUserId;

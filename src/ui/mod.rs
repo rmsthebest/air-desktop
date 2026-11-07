@@ -73,9 +73,13 @@ thread_local! {
 /// The latest refusal or info shown on this thread since the last take
 /// (tests only): taking it clears the record, so no check passes on what
 /// an earlier step was told.
+/// Panics if more than one was: a doubled toast must not hide behind the
+/// last one (count them with [`take_told`]).
 #[cfg(test)]
 pub fn last_told() -> Option<String> {
-    take_told().pop()
+    let mut told = take_told();
+    assert!(told.len() <= 1, "told more than once: {told:?}");
+    told.pop()
 }
 
 /// Everything shown on this thread since the last take, in order (tests

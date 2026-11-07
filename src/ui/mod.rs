@@ -19,6 +19,7 @@ pub use workspace::Workspace;
 
 use gpui::{App, KeyContext, Window};
 use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::notification::Notification;
 
 use crate::settings::{Settings, SettingsStore};
@@ -55,4 +56,38 @@ pub fn show_refusal(message: String, window: &mut Window, cx: &mut App) {
 
 pub fn show_info(message: String, window: &mut Window, cx: &mut App) {
     window.push_notification(Notification::info(message), cx);
+}
+
+/// Asks before running `run`: `ok` confirms (looking like `variant`),
+/// Escape or Cancel doesn't. The dialog closes and focus goes back where
+/// it was before `run` (which may report): gpui-component's OK path
+/// doesn't restore it.
+pub fn confirm(
+    title: String,
+    description: String,
+    ok: &'static str,
+    variant: ButtonVariant,
+    run: impl Fn(&mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let run = std::rc::Rc::new(run);
+    let previous_focus = window.focused(cx);
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let (run, previous_focus) = (run.clone(), previous_focus.clone());
+        alert
+            .confirm()
+            .title(title.clone())
+            .description(description.clone())
+            .ok_text(ok)
+            .ok_variant(variant)
+            .on_ok(move |_, window, cx| {
+                window.close_dialog(cx);
+                if let Some(focus) = &previous_focus {
+                    focus.focus(window, cx);
+                }
+                run(window, cx);
+                false
+            })
+    });
 }

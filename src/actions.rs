@@ -70,6 +70,10 @@ gpui_kit::actions!(
         ReportSpam,
         RetractRequest,
         DeleteChat,
+        DeleteMessage,
+        DeleteMessageForEveryone,
+        ShowMessageDetails,
+        ToggleMute,
     ]
 );
 
@@ -132,6 +136,7 @@ pub fn commands() -> Vec<Command> {
         cmd("Unblock contact", UnblockContact, "Workspace"),
         cmd("Report spam", ReportSpam, "Workspace"),
         cmd("Delete chat", DeleteChat, "Workspace"),
+        cmd("Mute or unmute chat", ToggleMute, "Workspace"),
         cmd("Toggle details pane", ToggleDetails, "Workspace"),
         cmd(
             "Cycle appearance (system/light/dark)",
@@ -205,6 +210,10 @@ pub fn label(action: &dyn Action) -> String {
         "UnblockContact" => "unblock contact",
         "ReportSpam" => "report spam",
         "DeleteChat" => "delete chat",
+        "DeleteMessage" => "delete message for me",
+        "DeleteMessageForEveryone" => "delete message for everyone",
+        "ShowMessageDetails" => "message details",
+        "ToggleMute" => "mute or unmute",
         "CancelCompose" => "cancel reply or edit",
         "ClearCursor" => "clear selection",
         "OpenChatAt" => "open chat n",

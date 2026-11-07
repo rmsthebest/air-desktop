@@ -43,6 +43,10 @@ pub enum Command {
     Report(String),
     /// Retract the open chat's contact request.
     Retract,
+    /// Mute the open chat's alerts, for how long as typed (see
+    /// `model::Mute::parse`; empty: until unmuted).
+    Mute(String),
+    Unmute,
     /// Send the file at this path, as typed, to the open chat.
     Attach(String),
     /// Change the user's display name.
@@ -196,6 +200,16 @@ const SPECS: &[Spec] = &[
         help: "Retract the contact request you sent",
     },
     Spec {
+        names: &["mute"],
+        arg: Arg::Text,
+        help: "Mute alerts: 30m, 8h, 2d, 1w, tomorrow, monday or forever",
+    },
+    Spec {
+        names: &["unmute"],
+        arg: Arg::None,
+        help: "Unmute alerts",
+    },
+    Spec {
         names: &["attach"],
         arg: Arg::Text,
         help: "Send a file (a path) to the open chat",
@@ -301,6 +315,8 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "unblock" => Command::Unblock,
         "report" => Command::Report(arg.to_string()),
         "retract" => Command::Retract,
+        "mute" => Command::Mute(arg.to_string()),
+        "unmute" => Command::Unmute,
         "attach" => Command::Attach(need("a file path")?),
         "name" => Command::DisplayName(need("a name")?),
         "link" => Command::Link(need("the code the new device shows")?),

@@ -86,9 +86,24 @@ pub struct ChatSummary {
     /// `None` for a chat without messages.
     pub last_activity: Option<DateTime<Utc>>,
     pub unread: u32,
+    /// Alerts are off for it until then (this device only, as upstream).
+    pub muted: Option<Mute>,
 }
 
 impl ChatSummary {
+    /// Alerts for it are off at `now`.
+    pub fn is_muted(&self, now: DateTime<Utc>) -> bool {
+        self.muted.is_some_and(|mute| mute.is_muted(now))
+    }
+
+    /// What deleting a message in it depends on.
+    pub fn deletion_facts(&self) -> ChatFacts {
+        ChatFacts {
+            self_chat: self.is_self_chat,
+            live: self.composes(),
+        }
+    }
+
     /// The user blocked the peer: their messages and requests are
     /// dropped, and the chat offers unblocking instead of a composer.
     pub fn blocked(&self) -> bool {
@@ -335,6 +350,11 @@ pub struct Message {
     pub reactions: Vec<Reaction>,
     /// Kinds of reaction not shown.
     pub more_reactions: usize,
+    /// Deleted for everyone: only a placeholder is left.
+    pub deleted: bool,
+    /// The core lets the user delete it on their devices (some system
+    /// messages stay).
+    pub erasable: bool,
 }
 
 /// One kind of reaction on a message, as shown under it.
@@ -610,6 +630,8 @@ impl Message {
             reply_to: None,
             reactions: Vec::new(),
             more_reactions: 0,
+            deleted: false,
+            erasable: true,
         }
     }
 
@@ -624,6 +646,212 @@ impl Message {
 
     pub fn is_event(&self) -> bool {
         matches!(self.body, MessageBody::Event(_))
+    }
+
+    /// What deleting it depends on.
+    pub fn deletion_facts(&self) -> MessageFacts {
+        MessageFacts {
+            content: !self.is_event(),
+            own: self.own,
+            sent: !matches!(self.status, MessageStatus::Sending | MessageStatus::Failed),
+            deleted: self.deleted,
+            erasable: self.erasable,
+        }
+    }
+}
+
+/// Who a message is deleted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteFor {
+    /// On all the user's devices; the other members keep it.
+    Me,
+    /// Replaced by a placeholder for every member.
+    Everyone,
+}
+
+/// A message as deleting it sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageFacts {
+    /// Sent by someone (not a system message).
+    pub content: bool,
+    pub own: bool,
+    /// The server took it.
+    pub sent: bool,
+    /// Deleted for everyone already.
+    pub deleted: bool,
+    /// The core lets the user delete it on their devices.
+    pub erasable: bool,
+}
+
+/// The chat a message is deleted in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatFacts {
+    pub self_chat: bool,
+    /// Messages can be sent to it (a deletion for everyone is one).
+    pub live: bool,
+}
+
+impl DeleteFor {
+    /// Whether `self` applies to `message` in `chat`, or why not. The one
+    /// rule table: the view asks before confirming, the session again on
+    /// the core's state before running.
+    ///
+    /// As upstream: only the sender deletes a message for everyone, once
+    /// it was sent, and not in Notes to self (deleting it there already
+    /// removes it from every device). The core itself doesn't check who
+    /// sent a message it is asked to delete for everyone.
+    pub fn check(self, message: MessageFacts, chat: ChatFacts) -> Result<(), &'static str> {
+        match self {
+            DeleteFor::Me if message.erasable => Ok(()),
+            DeleteFor::Me => Err("Air keeps that message"),
+            DeleteFor::Everyone if !message.content => {
+                Err("Only messages can be deleted for everyone")
+            }
+            DeleteFor::Everyone if !message.own => {
+                Err("Only your own messages can be deleted for everyone; delete it for you instead")
+            }
+            DeleteFor::Everyone if message.deleted => Err("It's deleted for everyone already"),
+            DeleteFor::Everyone if chat.self_chat => {
+                Err("In Notes to self, deleting it for you removes it everywhere")
+            }
+            DeleteFor::Everyone if !message.sent => {
+                Err("It wasn't sent; delete it for you instead")
+            }
+            DeleteFor::Everyone if !chat.live => {
+                Err("This chat takes no messages; delete it for you instead")
+            }
+            DeleteFor::Everyone => Ok(()),
+        }
+    }
+}
+
+/// One version of an edited message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Version {
+    /// `None` when it isn't text.
+    pub markdown: Option<Arc<Markdown>>,
+    /// When it was sent (the first) or the edit made, as the sender says.
+    pub at: DateTime<Utc>,
+}
+
+/// Versions of a message the details show; a sender can edit often.
+const MAX_VERSIONS: usize = 20;
+
+/// A message's edit history as the details show it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EditHistory {
+    /// Newest first, at most [`MAX_VERSIONS`]; the last is the original
+    /// when `older` is 0.
+    pub versions: Vec<Version>,
+    /// Older versions left out.
+    pub older: usize,
+}
+
+impl EditHistory {
+    /// From the core's versions, oldest first. A message never edited
+    /// has no history.
+    pub fn new(oldest_first: Vec<(Option<&str>, DateTime<Utc>)>) -> Self {
+        if oldest_first.len() < 2 {
+            return Self::default();
+        }
+        let older = oldest_first.len().saturating_sub(MAX_VERSIONS);
+        let versions = oldest_first
+            .into_iter()
+            .rev()
+            .take(MAX_VERSIONS)
+            .map(|(source, at)| Version {
+                markdown: source.map(|source| Arc::new(markdown::parse(source))),
+                at,
+            })
+            .collect();
+        Self { versions, older }
+    }
+}
+
+/// How long a chat is muted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mute {
+    Until(DateTime<Utc>),
+    Forever,
+}
+
+/// Longest mute with a duration; longer is `forever`.
+const MAX_MUTE_DAYS: i64 = 366;
+
+impl Mute {
+    pub fn is_muted(self, now: DateTime<Utc>) -> bool {
+        match self {
+            Mute::Until(until) => now < until,
+            Mute::Forever => true,
+        }
+    }
+
+    /// `:mute`'s argument at `now` (local time decides "tomorrow" and
+    /// "monday"): nothing, `forever` or `always`; `tomorrow` (until
+    /// midnight) or `monday` (until next Monday starts), as upstream's
+    /// choices; or a duration like `30m`, `8h`, `2d`, `1w`.
+    pub fn parse<Tz: chrono::TimeZone>(arg: &str, now: DateTime<Tz>) -> Result<Mute, &'static str> {
+        const USAGE: &str = "Mute for a time like 30m, 8h, 2d, 1w, or tomorrow, monday, forever";
+        let arg = arg.trim().to_lowercase();
+        let days_ahead = match arg.as_str() {
+            "" | "forever" | "always" => return Ok(Mute::Forever),
+            "tomorrow" => Some(1),
+            "monday" => {
+                // A Monday mutes until the next one, as upstream.
+                let today = i64::from(now.weekday().num_days_from_monday());
+                Some(7 - today)
+            }
+            _ => None,
+        };
+        if let Some(days) = days_ahead {
+            let day = now.date_naive() + chrono::Duration::days(days);
+            let midnight = day.and_time(chrono::NaiveTime::MIN);
+            // A midnight skipped by a clock change starts the day later.
+            let start = now
+                .timezone()
+                .from_local_datetime(&midnight)
+                .earliest()
+                .or_else(|| {
+                    now.timezone()
+                        .from_local_datetime(&(midnight + chrono::Duration::hours(1)))
+                        .earliest()
+                })
+                .ok_or(USAGE)?;
+            return Ok(Mute::Until(start.with_timezone(&Utc)));
+        }
+        let split = arg.find(|c: char| !c.is_ascii_digit()).ok_or(USAGE)?;
+        let (count, unit) = arg.split_at(split);
+        let count: i64 = count.parse().map_err(|_| USAGE)?;
+        let minutes = match unit {
+            "m" | "min" => 1,
+            "h" => 60,
+            "d" => 24 * 60,
+            "w" => 7 * 24 * 60,
+            _ => return Err(USAGE),
+        };
+        let minutes = count.checked_mul(minutes).filter(|m| *m > 0).ok_or(USAGE)?;
+        if minutes > MAX_MUTE_DAYS * 24 * 60 {
+            return Err("That's over a year: mute forever instead");
+        }
+        Ok(Mute::Until(
+            now.with_timezone(&Utc) + chrono::Duration::minutes(minutes),
+        ))
+    }
+
+    /// What muting says, e.g. "Muted until 14:05" (local time; the date
+    /// too when it isn't today).
+    pub fn label(self, now: DateTime<Utc>) -> String {
+        match self {
+            Mute::Forever => "Muted".to_string(),
+            Mute::Until(until) => {
+                let (until, now) = (until.with_timezone(&Local), now.with_timezone(&Local));
+                if until.date_naive() == now.date_naive() {
+                    format!("Muted until {}", until.format("%H:%M"))
+                } else {
+                    format!("Muted until {}", until.format("%a %b %-d, %H:%M"))
+                }
+            }
+        }
     }
 }
 
@@ -673,6 +901,17 @@ pub fn step_index(len: usize, current: Option<usize>, forward: bool) -> Option<u
         (Some(ix), true) => (ix + 1) % len,
         (Some(ix), false) => (ix + len - 1) % len,
     })
+}
+
+/// When the soonest of the chats' timed mutes ends, after `now`.
+pub fn next_mute_expiry(chats: &[ChatSummary], now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    chats
+        .iter()
+        .filter_map(|chat| match chat.muted {
+            Some(Mute::Until(until)) if until > now => Some(until),
+            _ => None,
+        })
+        .min()
 }
 
 /// The nearest other chat with unread messages in the given direction,
@@ -847,6 +1086,7 @@ pub mod mock {
                 }),
                 last_activity: Some(now - ago),
                 unread,
+                muted: None,
             }
         };
         vec![
@@ -997,6 +1237,174 @@ mod tests {
     }
 
     #[test]
+    fn each_deletion_applies_only_where_it_may() {
+        let own_sent = MessageFacts {
+            content: true,
+            own: true,
+            sent: true,
+            deleted: false,
+            erasable: true,
+        };
+        let chat = ChatFacts {
+            self_chat: false,
+            live: true,
+        };
+        let everyone = |message, chat| DeleteFor::Everyone.check(message, chat);
+        assert_eq!(everyone(own_sent, chat), Ok(()));
+        let refused = [
+            MessageFacts {
+                own: false,
+                ..own_sent
+            },
+            MessageFacts {
+                sent: false,
+                ..own_sent
+            },
+            MessageFacts {
+                deleted: true,
+                ..own_sent
+            },
+            MessageFacts {
+                content: false,
+                ..own_sent
+            },
+        ];
+        for message in refused {
+            assert!(everyone(message, chat).is_err(), "{message:?}");
+        }
+        assert!(
+            everyone(
+                own_sent,
+                ChatFacts {
+                    self_chat: true,
+                    ..chat
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            everyone(
+                own_sent,
+                ChatFacts {
+                    live: false,
+                    ..chat
+                }
+            )
+            .is_err()
+        );
+
+        // For the user: anything the core lets go, whoever sent it.
+        let peers = MessageFacts {
+            own: false,
+            sent: true,
+            ..own_sent
+        };
+        let dead = ChatFacts {
+            self_chat: true,
+            live: false,
+        };
+        assert_eq!(DeleteFor::Me.check(peers, dead), Ok(()));
+        let kept = MessageFacts {
+            content: false,
+            erasable: false,
+            ..peers
+        };
+        assert!(DeleteFor::Me.check(kept, chat).is_err());
+    }
+
+    #[test]
+    fn mutes_parse_from_durations_and_days() {
+        // Wednesday, 10:30 at UTC+2.
+        let zone = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        let now = zone.with_ymd_and_hms(2026, 11, 4, 10, 30, 0).unwrap();
+        let at = |d, h, m| {
+            Mute::Until(
+                zone.with_ymd_and_hms(2026, 11, d, h, m, 0)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+        };
+        assert_eq!(Mute::parse("", now), Ok(Mute::Forever));
+        assert_eq!(Mute::parse(" Always ", now), Ok(Mute::Forever));
+        assert_eq!(Mute::parse("30m", now), Ok(at(4, 11, 0)));
+        assert_eq!(Mute::parse("8h", now), Ok(at(4, 18, 30)));
+        assert_eq!(Mute::parse("2d", now), Ok(at(6, 10, 30)));
+        assert_eq!(Mute::parse("1w", now), Ok(at(11, 10, 30)));
+        // Local midnights.
+        assert_eq!(Mute::parse("tomorrow", now), Ok(at(5, 0, 0)));
+        assert_eq!(Mute::parse("monday", now), Ok(at(9, 0, 0)));
+        let monday = zone.with_ymd_and_hms(2026, 11, 9, 9, 0, 0).unwrap();
+        assert_eq!(
+            Mute::parse("monday", monday),
+            Ok(Mute::Until(
+                zone.with_ymd_and_hms(2026, 11, 16, 0, 0, 0)
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ))
+        );
+        for bad in [
+            "0h",
+            "-1h",
+            "h",
+            "5",
+            "5y",
+            "soon",
+            "53w",
+            "99999999999999999999m",
+        ] {
+            assert!(Mute::parse(bad, now).is_err(), "{bad}");
+        }
+        assert!(Mute::parse("52w", now).is_ok());
+    }
+
+    #[test]
+    fn a_mute_ends_when_it_says() {
+        let now = Utc::now();
+        let chat = |muted| ChatSummary {
+            muted,
+            ..mock::chats().remove(0)
+        };
+        let soon = now + Duration::minutes(5);
+        let later = now + Duration::hours(5);
+        let chats = [
+            chat(None),
+            chat(Some(Mute::Forever)),
+            chat(Some(Mute::Until(now - Duration::minutes(1)))),
+            chat(Some(Mute::Until(later))),
+            chat(Some(Mute::Until(soon))),
+        ];
+        assert_eq!(next_mute_expiry(&chats, now), Some(soon));
+        assert!(!chats[0].is_muted(now));
+        assert!(chats[1].is_muted(now));
+        assert!(!chats[2].is_muted(now));
+        assert!(chats[4].is_muted(now));
+        assert!(!chats[4].is_muted(soon));
+        assert_eq!(next_mute_expiry(&chats[..3], now), None);
+    }
+
+    #[test]
+    fn edit_history_is_newest_first_and_bounded() {
+        let at = |n: i64| DateTime::from_timestamp(n, 0).unwrap();
+        assert_eq!(
+            EditHistory::new(vec![(Some("only"), at(0))]),
+            EditHistory::default()
+        );
+        let history = EditHistory::new(vec![
+            (Some("first"), at(0)),
+            (None, at(1)),
+            (Some("now"), at(2)),
+        ]);
+        let times: Vec<_> = history.versions.iter().map(|v| v.at).collect();
+        assert_eq!(times, [at(2), at(1), at(0)]);
+        assert!(history.versions[1].markdown.is_none());
+        assert_eq!(history.older, 0);
+        let many = EditHistory::new((0..25).map(|n| (Some("x"), at(n))).collect());
+        assert_eq!(many.versions.len(), MAX_VERSIONS);
+        assert_eq!(many.older, 5);
+        assert_eq!(many.versions[0].at, at(24));
+    }
+
+    #[test]
     fn each_contact_operation_applies_only_where_it_may() {
         use ContactOp::*;
         let chat = |side, stage| OneToOne {
@@ -1059,6 +1467,7 @@ mod tests {
             preview: None,
             last_activity: None,
             unread: 0,
+            muted: None,
         };
         let stage = |stage| {
             Some(OneToOne {
@@ -1093,6 +1502,7 @@ mod tests {
                 preview: None,
                 last_activity: None,
                 unread,
+                muted: None,
             })
             .collect();
         assert_eq!(next_unread(&chats, None, true), Some(1));

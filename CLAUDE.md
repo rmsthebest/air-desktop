@@ -148,6 +148,26 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     `:delete-chat` deletes the group. Deleting a contact ends their
     chat too (the dialog says so); a contact's ended chat has no
     composer, only a footer to delete it.
+  - `message_ops.rs`: deleting a message and its edit history (upstream
+    `ChatDetailsCubit`). One rule table, `model::DeleteFor::check`, on
+    `MessageFacts`/`ChatFacts`, asked by the view before the dialog and by
+    the session again on the core's state: the core's delete for
+    everyone doesn't check the sender, so only the session stops a peer's
+    message being replaced. For everyone: own, sent, not deleted, not the
+    self chat, a chat that takes messages. For me: anything the core
+    erases (some system messages stay; `erasable` mirrors the core's
+    private `is_deletable`). Keys on the message cursor: `d`/`delete` for
+    me, `shift-d` for everyone (each confirmed), `i` details (Helix:
+    `space k`, as `i` inserts). Details show sender, time, own status and
+    the edit history (newest first, at most 20 versions, rendered as
+    messages are). Both run locally (a deletion for everyone is queued),
+    so failures never blame the connection (`Failure::local`).
+  - Mute (`chats.rs` `Session::set_muted`): `:mute [30m|8h|2d|1w|tomorrow|
+    monday|forever]` (empty: forever; `model::Mute::parse`), `:unmute`,
+    `secondary-shift-m` toggles. This device only, as upstream; alerts
+    already skip muted chats. The core stores forever as 9999-01-01 and
+    reads it back as a date: `chats::mute` maps it to forever. The list
+    tags muted chats and redraws when a timed mute ends.
   - `safety.rs`: safety codes, port of upstream `UserCubit::safety_codes`.
     The core hashes each user's credential; the pair is ordered so both
     sides see the same 12 zero-padded five-digit blocks (3 lines of 4).
@@ -209,9 +229,10 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   `AddContact` prefills); a new chat opens once the list has it
   (`ChatList::open_when_listed`). Groups likewise: `:group <name>`
   (`NewGroup`), `:invite`/`:kick` (complete contacts/members), `:rename`,
-  and `:leave`/`:delete-chat` behind a confirm dialog (`Workspace::confirm`
-  reaches the workspace through a weak handle, and closes the dialog and
-  restores focus itself before running: gpui-component's OK path doesn't).
+  and `:leave`/`:delete-chat` behind a confirm dialog (`ui::confirm` closes
+  the dialog and restores focus itself before running: gpui-component's OK
+  path doesn't; `Workspace::confirm` reaches the workspace through a weak
+  handle).
 - Normal-mode letter bindings must never live in a context that contains a
   text input (they'd steal typing): use `ChatList`/`MessageList`, or
   `Workspace && helix && !Input`.
@@ -267,7 +288,7 @@ From an Air checkout:
 Clients use domain `localhost`. E2E: `AIR_E2E_CODE=<code> cargo test e2e_sign_up --
 --ignored`, and the two-user test with `AIR_E2E_CODES=<code>,<code> cargo test
 e2e_two -- --ignored`; linked devices with `AIR_E2E_CODES=<code>,<code> cargo test e2e_linked --
---ignored`; blocking, reporting, retracting and deleting with three codes, `AIR_E2E_CODES=<code>,<code>,<code>
+--ignored`; blocking, reporting, retracting and deleting (contacts and messages, edit history, mute) with three codes, `AIR_E2E_CODES=<code>,<code>,<code>
 cargo test e2e_contacts -- --ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
 `AIR_DESKTOP_DATA_DIR=<dir> cargo run`. E2E tests use `flavor = "multi_thread"`: the
 core calls `block_in_place`.

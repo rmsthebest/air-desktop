@@ -26,6 +26,7 @@
       "secondary-shift-backspace": "air::DeclineRequest",
       "secondary-shift-t": "air::ToggleAppearance",
       "secondary-shift-s": "air::ShowSafetyCode",
+      "secondary-shift-m": "air::ToggleMute",
       "secondary-1": ["air::OpenChatAt", { "index": 0 }],
       "secondary-2": ["air::OpenChatAt", { "index": 1 }],
       "secondary-3": ["air::OpenChatAt", { "index": 2 }],
@@ -92,7 +93,11 @@
       "e": "air::EditMessage",
       "r": "air::ReplyToMessage",
       "+": "air::PickReaction",
-      "s": "air::SaveAttachment"
+      "s": "air::SaveAttachment",
+      "d": "air::DeleteMessage",
+      "delete": "air::DeleteMessage",
+      "shift-d": "air::DeleteMessageForEveryone",
+      "i": "air::ShowMessageDetails"
     }
   },
   {

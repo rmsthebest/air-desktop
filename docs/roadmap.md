@@ -35,7 +35,7 @@ pinned rev). Safety and privacy features come first.
 15. **Contact safety** (done). Block and unblock a contact, report spam, delete
     a one-to-one chat, and retract an outgoing contact request. Each is
     confirmed and has a `:` command.
-16. **Message deletion and mute.** Delete a message for yourself or for
+16. **Message deletion and mute** (done). Delete a message for yourself or for
     everyone from the message cursor (confirmed). Mute and unmute a chat
     (`:mute [duration]`; alerts already skip muted chats). Add message
     details.

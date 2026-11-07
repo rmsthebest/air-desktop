@@ -52,6 +52,8 @@
       "ctrl-d": "air::HalfPageDown",
       "ctrl-u": "air::HalfPageUp",
       "y": "air::YankMessage",
+      "i": "air::FocusComposer",
+      "space k": "air::ShowMessageDetails",
       "escape": "air::ClearCursor"
     }
   },

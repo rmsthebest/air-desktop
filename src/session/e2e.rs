@@ -1021,7 +1021,8 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
 #[ignore = "needs a local Air server and AIR_E2E_CODES"]
 async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
     use super::contact_safety::run as contact_op;
-    use crate::model::ContactOp;
+    use super::message_ops::{delete as delete_message, history as message_history};
+    use crate::model::{ContactOp, DeleteFor};
     let codes = std::env::var("AIR_E2E_CODES").expect("set AIR_E2E_CODES to three codes");
     let [ada_code, bob_code, carol_code] = codes.split(',').collect::<Vec<_>>()[..] else {
         panic!("AIR_E2E_CODES takes three comma-separated codes");
@@ -1155,6 +1156,76 @@ async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
     })
     .await;
     assert!(!got.own);
+
+    // Deleting messages. The core would delete a peer's message for
+    // everyone; the session refuses. Ada deletes his for herself.
+    let theirs = messages::core_message_id(&got.id);
+    assert!(refused(
+        delete_message(ada.clone(), chat, theirs, DeleteFor::Everyone).await
+    ));
+    let (_bob_worker, mut bob_updates, _) = open_messages(&bob, bob_chat);
+    let sent = composer::send(&ada, chat, "first".into(), None).await;
+    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+    let mine = next_message(&mut ada_updates, |m| m.plain_text() == "first").await;
+    let mine_id = messages::core_message_id(&mine.id).unwrap();
+    sent_mimi_id(&ada, mine_id).await;
+    let edit = composer::Draft {
+        editing: Some(mine_id),
+        ..composer::Draft::empty()
+    };
+    let sent = composer::send(&ada, chat, "second".into(), Some(&edit)).await;
+    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+    // Bob gets the edit, with its history.
+    let edited = next_message(&mut bob_updates, |m| m.edited).await;
+    assert_eq!(edited.plain_text(), "second");
+    let bobs_copy = messages::core_message_id(&edited.id);
+    let history = message_history(bob.clone(), bob_chat, bobs_copy)
+        .await
+        .unwrap();
+    let texts: Vec<_> = history
+        .versions
+        .iter()
+        .map(|version| version.markdown.is_some())
+        .collect();
+    assert_eq!(texts, [true, true]);
+    // Not another chat's message, even by its id.
+    assert!(refused(
+        message_history(bob.clone(), bob_chat, theirs)
+            .await
+            .map(drop)
+    ));
+    // Ada deletes it for everyone once it is sent: Bob is left a
+    // placeholder, and no history.
+    eventually("the edit is sent", async || {
+        let message = ada.message(mine_id).await.unwrap()?;
+        message.is_sent().then_some(())
+    })
+    .await;
+    delete_message(ada.clone(), chat, Some(mine_id), DeleteFor::Everyone)
+        .await
+        .unwrap();
+    let placeholder = next_message(&mut bob_updates, |m| m.id == edited.id && m.deleted).await;
+    assert!(!placeholder.plain_text().contains("second"));
+    let history = message_history(bob.clone(), bob_chat, bobs_copy)
+        .await
+        .unwrap();
+    assert!(history.versions.is_empty());
+    // A deleted message isn't deleted for everyone again.
+    assert!(refused(
+        delete_message(ada.clone(), chat, Some(mine_id), DeleteFor::Everyone).await
+    ));
+    let theirs = theirs.unwrap();
+    delete_message(ada.clone(), chat, Some(theirs), DeleteFor::Me)
+        .await
+        .unwrap();
+    assert!(ada.message(theirs).await.unwrap().is_none());
+
+    // Muting is the chat's, as the list shows it.
+    ada.set_chat_muted_until(chat, Some(aircoreclient::ChatMuted::Forever))
+        .await
+        .unwrap();
+    let summary = chats::summary(&ada, ada.chat(&chat).await.unwrap()).await;
+    assert_eq!(summary.muted, Some(crate::model::Mute::Forever));
 
     // Reporting tells the server; the chat stays.
     contact_op(ada.clone(), ContactOp::Report, chat)

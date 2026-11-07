@@ -18,7 +18,8 @@ use gpui::{
     Bounds, ClipboardItem, EventEmitter, ExternalPaths, FollowMode, ImageSource, KeyContext,
     ListAlignment, ListOffset, ListState, Pixels, SharedString, canvas, img,
 };
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, IconName, Selectable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
@@ -29,15 +30,15 @@ use gpui_kit::{
 
 use crate::actions::{
     AcceptRequest, BlockContact, CancelCompose, ClearCursor, CursorDown, CursorFirst, CursorLast,
-    CursorUp, DeclineRequest, DeleteChat, EditLastMessage, EditMessage, HalfPageDown, HalfPageUp,
-    OpenLinks, PickReaction, React, ReplyToMessage, RetractRequest, SaveAttachment, ToggleDetails,
-    UnblockContact, YankMessage,
+    CursorUp, DeclineRequest, DeleteChat, DeleteMessage, DeleteMessageForEveryone, EditLastMessage,
+    EditMessage, HalfPageDown, HalfPageUp, OpenLinks, PickReaction, React, ReplyToMessage,
+    RetractRequest, SaveAttachment, ShowMessageDetails, ToggleDetails, UnblockContact, YankMessage,
 };
 use crate::markdown::Block;
 use crate::model::{
-    Attachment, AttachmentState, ChatSummary, Message, MessageBody, MessageStatus, QUICK_REACTIONS,
-    Quote, Reaction, Request, format_day, format_message_time, move_cursor, starts_day,
-    starts_group,
+    Attachment, AttachmentState, ChatSummary, DeleteFor, EditHistory, Message, MessageBody,
+    MessageStatus, QUICK_REACTIONS, Quote, Reaction, Request, format_day, format_message_time,
+    move_cursor, starts_day, starts_group,
 };
 use crate::session::composer::{Composer, ComposerEvent};
 use crate::session::messages::{Messages, MessagesEvent};
@@ -81,6 +82,9 @@ pub struct Conversation {
     _messages_subscription: Option<Subscription>,
     _compose_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
+    /// The message details being loaded; replaced by the next request,
+    /// dropped (never shown) when the chat changes.
+    details: Option<gpui::Task<()>>,
 }
 
 /// The part of the history in view.
@@ -188,6 +192,7 @@ impl Conversation {
             _messages_subscription: None,
             _compose_subscription: None,
             _subscriptions: subscriptions,
+            details: None,
         }
     }
 
@@ -204,6 +209,7 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) {
         self.leave_chat(window, cx);
+        self.details = None;
         self._compose_subscription =
             Some(
                 cx.subscribe_in(&compose, window, |this, _, event, window, cx| match event {
@@ -308,6 +314,7 @@ impl Conversation {
         self.list.reset(0);
         self.cursor = None;
         self.reacting = false;
+        self.details = None;
         cx.notify();
     }
 
@@ -710,6 +717,74 @@ impl Conversation {
                 .detach();
             }
         }
+    }
+
+    /// Deletes the message under the cursor for whom `mode` says, once
+    /// confirmed, if [`DeleteFor::check`] allows it.
+    fn delete_message(&mut self, mode: DeleteFor, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(message), Some(chat), Some(messages)) = (
+            self.cursor_message(cx).cloned(),
+            self.chat.clone(),
+            self.messages.clone(),
+        ) else {
+            return;
+        };
+        if let Err(refusal) = mode.check(message.deletion_facts(), chat.deletion_facts()) {
+            return crate::ui::show_refusal(refusal.into(), window, cx);
+        }
+        let (title, description, ok) = deletion_confirmation(mode, &message, &chat);
+        let id = message.id;
+        crate::ui::confirm(
+            title.into(),
+            description,
+            ok,
+            ButtonVariant::Danger,
+            move |window, cx| {
+                let Some(done) = messages.read(cx).delete(&id, mode, cx) else {
+                    return crate::ui::show_refusal("Deleting needs an account".into(), window, cx);
+                };
+                window
+                    .spawn(cx, async move |cx| {
+                        if let Err(refusal) = done.await {
+                            _ = cx
+                                .update(|window, cx| crate::ui::show_refusal(refusal, window, cx));
+                        }
+                    })
+                    .detach();
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Shows the details of the message under the cursor, with its edit
+    /// history once loaded.
+    fn message_details(
+        &mut self,
+        _: &ShowMessageDetails,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(message), Some(messages)) =
+            (self.cursor_message(cx).cloned(), self.messages.clone())
+        else {
+            return;
+        };
+        let history = match messages.read(cx).edit_history(&message.id, cx) {
+            Some(history) if message.edited && !message.deleted => history,
+            // Never edited, or fixed messages: nothing to load.
+            _ => return show_details(message, EditHistory::default(), window, cx),
+        };
+        self.details = Some(cx.spawn_in(window, async move |this, cx| {
+            let history = history.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                this.details = None;
+                match history {
+                    Ok(history) => show_details(message, history, window, cx),
+                    Err(refusal) => crate::ui::show_refusal(refusal, window, cx),
+                }
+            });
+        }));
     }
 
     fn open_links(&mut self, _: &OpenLinks, window: &mut Window, cx: &mut Context<Self>) {
@@ -1142,6 +1217,15 @@ impl Render for Conversation {
                     .on_action(cx.listener(Self::pick_reaction))
                     .on_action(cx.listener(Self::react))
                     .on_action(cx.listener(Self::save_attachment))
+                    .on_action(cx.listener(|this, _: &DeleteMessage, window, cx| {
+                        this.delete_message(DeleteFor::Me, window, cx)
+                    }))
+                    .on_action(
+                        cx.listener(|this, _: &DeleteMessageForEveryone, window, cx| {
+                            this.delete_message(DeleteFor::Everyone, window, cx)
+                        }),
+                    )
+                    .on_action(cx.listener(Self::message_details))
                     .flex_1()
                     .min_h_0()
                     .children(status)
@@ -1292,6 +1376,148 @@ fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElemen
             )),
     };
     in_composer_place(card)
+}
+
+/// The deletion dialog's title, text and confirming button, upstream's
+/// wording.
+fn deletion_confirmation(
+    mode: DeleteFor,
+    message: &Message,
+    chat: &ChatSummary,
+) -> (&'static str, String, &'static str) {
+    match mode {
+        DeleteFor::Me => {
+            // System messages and placeholders are each device's own.
+            let others_keep = !chat.is_self_chat && !message.is_event() && !message.deleted;
+            let mut text = "This message will be deleted from all your devices.".to_string();
+            if others_keep {
+                text.push_str(" The others in the chat still have it.");
+            }
+            ("Delete message?", text, "Delete for me")
+        }
+        DeleteFor::Everyone => (
+            "Delete for everyone?",
+            "Each member's app shows \u{201c}Message deleted\u{201d} in its place once \
+             it gets the deletion, and it's deleted from all your devices."
+                .to_string(),
+            "Delete for everyone",
+        ),
+    }
+}
+
+/// Status of an own message, as the details say it.
+fn status_label(status: MessageStatus) -> &'static str {
+    match status {
+        MessageStatus::Sending => "Sending",
+        MessageStatus::Sent => "Sent",
+        MessageStatus::Delivered => "Delivered",
+        MessageStatus::Read => "Read",
+        MessageStatus::Failed => "Failed to send",
+    }
+}
+
+/// "Monday, November 9, 2026 at 14:05".
+fn full_time(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.with_timezone(&chrono::Local)
+        .format("%A, %B %-d, %Y at %H:%M")
+        .to_string()
+}
+
+/// The message details: who sent it and when, how far it got (the user's
+/// own), and its edit history, newest first. Peer text is rendered as in
+/// the chat (bounded markdown, links confirmed).
+fn show_details(message: Message, history: EditHistory, window: &mut Window, cx: &mut App) {
+    let previous_focus = window.focused(cx);
+    window.open_alert_dialog(cx, move |alert, _, cx| {
+        let theme = cx.theme();
+        let row = |label: &'static str, value: String| {
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(72.))
+                        .flex_none()
+                        .text_color(theme.muted_foreground)
+                        .child(label),
+                )
+                .child(div().min_w_0().child(value))
+        };
+        let mut rows = v_flex().gap_1().text_sm();
+        if !message.is_event() {
+            let from = if message.own {
+                "You".to_string()
+            } else {
+                message.sender_name.to_string()
+            };
+            rows = rows.child(row("From", from));
+        }
+        rows = rows.child(row("Sent", full_time(message.sent_at)));
+        if message.own && !message.is_event() && !message.deleted {
+            rows = rows.child(row("Status", status_label(message.status).to_string()));
+        }
+        let last = history.versions.len().saturating_sub(1);
+        let versions = history.versions.iter().enumerate().map(|(ix, version)| {
+            let original = ix == last && history.older == 0;
+            let label = if original { "Sent" } else { "Edited" };
+            let text = match &version.markdown {
+                Some(markdown) => {
+                    markdown_view::render(markdown, format!("version-{ix}").into(), cx)
+                }
+                None => div()
+                    .text_color(theme.muted_foreground)
+                    .child("Not text")
+                    .into_any_element(),
+            };
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{label} {}", full_time(version.at))),
+                )
+                .child(text)
+        });
+        let history_section = (!history.versions.is_empty()).then(|| {
+            v_flex()
+                .gap_3()
+                .pt_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Edit history"),
+                )
+                .children(versions)
+                .when(history.older > 0, |section| {
+                    section.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{} older versions not shown", history.older)),
+                    )
+                })
+        });
+        let previous_focus = previous_focus.clone();
+        alert
+            .title("Message details")
+            .description(
+                div()
+                    .id("message-details")
+                    .max_h(px(420.))
+                    .overflow_y_scroll()
+                    .child(rows)
+                    .children(history_section),
+            )
+            .ok_text("Close")
+            .on_ok(move |_, window, cx| {
+                window.close_dialog(cx);
+                if let Some(focus) = &previous_focus {
+                    focus.focus(window, cx);
+                }
+                false
+            })
+    });
 }
 
 /// Takes the composer's place in a contact's chat they deleted: nothing

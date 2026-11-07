@@ -338,6 +338,12 @@ impl Messages {
         }))
     }
 
+    /// The account and chat behind the window; `None` for fixed messages.
+    pub(super) fn live_chat(&self) -> Option<(CoreUser, CoreChatId)> {
+        let live = self.live.as_ref()?;
+        Some((live.user.clone(), live.chat))
+    }
+
     /// Appends a message locally (the mock echo of a send).
     pub fn push(&mut self, message: Message, cx: &mut Context<Self>) {
         // The worker owns a live window: a local insert would desync it.
@@ -1197,6 +1203,8 @@ impl Worker {
             reply_to,
             reactions,
             more_reactions,
+            deleted,
+            erasable: super::message_ops::erasable(&self.user, &message).await,
         };
         (key, item)
     }

@@ -10,13 +10,14 @@ use aircommon::identifiers::UserId;
 use aircommon::utils::FibonacciBackoff;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::DbEntityId;
-use aircoreclient::{Chat, ChatId as CoreChatId, ChatStatus, ChatType, MessageId};
+use aircoreclient::{Chat, ChatId as CoreChatId, ChatMuted, ChatStatus, ChatType, MessageId};
+use chrono::Datelike as _;
 use gpui_kit::{AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::error;
 
-use crate::model::{ChatId, ChatSummary, OneToOne, Side, Stage, name_line};
+use crate::model::{ChatId, ChatSummary, Mute, OneToOne, Side, Stage, name_line};
 use crate::runtime::{Tokio, TokioTask};
 use crate::session::pending::Pending;
 use crate::session::preview;
@@ -287,6 +288,42 @@ pub(super) async fn summary(user: &CoreUser, chat: Chat) -> ChatSummary {
 
 /// Loads what the list shows for a chat. Port of `load_chat_details`, minus
 /// what the list doesn't show yet.
+impl Session {
+    /// Mutes the chat's alerts (`None` unmutes), on this device only, as
+    /// upstream.
+    pub fn set_muted(
+        &self,
+        chat: &ChatId,
+        mute: Option<Mute>,
+        cx: &gpui_kit::App,
+    ) -> impl Future<Output = Result<(), String>> + use<> {
+        let (user, chat) = (self.user.clone(), super::messages::core_chat_id(chat));
+        let what = if mute.is_some() {
+            "mute the chat"
+        } else {
+            "unmute the chat"
+        };
+        let muted = mute.map(|mute| match mute {
+            Mute::Until(until) => ChatMuted::Until(until),
+            Mute::Forever => ChatMuted::Forever,
+        });
+        super::contacts::on_tokio(cx, what, async move {
+            user.set_chat_muted_until(chat, muted)
+                .await
+                .map_err(|err| super::contacts::Failure::from(err).local(what))
+        })
+    }
+}
+
+/// The core stores "forever" as the start of 9999 but reads back only
+/// later years as forever: a mute that long is forever.
+fn mute(muted: &ChatMuted) -> Mute {
+    match muted {
+        ChatMuted::Until(until) if until.year() < 9999 => Mute::Until(*until),
+        ChatMuted::Until(_) | ChatMuted::Forever => Mute::Forever,
+    }
+}
+
 async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
     let unread = user.unread_messages_count(chat.id).await;
     let last = user
@@ -352,6 +389,7 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
             .map(|message| message.timestamp())
             .or(chat.last_message_at),
         unread: u32::try_from(unread).unwrap_or(u32::MAX),
+        muted: chat.muted_until.as_ref().map(mute),
     };
     let keys = ChatKeys {
         last_message: last.map(|message| message.id()),
@@ -493,6 +531,15 @@ impl LocalState {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_mute_until_the_cores_forever_is_forever() {
+        // As the core stores and reads back `ChatMuted::Forever`.
+        let stored = ChatMuted::from(ChatMuted::Forever.into_date_time());
+        assert_eq!(mute(&stored), Mute::Forever);
+        let until = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert_eq!(mute(&ChatMuted::Until(until)), Mute::Until(until));
+    }
+
+    #[test]
     fn the_cores_chats_map_to_one_to_one_facts() {
         use aircoreclient::ChatStatus;
         let user = aircommon::identifiers::UserId::random("localhost".parse().unwrap());
@@ -564,6 +611,7 @@ mod tests {
             preview: None,
             last_activity: None,
             unread: 0,
+            muted: None,
         }
     }
 

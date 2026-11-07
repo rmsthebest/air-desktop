@@ -11,7 +11,8 @@ use gpui_kit::{
 
 use crate::actions::{AddContact, SelectNext, SelectPrev};
 use crate::model::{
-    ChatId, ChatSummary, PreviewKind, Request, format_activity, next_unread, step_index,
+    ChatId, ChatSummary, PreviewKind, Request, format_activity, next_mute_expiry, next_unread,
+    step_index,
 };
 use crate::session::chats::LoadState;
 use crate::ui::key_context;
@@ -38,6 +39,8 @@ pub struct ChatList {
     awaited: Option<ChatId>,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
+    /// Redraws when the next mute ends, so "Muted" goes with it.
+    mute_expiry: Option<gpui::Task<()>>,
 }
 
 impl EventEmitter<ChatListEvent> for ChatList {}
@@ -57,7 +60,22 @@ impl ChatList {
             awaited: None,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
+            mute_expiry: None,
         }
+    }
+
+    fn watch_mute_expiry(&mut self, cx: &mut Context<Self>) {
+        let now = chrono::Utc::now();
+        self.mute_expiry = next_mute_expiry(&self.chats, now).map(|at| {
+            let wait = (at - now).to_std().unwrap_or_default();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                _ = this.update(cx, |this, cx| {
+                    this.watch_mute_expiry(cx);
+                    cx.notify();
+                });
+            })
+        });
     }
 
     /// Replaces the chats, keeping the open chat open if it still exists.
@@ -75,6 +93,7 @@ impl ChatList {
         }
         self.chats = chats;
         self.state = state;
+        self.watch_mute_expiry(cx);
         if let Some(id) = self.awaited.take() {
             if self.chat(&id).is_some() {
                 self.open(id.clone(), cx);
@@ -155,9 +174,10 @@ impl ChatList {
         let chat = &self.chats[ix];
         let selected = self.selected.as_ref() == Some(&chat.id);
         let id = chat.id.clone();
+        let now = chrono::Utc::now();
         let activity: SharedString = chat
             .last_activity
-            .map(|at| format_activity(at, chrono::Utc::now()).into())
+            .map(|at| format_activity(at, now).into())
             .unwrap_or_default();
 
         // A blocked peer's last words aren't worth showing (as upstream).
@@ -247,6 +267,7 @@ impl ChatList {
                             })
                             .when(chat.is_self_chat, |line| line.child(tag("Self", cx)))
                             .when(chat.blocked(), |line| line.child(tag("Blocked", cx)))
+                            .when(chat.is_muted(now), |line| line.child(tag("Muted", cx)))
                             .child(
                                 div()
                                     .flex_none()

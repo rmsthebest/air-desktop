@@ -173,6 +173,20 @@ impl From<anyhow::Error> for Failure {
     }
 }
 
+impl Failure {
+    /// For an operation that never goes over the network: an internal
+    /// error is logged and reported without blaming the connection.
+    pub(super) fn local(self, what: &str) -> Self {
+        match self {
+            Failure::Internal(err) => {
+                error!("failed to {what}: {err:#}");
+                Failure::Shown(format!("Couldn't {what}"))
+            }
+            shown => shown,
+        }
+    }
+}
+
 pub(super) fn on_tokio<T: Send + 'static, F>(
     cx: &App,
     what: &'static str,

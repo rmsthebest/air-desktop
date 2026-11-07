@@ -18,12 +18,12 @@ use crate::actions::{
     InviteToGroup, JumpBack, JumpForward, LinkDevice, NewGroup, NextChat, NextUnreadChat,
     OpenChatAt, OpenCommandLine, OpenPalette, OpenSettings, PickTheme, PrevChat, PrevUnreadChat,
     ReportSpam, RetractRequest, SelectFirst, SelectLast, ShowSafetyCode, ShowShortcuts,
-    ToggleAppearance, ToggleDetails, ToggleHelixMode, UnblockContact,
+    ToggleAppearance, ToggleDetails, ToggleHelixMode, ToggleMute, UnblockContact,
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{
-    ChatId, ChatSummary, ContactOp, JumpList, Message, MessageId, Request, Side, Stage, UserId,
-    mock,
+    ChatId, ChatSummary, ContactOp, JumpList, Message, MessageId, Mute, Request, Side, Stage,
+    UserId, mock,
 };
 use crate::session::chats::{Chats, LoadState};
 use crate::session::composer::Composer;
@@ -100,6 +100,15 @@ const REPORT_SPAM: &str = "Air will be notified that this person may be sending 
 /// description, button), or why it doesn't apply there
 /// ([`ContactOp::check`], which the session asks again). Upstream's
 /// wording.
+/// What `:mute`, `:unmute` and the toggle ask for.
+enum MuteChange<'a> {
+    /// Unmute if muted, else mute until unmuted.
+    Toggle,
+    /// For how long, as typed.
+    Mute(&'a str),
+    Unmute,
+}
+
 fn contact_confirmation(
     op: ContactOp,
     chat: &ChatSummary,
@@ -1359,7 +1368,45 @@ impl Workspace {
             Command::Unblock => self.contact_safety(ContactOp::Unblock, "", window, cx),
             Command::Report(query) => self.contact_safety(ContactOp::Report, &query, window, cx),
             Command::Retract => self.contact_safety(ContactOp::Retract, "", window, cx),
+            Command::Mute(arg) => self.mute(MuteChange::Mute(&arg), window, cx),
+            Command::Unmute => self.mute(MuteChange::Unmute, window, cx),
         }
+    }
+
+    /// Mutes or unmutes the open chat's alerts, and says what it did.
+    fn mute(&mut self, change: MuteChange, window: &mut Window, cx: &mut Context<Self>) {
+        let list = self.chat_list.read(cx);
+        let Some(chat) = list.selected_index().map(|ix| list.chats()[ix].clone()) else {
+            return show_refusal("Open a chat first".into(), window, cx);
+        };
+        let now = chrono::Utc::now();
+        let mute = match change {
+            MuteChange::Toggle if chat.is_muted(now) => None,
+            MuteChange::Toggle => Some(Mute::Forever),
+            MuteChange::Unmute if !chat.is_muted(now) => {
+                return show_refusal("It isn't muted".into(), window, cx);
+            }
+            MuteChange::Unmute => None,
+            MuteChange::Mute(arg) => match Mute::parse(arg, chrono::Local::now()) {
+                Ok(mute) => Some(mute),
+                Err(refusal) => return show_refusal(refusal.into(), window, cx),
+            },
+        };
+        let Some(session) = &self.session else {
+            return show_refusal("That needs an account".into(), window, cx);
+        };
+        let done = session.read(cx).set_muted(&chat.id, mute, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            let shown = done.await.map(|()| match mute {
+                Some(mute) => mute.label(chrono::Utc::now()),
+                None => "Unmuted".to_string(),
+            });
+            _ = cx.update(|window, cx| match shown {
+                Ok(info) => show_info(info, window, cx),
+                Err(refusal) => show_refusal(refusal, window, cx),
+            });
+        })
+        .detach();
     }
 
     /// Runs `op` in the open chat once the user confirms: for a contact (or
@@ -1542,27 +1589,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let this = cx.weak_entity();
-        let run = std::rc::Rc::new(run);
-        let previous_focus = window.focused(cx);
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let (this, run, previous_focus) = (this.clone(), run.clone(), previous_focus.clone());
-            alert
-                .confirm()
-                .title(title.clone())
-                .description(description.clone())
-                .ok_text(ok)
-                .ok_variant(variant)
-                .on_ok(move |_, window, cx| {
-                    // Closed first, so focus is back before `run` (which
-                    // may report) and stays where the command came from.
-                    window.close_dialog(cx);
-                    if let Some(focus) = &previous_focus {
-                        focus.focus(window, cx);
-                    }
-                    _ = this.update(cx, |this, cx| run(this, window, cx));
-                    false
-                })
-        });
+        crate::ui::confirm(
+            title,
+            description,
+            ok,
+            variant,
+            move |window, cx| _ = this.update(cx, |this, cx| run(this, window, cx)),
+            window,
+            cx,
+        );
     }
 
     fn send_contact_request(
@@ -1912,6 +1947,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DeleteChat, window, cx| {
                 this.contact_safety(ContactOp::Delete, "", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleMute, window, cx| {
+                this.mute(MuteChange::Toggle, window, cx)
             }))
             .on_action(cx.listener(Self::attach_file))
             .on_action(cx.listener(Self::open_settings))
@@ -2442,6 +2480,62 @@ mod tests {
         };
         set_first(None, ended, cx);
         assert_eq!(focused(cx), Focus::Messages);
+    }
+
+    #[gpui::test]
+    fn deleting_a_message_asks_and_refuses_what_cannot_apply(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let asking = |cx: &mut VisualTestContext| cx.update(|w, cx| w.has_active_dialog(cx));
+        let told = |cx: &mut VisualTestContext| cx.update(|w, cx| w.notifications(cx).len());
+        let escape = |cx: &mut VisualTestContext| {
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(!asking(cx));
+        };
+        cx.simulate_keystrokes(&format!("j enter {MOD}-m home"));
+        assert_eq!(cursor(&workspace, cx), Some(0));
+        let count = message_count(&workspace, cx);
+        let before = told(cx);
+        // A peer's message: only the sender deletes it for everyone.
+        cx.simulate_keystrokes("shift-d");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert_eq!(told(cx), before + 1);
+        // For the user it asks first; Escape deletes nothing.
+        cx.simulate_keystrokes("d");
+        cx.run_until_parked();
+        assert!(asking(cx));
+        escape(cx);
+        assert_eq!(told(cx), before + 1);
+        // The user's own message, for everyone: asked, then run (the
+        // fixed sample has no account to run it on, which it says).
+        cx.simulate_keystrokes("down shift-d");
+        cx.run_until_parked();
+        assert!(asking(cx));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert_eq!(told(cx), before + 2);
+        assert_eq!(message_count(&workspace, cx), count);
+        // Details show for any message.
+        cx.simulate_keystrokes("i");
+        cx.run_until_parked();
+        assert!(asking(cx));
+        escape(cx);
+    }
+
+    #[gpui::test]
+    fn helix_i_still_inserts_from_the_messages(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let focused = focus_probe(&workspace, cx);
+        enable_helix(cx);
+        cx.simulate_keystrokes(&format!("j enter {MOD}-m k"));
+        assert_eq!(focused(cx), Focus::Messages);
+        assert!(cursor(&workspace, cx).is_some());
+        cx.simulate_keystrokes("i");
+        cx.run_until_parked();
+        assert_eq!(focused(cx), Focus::Composer);
+        assert!(!cx.update(|w, cx| w.has_active_dialog(cx)));
     }
 
     #[gpui::test]
@@ -3196,6 +3290,7 @@ mod tests {
             preview: None,
             last_activity: None,
             unread: 0,
+            muted: None,
         };
         let said = |op, facts| contact_confirmation(op, &chat(Some(facts))).unwrap().1;
         let incoming = OneToOne {
@@ -3228,6 +3323,7 @@ mod tests {
             preview: None,
             last_activity: None,
             unread: 0,
+            muted: None,
         };
         let (contact, group, own) = (chat(false, false), chat(true, false), chat(false, true));
         assert!(safety_target(None, "").is_err());

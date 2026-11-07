@@ -168,6 +168,24 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     already skip muted chats. The core stores forever as 9999-01-01 and
     reads it back as a date: `chats::mute` maps it to forever. The list
     tags muted chats and redraws when a timed mute ends.
+  - `account_settings.rs`: the synced account settings (read receipts,
+    deleting expired contact requests), reloaded when the core reports
+    their keys changed (also its rollbacks); `:read-receipts on|off`,
+    `:delete-expired-requests on|off`, and settings rows.
+  - `invitations.rs`: invite codes (upstream `InvitationCodesCubit`):
+    codes, then tokens to trade for one, reloaded when the settings open
+    (tokens arrive untold). Codes are shown and copied reduced to letters
+    and digits (`model::invite_code`); copying marks them given out.
+  - Deleting the account (`Session::delete_account`, upstream
+    `UserCubit::delete_account`): `:delete-account delete` (the typed
+    word, as upstream) then a confirm dialog. The core stores the
+    deletion first and finishes it in the background if it takes long
+    (Pending: told so). Completed, the unlink watcher reports
+    `account_deleted` and the app root resets the device. An abort the
+    user wasn't told (in the background, or while closed) is reported
+    once (`DeletionAborted`) and recorded, checked at start and on own
+    user changes; not while this session's own deletion runs (it tells
+    its outcome).
   - `safety.rs`: safety codes, port of upstream `UserCubit::safety_codes`.
     The core hashes each user's credential; the pair is ordered so both
     sides see the same 12 zero-padded five-digit blocks (3 lines of 4).
@@ -286,7 +304,7 @@ From an Air checkout:
 3. `cargo run --bin airserver -- code generate 2` for invitation codes
    (the local server requires them).
 Clients use domain `localhost`. E2E: `AIR_E2E_CODE=<code> cargo test e2e_sign_up --
---ignored`, and the two-user test with `AIR_E2E_CODES=<code>,<code> cargo test
+--ignored` (and `e2e_account`: synced settings, invite codes, account deletion), and the two-user test with `AIR_E2E_CODES=<code>,<code> cargo test
 e2e_two -- --ignored`; linked devices with `AIR_E2E_CODES=<code>,<code> cargo test e2e_linked --
 --ignored`; blocking, reporting, retracting and deleting (contacts and messages, edit history, mute) with three codes, `AIR_E2E_CODES=<code>,<code>,<code>
 cargo test e2e_contacts -- --ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then

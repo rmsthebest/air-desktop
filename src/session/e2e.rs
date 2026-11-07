@@ -1402,3 +1402,57 @@ async fn eventually<T>(what: &str, check: impl AsyncFn() -> Option<T>) -> T {
     .await
     .unwrap_or_else(|_| panic!("timed out: {what}"))
 }
+
+/// Synced settings and invite codes load as stored, and deleting the
+/// account resets the device. Needs one unused invitation code:
+/// `AIR_E2E_CODE=XXXXXXXX cargo test e2e_account -- --ignored`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Air server and AIR_E2E_CODE"]
+async fn e2e_account_settings_load_and_deleting_it_resets_the_device() {
+    use super::{account_settings, invitations};
+    use crate::model::SyncedSettings;
+    let code = std::env::var("AIR_E2E_CODE").expect("set AIR_E2E_CODE to an unused code");
+    let dir = tempfile::tempdir().unwrap();
+    let ada = new_account(dir.path(), "Ada", &code).await;
+    let data = dir.path().join("Ada").to_str().unwrap().to_string();
+    let (alerts, _, _) = alerts();
+    let queue = listen_queue(&ada, alerts).await;
+
+    // Unset, the core's defaults; changed, as stored.
+    assert_eq!(
+        account_settings::load(ada.clone()).await,
+        SyncedSettings::default()
+    );
+    ada.set_synced_user_setting(&aircoreclient::ReadReceiptsSetting(false))
+        .await
+        .unwrap();
+    ada.set_synced_user_setting(&aircoreclient::DeleteExpiredContactRequestsSetting(true))
+        .await
+        .unwrap();
+    assert_eq!(
+        account_settings::load(ada.clone()).await,
+        SyncedSettings {
+            read_receipts: false,
+            delete_expired_requests: true,
+        }
+    );
+    // Whatever the server handed out so far loads.
+    invitations::load(ada.clone()).await.unwrap();
+
+    // Deleted, the device learns it and its data goes.
+    let unlinked = tokio::spawn(devices::unlinked(ada.clone(), ada.db_notifications()));
+    let status = ada.delete_account().await.unwrap();
+    assert_eq!(status, aircoreclient::AccountDeletionStatus::Completed);
+    let reason = tokio::time::timeout(Duration::from_secs(30), unlinked)
+        .await
+        .expect("the device didn't learn the account was deleted")
+        .unwrap();
+    assert_eq!(reason, Some(aircoreclient::UnlinkReason::AccountDeleted));
+    assert!(!ada.has_unreported_account_deletion_abort().await.unwrap());
+    drop(queue);
+    assert_eq!(
+        devices::tear_down(ada, data.clone()).await,
+        devices::TornDown::Deleted
+    );
+    assert!(account::load_default(data).await.unwrap().is_none());
+}

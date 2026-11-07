@@ -779,6 +779,72 @@ impl EditHistory {
     }
 }
 
+/// How far deleting the account got when the core stopped waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountDeletion {
+    /// Deleted: this device resets.
+    Completed,
+    /// Goes on in the background (also after a restart); this device
+    /// resets once it is done.
+    Pending,
+}
+
+/// One invite code, or a token to trade for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteSlot {
+    Code {
+        code: SharedString,
+        /// Given out: copied once.
+        copied: bool,
+    },
+    /// The core's id for the token.
+    Token(i64),
+}
+
+/// Longest invite code shown or copied; the server's are 8 characters.
+const MAX_INVITE_CODE: usize = 32;
+
+/// An invite code as the server sent it, reduced to letters and digits
+/// (bounded), so what is shown and copied can't carry anything else.
+pub fn invite_code(code: &str) -> SharedString {
+    code.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(MAX_INVITE_CODE)
+        .collect::<String>()
+        .into()
+}
+
+/// What copying invite codes puts on the clipboard (upstream's wording,
+/// without its install link: that is for its own app).
+pub fn invite_message(codes: &[SharedString]) -> String {
+    match codes {
+        [code] => format!("Let's chat on Air. Use invite code {code}."),
+        codes => format!(
+            "Let's chat on Air. Use one of these invite codes to join:\n\n{}",
+            codes.join("\n")
+        ),
+    }
+}
+
+/// The account's settings the core syncs to the user's devices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncedSettings {
+    /// Others see when the user read their messages, and the user theirs.
+    pub read_receipts: bool,
+    /// Contact requests that expired are deleted, not kept as a record.
+    pub delete_expired_requests: bool,
+}
+
+impl Default for SyncedSettings {
+    /// The core's defaults for unset settings.
+    fn default() -> Self {
+        Self {
+            read_receipts: true,
+            delete_expired_requests: false,
+        }
+    }
+}
+
 /// How long a chat is muted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mute {
@@ -1246,6 +1312,19 @@ mod tests {
         assert_eq!(step_index(3, None, false), Some(2));
         assert_eq!(step_index(3, Some(2), true), Some(0));
         assert_eq!(step_index(3, Some(0), false), Some(2));
+    }
+
+    #[test]
+    fn invite_codes_are_only_letters_and_digits() {
+        assert_eq!(invite_code("AB12cd34"), "AB12cd34");
+        // A server can't slip text, lines or bidi tricks into the clipboard.
+        assert_eq!(invite_code("AB\u{202E}12\nhttp://x"), "AB12httpx");
+        assert_eq!(invite_code(&"A".repeat(100)).len(), 32);
+        assert_eq!(
+            invite_message(&["AB12".into()]),
+            "Let's chat on Air. Use invite code AB12."
+        );
+        assert!(invite_message(&["AB12".into(), "CD34".into()]).ends_with("AB12\nCD34"));
     }
 
     #[test]

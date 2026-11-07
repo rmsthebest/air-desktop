@@ -22,16 +22,18 @@ use crate::actions::{
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{
-    ChatId, ChatSummary, ContactOp, JumpList, Message, MessageId, Mute, Request, Side, Stage,
-    UserId, mock,
+    AccountDeletion, ChatId, ChatSummary, ContactOp, JumpList, Message, MessageId, Mute, Request,
+    Side, Stage, UserId, mock,
 };
+use crate::session::account_settings::AccountSettings;
 use crate::session::chats::{Chats, LoadState};
 use crate::session::composer::Composer;
 use crate::session::devices::{self, Devices, Link, LinkEvent};
 use crate::session::groups::Members;
+use crate::session::invitations::Invitations;
 use crate::session::messages::Messages;
 use crate::session::safety::SafetyLines;
-use crate::session::{OpenFromAlert, Session};
+use crate::session::{DeletionAborted, OpenFromAlert, Session};
 use crate::settings::{Appearance, KeymapMode, Notifications, SettingsStore};
 use crate::theme;
 use crate::ui::chat_list::{ChatList, ChatListEvent};
@@ -41,7 +43,7 @@ use crate::ui::details_pane::details_pane;
 use crate::ui::link_view::{LinkPhase, LinkView, LinkViewEvent};
 use crate::ui::nav_rail::{Account, nav_rail};
 use crate::ui::palette::{self, Scope};
-use crate::ui::settings_view::{SettingsEvent, SettingsView};
+use crate::ui::settings_view::{AccountEntities, SettingsEvent, SettingsView};
 use crate::ui::{key_context, show_error, show_info, show_refusal, update_settings};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::ButtonVariant;
@@ -71,6 +73,10 @@ pub struct Workspace {
     focus_when_opened: Option<(ChatId, FocusChat)>,
     /// The user's devices (with an account).
     devices: Option<Entity<Devices>>,
+    /// The account's synced settings (with an account).
+    account_settings: Option<Entity<AccountSettings>>,
+    /// Invite codes to give out (with an account).
+    invitations: Option<Entity<Invitations>>,
     /// Linking a new device from this one.
     linking: Option<Linking>,
     /// The safety code being looked up; a new request replaces it.
@@ -95,6 +101,15 @@ type FocusChat = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
 /// What reporting spam tells, as upstream.
 const REPORT_SPAM: &str = "Air will be notified that this person may be sending spam. \
                            Air is never able to see the contents of any chats.";
+
+/// The word typed to confirm deleting the account, as upstream.
+const DELETE_ACCOUNT_WORD: &str = "delete";
+
+/// A synced account setting to change.
+enum Synced {
+    ReadReceipts(bool),
+    DeleteExpiredRequests(bool),
+}
 
 /// What `:mute`, `:unmute` and the toggle ask for.
 enum MuteChange<'a> {
@@ -230,7 +245,22 @@ impl Workspace {
         let devices = session
             .as_ref()
             .map(|session| cx.new(|cx| Devices::new(session, cx)));
-        let settings_view = cx.new(|cx| SettingsView::new(session.clone(), devices.clone(), cx));
+        let account_settings = session
+            .as_ref()
+            .map(|session| cx.new(|cx| AccountSettings::new(session, cx)));
+        let invitations = session.as_ref().map(|session| {
+            let user = session.read(cx).user().clone();
+            cx.new(|cx| Invitations::new(user, cx))
+        });
+        let account = match (&devices, &account_settings, &invitations) {
+            (Some(devices), Some(settings), Some(invitations)) => Some(AccountEntities {
+                devices: devices.clone(),
+                settings: settings.clone(),
+                invitations: invitations.clone(),
+            }),
+            _ => None,
+        };
+        let settings_view = cx.new(|cx| SettingsView::new(session.clone(), account, cx));
 
         let mut subscriptions = vec![
             cx.subscribe_in(
@@ -326,6 +356,17 @@ impl Workspace {
                     this.open_from_alert(chat.clone(), window, cx)
                 },
             ));
+            subscriptions.push(cx.subscribe_in(
+                session,
+                window,
+                |_, _, DeletionAborted, window, cx| {
+                    show_refusal(
+                        "Your Air account couldn't be deleted. You can try again.".into(),
+                        window,
+                        cx,
+                    )
+                },
+            ));
         }
         if let Some(chats) = &chats {
             subscriptions.push(cx.observe(chats, |this, chats, cx| {
@@ -353,6 +394,8 @@ impl Workspace {
             settings_open: false,
             focus_when_opened: None,
             devices,
+            account_settings,
+            invitations,
             linking: None,
             safety_code: None,
             _subscriptions: subscriptions,
@@ -492,6 +535,10 @@ impl Workspace {
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = true;
+        // Tokens for codes arrive in the background, untold.
+        if let Some(invitations) = &self.invitations {
+            invitations.update(cx, |invitations, cx| invitations.reload(cx));
+        }
         self.conversation
             .update(cx, |conversation, _| conversation.set_hidden(true));
         self.report_attention(window, cx);
@@ -783,8 +830,155 @@ impl Workspace {
             }
             SettingsEvent::UnlinkDevice(tag) => self.unlink_device(&format!("#{tag}"), window, cx),
             SettingsEvent::LinkDevice => self.prompt("link ", window, cx),
+            SettingsEvent::ReadReceipts(on) => {
+                self.set_synced(Synced::ReadReceipts(on), window, cx)
+            }
+            SettingsEvent::DeleteExpiredRequests(on) => {
+                self.set_synced(Synced::DeleteExpiredRequests(on), window, cx)
+            }
+            SettingsEvent::CopyInviteCodes(codes) => self.copy_invite_codes(codes, window, cx),
+            SettingsEvent::GetInviteCode(id) => self.get_invite_code(id, window, cx),
+            SettingsEvent::RemoveUsedCodes => {
+                self.invitation_op(|invitations, cx| invitations.clear_copied(cx), window, cx)
+            }
+            SettingsEvent::DeleteAccount => self.delete_account("", window, cx),
             SettingsEvent::Close => self.close_settings(window, cx),
         }
+    }
+
+    /// Changes a synced account setting.
+    fn set_synced(&mut self, change: Synced, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(settings) = &self.account_settings else {
+            return show_refusal("That needs an account".into(), window, cx);
+        };
+        let settings = settings.read(cx);
+        let done = match change {
+            Synced::ReadReceipts(on) => {
+                futures_util::FutureExt::boxed_local(settings.set_read_receipts(on, cx))
+            }
+            Synced::DeleteExpiredRequests(on) => {
+                futures_util::FutureExt::boxed_local(settings.set_delete_expired_requests(on, cx))
+            }
+        };
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(refusal) = done.await {
+                _ = cx.update(|window, cx| show_refusal(refusal, window, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Runs an invite-code operation, then shows the codes as they are.
+    fn invitation_op<F>(
+        &mut self,
+        op: impl FnOnce(&Invitations, &App) -> F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: Future<Output = Result<(), String>> + 'static,
+    {
+        let Some(invitations) = self.invitations.clone() else {
+            return show_refusal("That needs an account".into(), window, cx);
+        };
+        let done = op(invitations.read(cx), cx);
+        cx.spawn_in(window, async move |_, cx| {
+            let result = done.await;
+            _ = cx.update(|window, cx| {
+                invitations.update(cx, |invitations, cx| invitations.reload(cx));
+                if let Err(refusal) = result {
+                    show_refusal(refusal, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Copies invite codes to give out, and marks them given out.
+    fn copy_invite_codes(
+        &mut self,
+        codes: Vec<gpui::SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            crate::model::invite_message(&codes),
+        ));
+        show_info("Copied to clipboard".into(), window, cx);
+        self.invitation_op(
+            move |invitations, cx| invitations.mark_copied(codes, cx),
+            window,
+            cx,
+        );
+    }
+
+    /// Trades a token for an invite code.
+    fn get_invite_code(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(invitations) = self.invitations.clone() else {
+            return show_refusal("That needs an account".into(), window, cx);
+        };
+        let code = invitations.read(cx).request(id, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            let code = code.await;
+            _ = cx.update(|window, cx| {
+                invitations.update(cx, |invitations, cx| invitations.reload(cx));
+                match code {
+                    Ok(code) => show_info(format!("New invite code {code}"), window, cx),
+                    Err(refusal) => show_refusal(refusal, window, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Deletes the account once the user typed the word and confirmed:
+    /// without it, asks for it on the command line, as upstream asks to
+    /// type it.
+    fn delete_account(&mut self, typed: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match typed.trim() {
+            "" => return self.prompt("delete-account ", window, cx),
+            DELETE_ACCOUNT_WORD => {}
+            _ => {
+                return show_refusal(
+                    format!(
+                        "Type {DELETE_ACCOUNT_WORD} to confirm: :delete-account {DELETE_ACCOUNT_WORD}"
+                    ),
+                    window,
+                    cx,
+                );
+            }
+        }
+        self.confirm(
+            "Delete your account?".into(),
+            "This deletes your Air account and resets this app, and your linked \
+             devices reset too. You can't recover the account."
+                .into(),
+            "Delete account",
+            move |this, window, cx| {
+                let Some(session) = this.session.clone() else {
+                    return show_refusal("That needs an account".into(), window, cx);
+                };
+                show_info("Deleting your account…".into(), window, cx);
+                let deletion = session.update(cx, |session, cx| session.delete_account(cx));
+                cx.spawn_in(window, async move |_, cx| {
+                    let outcome = deletion.await;
+                    _ = cx.update(|window, cx| match outcome {
+                        // The session reports it; this device resets.
+                        Ok(AccountDeletion::Completed) => {}
+                        Ok(AccountDeletion::Pending) => show_info(
+                            "Your Air account is still being deleted. This device resets \
+                             once the deletion is done."
+                                .into(),
+                            window,
+                            cx,
+                        ),
+                        Err(refusal) => show_refusal(refusal, window, cx),
+                    });
+                })
+                .detach();
+            },
+            window,
+            cx,
+        );
     }
 
     fn focus_next_pane(&mut self, _: &FocusNextPane, window: &mut Window, cx: &mut Context<Self>) {
@@ -1372,6 +1566,11 @@ impl Workspace {
             Command::Unblock => self.contact_safety(ContactOp::Unblock, "", window, cx),
             Command::Report(query) => self.contact_safety(ContactOp::Report, &query, window, cx),
             Command::Retract => self.contact_safety(ContactOp::Retract, "", window, cx),
+            Command::DeleteAccount(typed) => self.delete_account(&typed, window, cx),
+            Command::ReadReceipts(on) => self.set_synced(Synced::ReadReceipts(on), window, cx),
+            Command::DeleteExpiredRequests(on) => {
+                self.set_synced(Synced::DeleteExpiredRequests(on), window, cx)
+            }
             Command::Mute(arg) => self.mute(MuteChange::Mute(&arg), window, cx),
             Command::Unmute => self.mute(MuteChange::Unmute, window, cx),
         }
@@ -2549,6 +2748,36 @@ mod tests {
         assert!(!asking(cx));
         assert_eq!(told(cx), before + 2);
         assert_eq!(message_count(&workspace, cx), count);
+    }
+
+    #[gpui::test]
+    fn deleting_the_account_takes_the_typed_word_then_a_confirmation(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let asking = |cx: &mut VisualTestContext| cx.update(|w, cx| w.has_active_dialog(cx));
+        let told = |cx: &mut VisualTestContext| cx.update(|w, cx| w.notifications(cx).len());
+        let run = |command: &str, cx: &mut VisualTestContext| {
+            let command = command_line::parse(command).unwrap();
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.run(command, window, cx)
+            });
+            cx.run_until_parked();
+        };
+        let before = told(cx);
+        // Nothing typed: it asks for the word on the command line.
+        run(":delete-account", cx);
+        assert!(!asking(cx));
+        assert!(workspace.read_with(cx, |workspace, _| workspace.command_line.is_some()));
+        // The wrong word is refused at once.
+        run(":delete-account yes", cx);
+        assert!(!asking(cx));
+        assert_eq!(told(cx), before + 1);
+        // The word asks to confirm; Escape deletes nothing.
+        run(":delete-account delete", cx);
+        assert!(asking(cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert_eq!(told(cx), before + 1);
     }
 
     #[gpui::test]

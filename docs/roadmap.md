@@ -39,7 +39,7 @@ pinned rev). Safety and privacy features come first.
     everyone from the message cursor (confirmed). Mute and unmute a chat
     (`:mute [duration]`; alerts already skip muted chats). Add message
     details.
-17. **Account management.** Delete the account, including upstream's
+17. **Account management** (done). Delete the account, including upstream's
     abort handling. Settings rows for read receipts and for deleting
     expired contact requests (both synced by the core). Invitation codes.
 18. **Profile pictures.** Set your own and show peers' pictures, decoded

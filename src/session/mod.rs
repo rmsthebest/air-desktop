@@ -3,6 +3,7 @@
 //! state from here and never touch `aircoreclient` themselves.
 
 pub mod account;
+pub mod account_settings;
 pub mod alerts;
 mod attachments;
 pub mod chats;
@@ -13,6 +14,7 @@ pub mod devices;
 #[cfg(test)]
 mod e2e;
 pub mod groups;
+pub mod invitations;
 pub mod message_ops;
 pub mod messages;
 mod pending;
@@ -77,6 +79,11 @@ pub struct Unlinked {
     pub account_deleted: bool,
 }
 
+/// An account deletion was aborted without the user being told (it went
+/// on in the background, or the app was closed meanwhile): the account
+/// still exists, and this device keeps working.
+pub struct DeletionAborted;
+
 /// Clicks waiting for the UI. A handful at most: the user clicks one
 /// notification at a time.
 const CLICKS_BUFFER: usize = 8;
@@ -107,11 +114,18 @@ pub struct Session {
     _forward: TokioTask<()>,
     _downloads: TokioTask<()>,
     _receive: [Task<()>; 5],
+    /// The user's account deletion is running here: it reports its own
+    /// outcome, an abort included.
+    deleting: bool,
+    /// An abort is being reported: not again until it is recorded.
+    reporting_abort: bool,
+    abort_check: Option<Task<()>>,
 }
 
 impl EventEmitter<SessionEvent> for Session {}
 impl EventEmitter<OpenFromAlert> for Session {}
 impl EventEmitter<Unlinked> for Session {}
+impl EventEmitter<DeletionAborted> for Session {}
 
 impl Session {
     pub fn start(user: CoreUser, cx: &mut App) -> Entity<Self> {
@@ -258,8 +272,13 @@ impl Session {
                 _forward: forward,
                 _downloads: downloads,
                 _receive: receive,
+                deleting: false,
+                reporting_abort: false,
+                abort_check: None,
             };
             session.reload_profile(cx);
+            // Durable: one aborted while the app was closed is told now.
+            session.check_deletion_abort(cx);
             session
         })
     }
@@ -321,6 +340,81 @@ impl Session {
         contacts::on_tokio(cx, "change your name", set_display_name(user, name))
     }
 
+    /// Deletes the account on the server, as upstream: the deletion is
+    /// stored first and goes on in the background (also after a restart)
+    /// if it takes longer than the core waits. Once it completes, the
+    /// session reports [`Unlinked`] with `account_deleted`, and this
+    /// device resets.
+    pub fn delete_account(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<crate::model::AccountDeletion, String>> {
+        use crate::model::AccountDeletion;
+        self.deleting = true;
+        let user = self.user.clone();
+        let run = contacts::on_tokio(cx, "delete the account", async move {
+            match user.delete_account().await {
+                Ok(aircoreclient::AccountDeletionStatus::Completed) => {
+                    Ok(AccountDeletion::Completed)
+                }
+                Ok(aircoreclient::AccountDeletionStatus::Pending) => Ok(AccountDeletion::Pending),
+                // The core counts this as told: the caller tells it.
+                Err(err) => {
+                    error!("failed to delete the account: {err:#}");
+                    Err(contacts::Failure::Shown(
+                        "Your account couldn't be deleted. Wait a moment, then try again.".into(),
+                    ))
+                }
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = run.await;
+            _ = this.update(cx, |this, cx| {
+                this.deleting = false;
+                // An abort recorded meanwhile was told by `outcome`; one
+                // after it (the deletion went on) is told here.
+                this.check_deletion_abort(cx);
+            });
+            outcome
+        })
+    }
+
+    /// Tells the user ([`DeletionAborted`]) about an account deletion
+    /// aborted in the background, once, and records that they were told.
+    fn check_deletion_abort(&mut self, cx: &mut Context<Self>) {
+        if self.deleting || self.reporting_abort {
+            return;
+        }
+        let user = self.user.clone();
+        let aborted = Tokio::spawn(cx, async move {
+            user.has_unreported_account_deletion_abort().await
+        });
+        self.abort_check = Some(cx.spawn(async move |this, cx| {
+            let aborted = match aborted.await.and_then(|aborted| aborted) {
+                Ok(aborted) => aborted,
+                Err(err) => return error!("failed to check for an aborted deletion: {err:#}"),
+            };
+            _ = this.update(cx, |this, cx| {
+                if !aborted || this.deleting || this.reporting_abort {
+                    return;
+                }
+                this.reporting_abort = true;
+                cx.emit(DeletionAborted);
+                let user = this.user.clone();
+                let recorded = Tokio::spawn(cx, async move {
+                    user.mark_account_deletion_abort_reported().await
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Err(err) = recorded.await.and_then(|recorded| recorded) {
+                        error!("failed to record that the abort was told: {err:#}");
+                    }
+                    _ = this.update(cx, |this, _| this.reporting_abort = false);
+                })
+                .detach();
+            });
+        }));
+    }
+
     pub(crate) fn reload_profile(&mut self, cx: &mut Context<Self>) {
         let user = self.user.clone();
         let profile = Tokio::spawn(cx, async move { user.own_user_profile().await });
@@ -348,6 +442,8 @@ impl Session {
         let own = DbEntityId::User(self.user.user_id().clone());
         if overflowed || notifications.iter().any(|n| n.ops.contains_key(&own)) {
             self.reload_profile(cx);
+            // The core records an abort on the own user.
+            self.check_deletion_abort(cx);
         }
         cx.emit(SessionEvent::Changed {
             notifications,

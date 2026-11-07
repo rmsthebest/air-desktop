@@ -1,7 +1,7 @@
 //! The settings screen: one list of everything the commands can change
 //! (appearance, themes, keymap, notifications, display name, usernames,
-//! devices). Delete removes the selected username or unlinks the selected
-//! device.
+//! synced account settings, devices, invite codes, deleting the account).
+//! Delete removes the selected username or unlinks the selected device.
 //! Up and down pick a row; left and right (or enter) change it. Text is
 //! typed on the command line, prefilled with the command, so the screen
 //! and the commands stay one thing. The view only says what was asked for
@@ -19,9 +19,11 @@ use crate::actions::{
     CloseSettings, SelectFirst, SelectLast, SelectNext, SelectPrev, SettingNext, SettingPrev,
     SettingRemove,
 };
-use crate::model::Device;
+use crate::model::{Device, InviteSlot, SyncedSettings};
 use crate::session::Session;
+use crate::session::account_settings::AccountSettings;
 use crate::session::devices::Devices;
+use crate::session::invitations::Invitations;
 use crate::settings::{Appearance, KeymapMode, Notifications, Settings, SettingsStore};
 use crate::theme;
 use crate::ui::key_context;
@@ -47,6 +49,16 @@ pub enum SettingsEvent {
     UnlinkDevice(SharedString),
     /// Type the code a new device shows.
     LinkDevice,
+    ReadReceipts(bool),
+    DeleteExpiredRequests(bool),
+    /// Copy these invite codes to give them out.
+    CopyInviteCodes(Vec<SharedString>),
+    /// Trade the token with this id for an invite code.
+    GetInviteCode(i64),
+    /// Forget the codes given out.
+    RemoveUsedCodes,
+    /// Start deleting the account (typed and confirmed first).
+    DeleteAccount,
     Close,
 }
 
@@ -67,6 +79,18 @@ pub enum Row {
         count: usize,
         max: u32,
     },
+    ReadReceipts(bool),
+    DeleteExpiredRequests(bool),
+    InviteCode {
+        code: SharedString,
+        copied: bool,
+    },
+    /// A token to trade for a code, by the core's id.
+    GetInviteCode(i64),
+    /// Every code shown, to copy at once.
+    CopyInviteCodes(Vec<SharedString>),
+    RemoveUsedCodes,
+    DeleteAccount,
 }
 
 /// What the account adds to the screen; `None` without one.
@@ -76,6 +100,8 @@ pub struct AccountRows {
     pub usernames: Vec<SharedString>,
     pub devices: Vec<Device>,
     pub max_devices: u32,
+    pub synced: SyncedSettings,
+    pub invites: Vec<InviteSlot>,
 }
 
 /// The rows, in order: the app's settings, then the account's.
@@ -91,11 +117,37 @@ pub fn rows(settings: &Settings, account: Option<&AccountRows>) -> Vec<Row> {
         rows.push(Row::DisplayName(account.display_name.clone()));
         rows.extend(account.usernames.iter().cloned().map(Row::Username));
         rows.push(Row::AddUsername);
+        rows.push(Row::ReadReceipts(account.synced.read_receipts));
+        rows.push(Row::DeleteExpiredRequests(
+            account.synced.delete_expired_requests,
+        ));
         rows.extend(account.devices.iter().cloned().map(Row::Device));
         rows.push(Row::LinkDevice {
             count: account.devices.len(),
             max: account.max_devices,
         });
+        let mut codes = Vec::new();
+        let mut used = false;
+        for slot in &account.invites {
+            rows.push(match slot {
+                InviteSlot::Code { code, copied } => {
+                    codes.push(code.clone());
+                    used |= copied;
+                    Row::InviteCode {
+                        code: code.clone(),
+                        copied: *copied,
+                    }
+                }
+                InviteSlot::Token(id) => Row::GetInviteCode(*id),
+            });
+        }
+        if codes.len() > 1 {
+            rows.push(Row::CopyInviteCodes(codes));
+        }
+        if used {
+            rows.push(Row::RemoveUsedCodes);
+        }
+        rows.push(Row::DeleteAccount);
     }
     rows
 }
@@ -144,6 +196,9 @@ pub fn change(row: &Row, forward: bool, themes: &Themes) -> Option<SettingsEvent
         Row::Notifications(current) => {
             SettingsEvent::Notifications(step(&[Full, Private, Off], current, forward)?)
         }
+        // On or off: either way flips it.
+        Row::ReadReceipts(on) => SettingsEvent::ReadReceipts(!on),
+        Row::DeleteExpiredRequests(on) => SettingsEvent::DeleteExpiredRequests(!on),
         // Text and lists aren't stepped: only the forward key (enter,
         // right) acts on them, so stepping back never starts a removal.
         _ if !forward => return None,
@@ -155,7 +210,20 @@ pub fn change(row: &Row, forward: bool, themes: &Themes) -> Option<SettingsEvent
             name: device.name.clone(),
         },
         Row::LinkDevice { .. } => SettingsEvent::LinkDevice,
+        Row::InviteCode { code, .. } => SettingsEvent::CopyInviteCodes(vec![code.clone()]),
+        Row::GetInviteCode(id) => SettingsEvent::GetInviteCode(*id),
+        Row::CopyInviteCodes(codes) => SettingsEvent::CopyInviteCodes(codes.clone()),
+        Row::RemoveUsedCodes => SettingsEvent::RemoveUsedCodes,
+        Row::DeleteAccount => SettingsEvent::DeleteAccount,
     })
+}
+
+fn on_off(on: bool) -> String {
+    if on { "On" } else { "Off" }.into()
+}
+
+fn on_off_expired(delete: bool) -> String {
+    if delete { "Deleted" } else { "Kept" }.into()
 }
 
 /// Registered theme names by mode, sorted.
@@ -170,8 +238,16 @@ pub struct SettingsView {
     selected: usize,
     /// `None` only in tests, on mock data.
     session: Option<Entity<Session>>,
-    devices: Option<Entity<Devices>>,
+    account: Option<AccountEntities>,
     themes: Themes,
+}
+
+/// What the account's rows come from.
+#[derive(Clone)]
+pub struct AccountEntities {
+    pub devices: Entity<Devices>,
+    pub settings: Entity<AccountSettings>,
+    pub invitations: Entity<Invitations>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -185,7 +261,7 @@ impl Focusable for SettingsView {
 impl SettingsView {
     pub fn new(
         session: Option<Entity<Session>>,
-        devices: Option<Entity<Devices>>,
+        account: Option<AccountEntities>,
         cx: &mut Context<Self>,
     ) -> Self {
         // Settings change from the command line too, and the account's
@@ -195,14 +271,19 @@ impl SettingsView {
         if let Some(session) = &session {
             cx.observe(session, |_, _, cx| cx.notify()).detach();
         }
-        if let Some(devices) = &devices {
-            cx.observe(devices, |_, _, cx| cx.notify()).detach();
+        if let Some(account) = &account {
+            cx.observe(&account.devices, |_, _, cx| cx.notify())
+                .detach();
+            cx.observe(&account.settings, |_, _, cx| cx.notify())
+                .detach();
+            cx.observe(&account.invitations, |_, _, cx| cx.notify())
+                .detach();
         }
         Self {
             focus_handle: cx.focus_handle(),
             selected: 0,
             session,
-            devices,
+            account,
             // Themes are read at startup only.
             themes: theme::by_mode(cx),
         }
@@ -210,12 +291,19 @@ impl SettingsView {
 
     fn account(&self, cx: &App) -> Option<AccountRows> {
         let session = self.session.as_ref()?.read(cx);
-        let devices = self.devices.as_ref().map(|devices| devices.read(cx));
+        let account = self.account.as_ref();
+        let devices = account.map(|account| account.devices.read(cx));
         Some(AccountRows {
             display_name: session.display_name().clone(),
             usernames: session.usernames().to_vec(),
             devices: devices.map(|d| d.devices().to_vec()).unwrap_or_default(),
             max_devices: devices.map_or(0, Devices::max_devices),
+            synced: account.map_or_else(SyncedSettings::default, |account| {
+                account.settings.read(cx).settings()
+            }),
+            invites: account
+                .map(|account| account.invitations.read(cx).slots().to_vec())
+                .unwrap_or_default(),
         })
     }
 
@@ -313,6 +401,21 @@ impl SettingsView {
                 },
                 "enter",
             ),
+            Row::ReadReceipts(on) => ("Read receipts", on_off(*on), "← →"),
+            Row::DeleteExpiredRequests(on) => ("Expired requests", on_off_expired(*on), "← →"),
+            Row::InviteCode { code, copied } => (
+                "Invite code",
+                if *copied {
+                    format!("{code} (given out)")
+                } else {
+                    code.to_string()
+                },
+                "enter to copy",
+            ),
+            Row::GetInviteCode(_) => ("", "Get an invite code…".into(), "enter"),
+            Row::CopyInviteCodes(codes) => ("", format!("Copy all {} codes", codes.len()), "enter"),
+            Row::RemoveUsedCodes => ("", "Remove codes given out".into(), "enter"),
+            Row::DeleteAccount => ("", "Delete your account…".into(), "enter"),
         };
         let selected = ix == self.selected;
         h_flex()
@@ -374,6 +477,14 @@ impl Render for SettingsView {
             }
             if matches!(row, Row::Device(device) if device.this_device) {
                 list = list.child(section("DEVICES"));
+            }
+            let first_invite =
+                |row: &Row| matches!(row, Row::InviteCode { .. } | Row::GetInviteCode(_));
+            if first_invite(row) && !rows[..ix].iter().any(first_invite) {
+                list = list.child(section("INVITE CODES"));
+            }
+            if matches!(row, Row::DeleteAccount) {
+                list = list.child(section("DANGER"));
             }
             list = list.child(self.render_row(ix, row, focused, cx));
         }
@@ -486,7 +597,11 @@ mod tests {
             ..AccountRows::default()
         };
         let rows = rows(&settings, Some(&account));
-        let tail: Vec<_> = rows[rows.len() - 5..rows.len() - 1].to_vec();
+        let at = rows
+            .iter()
+            .position(|row| matches!(row, Row::DisplayName(_)))
+            .unwrap();
+        let tail: Vec<_> = rows[at..at + 4].to_vec();
         assert_eq!(
             tail,
             [
@@ -531,7 +646,11 @@ mod tests {
             ..AccountRows::default()
         };
         let rows = rows(&Settings::default(), Some(&account));
-        let tail: Vec<_> = rows[rows.len() - 3..].to_vec();
+        let at = rows
+            .iter()
+            .position(|row| matches!(row, Row::Device(_)))
+            .unwrap();
+        let tail: Vec<_> = rows[at..at + 3].to_vec();
         assert_eq!(tail[2], Row::LinkDevice { count: 2, max: 3 });
         // Alike names: what is renamed or unlinked is the tag's device.
         assert_eq!(
@@ -554,5 +673,85 @@ mod tests {
             change(&tail[2], true, &themes()),
             Some(SettingsEvent::LinkDevice)
         );
+    }
+
+    #[test]
+    fn synced_settings_flip_and_codes_are_given_out_one_or_all() {
+        let account = |invites: Vec<InviteSlot>| AccountRows {
+            display_name: "Ada".into(),
+            invites,
+            ..AccountRows::default()
+        };
+        let all = rows(&Settings::default(), Some(&account(Vec::new())));
+        // Either key flips a synced setting; read receipts start on.
+        let receipts = all
+            .iter()
+            .find(|row| matches!(row, Row::ReadReceipts(_)))
+            .unwrap();
+        assert_eq!(receipts, &Row::ReadReceipts(true));
+        for forward in [true, false] {
+            assert_eq!(
+                change(receipts, forward, &themes()),
+                Some(SettingsEvent::ReadReceipts(false))
+            );
+            assert_eq!(
+                change(&Row::DeleteExpiredRequests(false), forward, &themes()),
+                Some(SettingsEvent::DeleteExpiredRequests(true))
+            );
+        }
+        // Deleting the account is the last row, and only enter starts it
+        // (it asks for the word, then confirms).
+        assert_eq!(all.last(), Some(&Row::DeleteAccount));
+        assert_eq!(change(&Row::DeleteAccount, false, &themes()), None);
+        assert_eq!(remove(&Row::DeleteAccount), None);
+
+        let code = |code: &str, copied| InviteSlot::Code {
+            code: code.to_string().into(),
+            copied,
+        };
+        // One fresh code and a token: no copy-all, nothing to clear.
+        let one = rows(
+            &Settings::default(),
+            Some(&account(vec![
+                code("AAAA1111", false),
+                InviteSlot::Token(7),
+            ])),
+        );
+        let invites: Vec<_> = one
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row,
+                    Row::InviteCode { .. }
+                        | Row::GetInviteCode(_)
+                        | Row::CopyInviteCodes(_)
+                        | Row::RemoveUsedCodes
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(invites.len(), 2);
+        assert_eq!(
+            change(&invites[0], true, &themes()),
+            Some(SettingsEvent::CopyInviteCodes(vec!["AAAA1111".into()]))
+        );
+        assert_eq!(
+            change(&invites[1], true, &themes()),
+            Some(SettingsEvent::GetInviteCode(7))
+        );
+        assert_eq!(change(&invites[1], false, &themes()), None);
+        // Two codes, one given out: copy all of them, clear the used.
+        let two = rows(
+            &Settings::default(),
+            Some(&account(vec![
+                code("AAAA1111", true),
+                code("BBBB2222", false),
+            ])),
+        );
+        assert!(two.contains(&Row::CopyInviteCodes(vec![
+            "AAAA1111".into(),
+            "BBBB2222".into()
+        ])));
+        assert!(two.contains(&Row::RemoveUsedCodes));
     }
 }

@@ -47,6 +47,12 @@ pub enum Command {
     /// `model::Mute::parse`; empty: until unmuted).
     Mute(String),
     Unmute,
+    /// Delete the account, once confirmed with the word typed (as typed).
+    DeleteAccount(String),
+    /// Send read receipts (synced to the user's devices).
+    ReadReceipts(bool),
+    /// Delete contact requests once they expire (synced).
+    DeleteExpiredRequests(bool),
     /// Send the file at this path, as typed, to the open chat.
     Attach(String),
     /// Change the user's display name.
@@ -90,6 +96,8 @@ enum Arg {
     Device,
     /// Free text, not completed (e.g. a username).
     Text,
+    /// on or off.
+    Toggle,
 }
 
 struct Spec {
@@ -210,6 +218,21 @@ const SPECS: &[Spec] = &[
         help: "Unmute alerts",
     },
     Spec {
+        names: &["read-receipts"],
+        arg: Arg::Toggle,
+        help: "on or off: others see when you read their messages",
+    },
+    Spec {
+        names: &["delete-expired-requests"],
+        arg: Arg::Toggle,
+        help: "on or off: delete contact requests once they expire",
+    },
+    Spec {
+        names: &["delete-account"],
+        arg: Arg::Text,
+        help: "Delete your Air account (type delete to confirm)",
+    },
+    Spec {
         names: &["attach"],
         arg: Arg::Text,
         help: "Send a file (a path) to the open chat",
@@ -317,6 +340,11 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "retract" => Command::Retract,
         "mute" => Command::Mute(arg.to_string()),
         "unmute" => Command::Unmute,
+        "delete-account" => Command::DeleteAccount(arg.to_string()),
+        "read-receipts" => Command::ReadReceipts(toggle(arg, "read-receipts")?),
+        "delete-expired-requests" => {
+            Command::DeleteExpiredRequests(toggle(arg, "delete-expired-requests")?)
+        }
         "attach" => Command::Attach(need("a file path")?),
         "name" => Command::DisplayName(need("a name")?),
         "link" => Command::Link(need("the code the new device shows")?),
@@ -364,12 +392,22 @@ pub fn complete(input: &str, candidates: &Candidates) -> Vec<(String, String)> {
         Arg::Appearance => ["system", "light", "dark"].map(String::from).to_vec(),
         Arg::Keymap => ["standard", "helix"].map(String::from).to_vec(),
         Arg::Notifications => ["full", "private", "off"].map(String::from).to_vec(),
+        Arg::Toggle => ["on", "off"].map(String::from).to_vec(),
     };
     candidates
         .into_iter()
         .filter(|candidate| normalize(candidate).contains(&arg))
         .map(|candidate| (format!("{name} {candidate}"), String::new()))
         .collect()
+}
+
+/// `on` or `off` for `:name`.
+fn toggle(arg: &str, name: &str) -> Result<bool, String> {
+    match normalize(arg).as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!(":{name} takes on or off")),
+    }
 }
 
 /// Lowercase with spaces, dashes and underscores removed, so `air-dark`
@@ -448,6 +486,20 @@ mod tests {
             Ok(Command::Keymap(KeymapMode::Helix))
         );
         assert_eq!(parse(":details"), Ok(Command::ToggleDetails));
+        assert_eq!(
+            parse(":read-receipts Off"),
+            Ok(Command::ReadReceipts(false))
+        );
+        assert_eq!(
+            parse(":delete-expired-requests on"),
+            Ok(Command::DeleteExpiredRequests(true))
+        );
+        assert!(parse(":read-receipts maybe").is_err());
+        // The word is checked when run, so a wrong one is told why.
+        assert_eq!(
+            parse(":delete-account  delete "),
+            Ok(Command::DeleteAccount("delete".into()))
+        );
         // Usernames go to the session as typed; it normalizes them.
         assert_eq!(
             parse(":add  @Ada-L "),
@@ -513,6 +565,7 @@ mod tests {
                     Arg::Appearance => format!("{name} dark"),
                     Arg::Keymap => format!("{name} helix"),
                     Arg::Notifications => format!("{name} private"),
+                    Arg::Toggle => format!("{name} off"),
                     Arg::Theme
                     | Arg::Chat
                     | Arg::Contact

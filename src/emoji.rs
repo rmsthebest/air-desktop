@@ -53,6 +53,25 @@ pub fn expand_shortcode(text: &str, cursor: usize) -> Option<(String, usize)> {
     Some((expanded, start + emoji.len()))
 }
 
+/// Whether the change from `before` to `text` typed one closing `:` just
+/// before `cursor`: only then is a shortcode expanded, so an undo that
+/// brings back `:smile:` (or a paste) leaves it as it is.
+pub fn closed_by_typing(before: &str, text: &str, cursor: usize) -> bool {
+    let Some(typed) = cursor.checked_sub(1) else {
+        return false;
+    };
+    text.len() == before.len() + 1
+        && text.get(typed..cursor) == Some(":")
+        && text
+            .get(..typed)
+            .zip(text.get(cursor..))
+            .is_some_and(|(head, tail)| {
+                before.len() == head.len() + tail.len()
+                    && before.starts_with(head)
+                    && before.ends_with(tail)
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,11 +111,14 @@ mod tests {
     }
 
     #[test]
-    fn the_list_has_names_and_shortcodes() {
-        let all = all();
-        assert!(all.len() > 1000);
-        let thumbs = all.iter().find(|entry| entry.emoji == "👍").unwrap();
-        assert!(thumbs.shortcodes.contains(&"+1"), "{:?}", thumbs.shortcodes);
-        assert!(!thumbs.name.is_empty());
+    fn only_a_typed_closing_colon_expands() {
+        assert!(closed_by_typing("hi :smile", "hi :smile:", 10));
+        assert!(closed_by_typing(":smile x", ":smile: x", 7));
+        // Undo (or a paste) bringing back a whole shortcode: kept.
+        assert!(!closed_by_typing("hi 😄", "hi :smile:", 10));
+        // A colon typed elsewhere, or a deletion.
+        assert!(!closed_by_typing("hi :smile", "hi :smile:", 3));
+        assert!(!closed_by_typing("hi :smile::", "hi :smile:", 10));
+        assert!(!closed_by_typing("", "", 0));
     }
 }

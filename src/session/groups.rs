@@ -165,8 +165,8 @@ pub(super) async fn add_member_contact(
     }
     for id in user.ordered_chat_ids().await? {
         if let Some(found) = user.chat(&id).await
+            // In any status: the core refuses while its record exists.
             && found.chat_type == ChatType::TargetedMessageConnection(picked.id.clone())
-            && !matches!(found.status(), ChatStatus::Inactive(_))
         {
             return Err(Failure::Shown(format!(
                 "You already sent {name} a contact request"

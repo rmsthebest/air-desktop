@@ -3060,29 +3060,49 @@ mod tests {
     #[gpui::test]
     fn retry_and_view_refuse_what_they_cannot_apply_to(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
-        let told = |cx: &mut VisualTestContext| cx.update(|w, cx| w.notifications(cx).len());
         cx.simulate_keystrokes(&format!("j enter {MOD}-m home"));
         assert!(cursor(&workspace, cx).is_some());
         // A text message: nothing to send again, nothing to view.
-        let before = told(cx);
         cx.simulate_keystrokes("shift-r");
         cx.run_until_parked();
-        assert_eq!(told(cx), before + 1);
+        assert_eq!(
+            crate::ui::last_told().as_deref(),
+            Some("Only a file that failed to send can be sent again")
+        );
         cx.simulate_keystrokes("v");
         cx.run_until_parked();
-        assert_eq!(told(cx), before + 2);
+        assert_eq!(
+            crate::ui::last_told().as_deref(),
+            Some("That message has no image")
+        );
         assert!(!cx.update(|w, cx| w.has_active_dialog(cx)));
-        // Any emoji as a reaction: `/` from the reaction bar finds it,
-        // and picking it reacts (refused here: mock messages have no
-        // account, which shows the pick reached the reaction).
-        cx.simulate_keystrokes("+ /");
-        cx.run_until_parked();
-        assert!(cx.update(|w, cx| w.has_active_dialog(cx)));
-        cx.simulate_input("+1");
-        cx.simulate_keystrokes("enter");
-        cx.run_until_parked();
-        assert!(!cx.update(|w, cx| w.has_active_dialog(cx)));
-        assert_eq!(told(cx), before + 3);
+    }
+
+    #[gpui::test]
+    fn any_emoji_reacts_from_the_reaction_bar(cx: &mut TestAppContext) {
+        for helix in [false, true] {
+            let (workspace, cx) = setup(cx);
+            if helix {
+                enable_helix(cx);
+            }
+            cx.simulate_keystrokes(&format!("j enter {MOD}-m home"));
+            assert!(cursor(&workspace, cx).is_some());
+            // `/` in the reaction bar finds any emoji (in Helix mode too,
+            // where `/` elsewhere finds a chat); picking one reacts.
+            cx.simulate_keystrokes("+ /");
+            cx.run_until_parked();
+            assert!(cx.update(|w, cx| w.has_active_dialog(cx)), "helix: {helix}");
+            cx.simulate_input("+1");
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+            assert!(!cx.update(|w, cx| w.has_active_dialog(cx)));
+            // Mock messages have no account: the reaction was asked for.
+            assert_eq!(
+                crate::ui::last_told().as_deref(),
+                Some("Reactions need an account"),
+                "helix: {helix}"
+            );
+        }
     }
 
     #[gpui::test]

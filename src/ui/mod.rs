@@ -52,11 +52,28 @@ pub fn show_error(message: String, window: &mut Window, cx: &mut App) {
 /// logging it: the message may name a contact, and the session logged any
 /// internal cause where it happened.
 pub fn show_refusal(message: String, window: &mut Window, cx: &mut App) {
+    #[cfg(test)]
+    TOLD.with(|told| told.borrow_mut().push(message.clone()));
     window.push_notification(Notification::error(message), cx);
 }
 
 pub fn show_info(message: String, window: &mut Window, cx: &mut App) {
+    #[cfg(test)]
+    TOLD.with(|told| told.borrow_mut().push(message.clone()));
     window.push_notification(Notification::info(message), cx);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What tests' windows were told, in order (toasts don't show their
+    /// text to tests).
+    static TOLD: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The latest refusal or info shown on this thread (tests only).
+#[cfg(test)]
+pub fn last_told() -> Option<String> {
+    TOLD.with(|told| told.borrow().last().cloned())
 }
 
 /// Asks before running `run`: `ok` confirms (looking like `variant`),

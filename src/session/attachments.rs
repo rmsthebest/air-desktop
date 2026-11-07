@@ -294,14 +294,50 @@ const MAX_FULL_BYTES: usize = 32 * 1024 * 1024;
 /// The viewer keeps an image at most this large (16 MiB as BGRA).
 pub(crate) const MAX_FULL_KEPT: u32 = 2048;
 
+/// Set while the viewer loads an image: one at a time, so repeated
+/// requests (a held key) can't load and decode many large files at once.
+static VIEWING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Holds [`VIEWING`] until dropped.
+struct Viewing;
+
+impl Viewing {
+    fn take() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        VIEWING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(Self)
+    }
+}
+
+impl Drop for Viewing {
+    fn drop(&mut self) {
+        VIEWING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The image of `message` (in `chat`) as large as the viewer shows it:
 /// decoded from the downloaded original, under limits, one at a time.
+/// Only an image the core made a preview of (or found small enough to be
+/// its own): never the original of a failed preview, which the core's
+/// decoder refused.
 pub(super) async fn full_picture(
     user: CoreUser,
     chat: ChatId,
     message: MessageId,
 ) -> Result<Picture, Failure> {
+    let _viewing =
+        Viewing::take().ok_or_else(|| Failure::Shown("Still opening an image".into()))?;
     let id = attachment_in(&user, chat, message).await?;
+    match user.attachment_thumbnail(id).await? {
+        Some(AttachmentThumbnail::Ready { .. } | AttachmentThumbnail::OriginalFits) => {}
+        Some(AttachmentThumbnail::Failed) | None => {
+            return Err(Failure::Shown(
+                "That file isn't an image Air can show".into(),
+            ));
+        }
+    }
     let bytes = match user.load_attachment(id).await? {
         AttachmentContent::Ready(bytes)
         | AttachmentContent::Uploading(bytes)
@@ -751,6 +787,14 @@ mod tests {
             .unwrap();
         assert!(decode(&png).is_none());
         assert!(decode(b"RIFF\0\0\0\0WEBPjunk").is_none());
+    }
+
+    #[test]
+    fn the_viewer_opens_one_image_at_a_time() {
+        let first = Viewing::take().expect("free");
+        assert!(Viewing::take().is_none(), "a second load waits its turn");
+        drop(first);
+        assert!(Viewing::take().is_some());
     }
 
     #[test]

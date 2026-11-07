@@ -1213,3 +1213,32 @@ cases were Linux-only; they are `cfg(unix)` now (a named pipe blocks
 
 Accepted (low): the test makes its FIFO with the `mkfifo` program, not
 `libc::mkfifo` (which needs `unsafe`); coreutils is assumed present.
+
+## Gate 21 — milestone 19, polish (`f5ed341..b4ea001`): PASS
+
+Fixed (low):
+- The image viewer could start a large decode per keypress: `v` is now
+  single-flight (`VIEWING`, "Still opening an image"), and only an image
+  whose thumbnail the core made (or whose original it says fits) opens,
+  never a failed one's original.
+- `:contact-member` refused only a pending request of the user's; any
+  existing contact-request chat with the member now refuses before the
+  core.
+- Shortcodes expanded on any change ending in `:smile:` (a paste, an
+  undo, moving the cursor and editing elsewhere); only a closing colon
+  just typed expands now (`emoji::closed_by_typing`). The test that
+  checked the `emojis` crate's data became one on that rule.
+- The picker built every emoji's item on each render; they're built once.
+- Doc comments that had drifted off `position_of`, `show_image` and
+  `show_details` are back.
+- The refusal tests checked only that no dialog opened; they now check
+  the text the user is told (`ui::last_told`, test only), and `+ /`
+  reacting is tested in Helix mode too (where `/` elsewhere finds a chat).
+
+Deferred to milestone 20 (account seam): a session test that a failed
+thumbnail's original never opens in the viewer, and one that
+`retry_upload` holds the `IN_FLIGHT` claim.
+
+Accepted (low): the viewer checks the file's size after taking the
+single-flight claim (the load is bounded anyway); an expansion replaces
+the composer's whole text (bounded by the input).

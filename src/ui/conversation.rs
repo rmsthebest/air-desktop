@@ -86,6 +86,8 @@ pub struct Conversation {
     /// The message details or image being loaded; replaced by the next request,
     /// dropped (never shown) when the chat changes.
     details: Option<gpui::Task<()>>,
+    /// The composer's text as last seen, to tell what an edit typed.
+    typed: String,
 }
 
 /// The part of the history in view.
@@ -166,9 +168,13 @@ impl Conversation {
                     InputEvent::Change => {
                         let state = composer.read(cx);
                         let mut text = state.value().to_string();
-                        // A closed `:shortcode:` becomes its emoji as typed.
+                        let cursor = state.cursor();
+                        // A `:shortcode:` becomes its emoji when its
+                        // closing colon is typed (not when undo brings
+                        // one back).
+                        let typed = crate::emoji::closed_by_typing(&this.typed, &text, cursor);
                         if let Some((expanded, at)) =
-                            crate::emoji::expand_shortcode(&text, state.cursor())
+                            crate::emoji::expand_shortcode(&text, cursor).filter(|_| typed)
                         {
                             let at = position_of(&expanded, at);
                             composer.update(cx, |composer, cx| {
@@ -177,6 +183,7 @@ impl Conversation {
                             });
                             text = expanded;
                         }
+                        this.typed = text.clone();
                         if let Some(compose) = &this.compose {
                             compose.update(cx, |compose, cx| compose.typed(text, cx));
                         }
@@ -206,6 +213,7 @@ impl Conversation {
             _compose_subscription: None,
             _subscriptions: subscriptions,
             details: None,
+            typed: String::new(),
         }
     }
 
@@ -1534,11 +1542,6 @@ fn full_time(at: chrono::DateTime<chrono::Utc>) -> String {
         .to_string()
 }
 
-/// The message details: who sent it and when, how far it got (the user's
-/// own), and its edit history, newest first. Peer text is rendered as in
-/// the chat (bounded markdown, links confirmed).
-/// The image viewer: the picture fit to the window, its name above.
-/// Closing it drops the picture's texture.
 /// The composer's position (line, character) of byte `offset` in `text`.
 fn position_of(text: &str, offset: usize) -> Position {
     let before = &text[..offset];
@@ -1549,6 +1552,8 @@ fn position_of(text: &str, offset: usize) -> Position {
     )
 }
 
+/// The image viewer: the picture fit to the window, its name above.
+/// Closing it drops the picture's texture.
 fn show_image(
     name: SharedString,
     picture: crate::model::Picture,
@@ -1585,6 +1590,9 @@ fn show_image(
     });
 }
 
+/// The message details: who sent it and when, how far it got (the user's
+/// own), and its edit history, newest first. Peer text is rendered as in
+/// the chat (bounded markdown, links confirmed).
 fn show_details(message: Message, history: EditHistory, window: &mut Window, cx: &mut App) {
     let previous_focus = window.focused(cx);
     window.open_alert_dialog(cx, move |alert, _, cx| {

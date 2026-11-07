@@ -96,10 +96,6 @@ type FocusChat = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
 const REPORT_SPAM: &str = "Air will be notified that this person may be sending spam. \
                            Air is never able to see the contents of any chats.";
 
-/// The confirmation `op` asks for in the one-to-one `chat` (title,
-/// description, button), or why it doesn't apply there
-/// ([`ContactOp::check`], which the session asks again). Upstream's
-/// wording.
 /// What `:mute`, `:unmute` and the toggle ask for.
 enum MuteChange<'a> {
     /// Unmute if muted, else mute until unmuted.
@@ -109,6 +105,10 @@ enum MuteChange<'a> {
     Unmute,
 }
 
+/// The confirmation `op` asks for in the one-to-one `chat` (title,
+/// description, button), or why it doesn't apply there
+/// ([`ContactOp::check`], which the session asks again). Upstream's
+/// wording.
 fn contact_confirmation(
     op: ContactOp,
     chat: &ChatSummary,
@@ -1047,6 +1047,10 @@ impl Workspace {
             }
             Some(chat) if chat.ended() => {
                 show_refusal("They ended this chat".into(), window, cx);
+                None
+            }
+            Some(chat) if chat.group_ended => {
+                show_refusal("You're no longer in this group".into(), window, cx);
                 None
             }
             Some(_) => {
@@ -2517,11 +2521,6 @@ mod tests {
         assert!(!asking(cx));
         assert_eq!(told(cx), before + 2);
         assert_eq!(message_count(&workspace, cx), count);
-        // Details show for any message.
-        cx.simulate_keystrokes("i");
-        cx.run_until_parked();
-        assert!(asking(cx));
-        escape(cx);
     }
 
     #[gpui::test]
@@ -3291,6 +3290,7 @@ mod tests {
             last_activity: None,
             unread: 0,
             muted: None,
+            group_ended: false,
         };
         let said = |op, facts| contact_confirmation(op, &chat(Some(facts))).unwrap().1;
         let incoming = OneToOne {
@@ -3324,6 +3324,7 @@ mod tests {
             last_activity: None,
             unread: 0,
             muted: None,
+            group_ended: false,
         };
         let (contact, group, own) = (chat(false, false), chat(true, false), chat(false, true));
         assert!(safety_target(None, "").is_err());

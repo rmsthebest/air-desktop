@@ -1238,6 +1238,7 @@ impl Render for Conversation {
                 _ if chat.blocked() => render_blocked(&chat.title, cx),
                 Some(request) => render_request(request, &chat.title, cx),
                 None if chat.ended() => render_ended(&chat.title, cx),
+                None if chat.group_ended => render_group_ended(cx),
                 None => self
                     .render_composer(composer_context, composer_focused, compose_bar, cx)
                     .into_any_element(),
@@ -1534,6 +1535,22 @@ fn render_ended(title: &SharedString, cx: &App) -> AnyElement {
             "delete-ended",
             "Delete",
             "Delete this chat",
+            DeleteChat,
+        ));
+    in_composer_place(card)
+}
+
+/// Takes the composer's place in a group the user is no longer in.
+fn render_group_ended(cx: &App) -> AnyElement {
+    let card = card(cx)
+        .child(
+            card_text("You're no longer in this group.".to_string())
+                .text_color(cx.theme().muted_foreground),
+        )
+        .child(card_button(
+            "delete-ended-group",
+            "Delete",
+            "Delete this group",
             DeleteChat,
         ));
     in_composer_place(card)

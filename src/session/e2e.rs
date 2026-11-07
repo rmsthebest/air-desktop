@@ -1220,13 +1220,6 @@ async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
         .unwrap();
     assert!(ada.message(theirs).await.unwrap().is_none());
 
-    // Muting is the chat's, as the list shows it.
-    ada.set_chat_muted_until(chat, Some(aircoreclient::ChatMuted::Forever))
-        .await
-        .unwrap();
-    let summary = chats::summary(&ada, ada.chat(&chat).await.unwrap()).await;
-    assert_eq!(summary.muted, Some(crate::model::Mute::Forever));
-
     // Reporting tells the server; the chat stays.
     contact_op(ada.clone(), ContactOp::Report, chat)
         .await

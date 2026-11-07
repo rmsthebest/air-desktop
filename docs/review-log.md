@@ -1073,3 +1073,27 @@ Fixed (low): the e2e check that a blocked sender's next request never
 shows matched only open requests, so one stored blocked or ended would
 pass. It now fails on any chat of a request from him, whatever its
 status (his earlier one was erased with the block).
+
+## Gate 18 — milestone 16, message deletion, details and mute (`cba7ca2..8b3aeba`): PASS
+
+Fixed:
+- (medium) The view and the session decided "this chat takes messages"
+  differently: a group the user is out of still composed in the view
+  (so shift-d asked, then the session refused) and kept a composer.
+  One rule now, `model::takes_messages`, on `one_to_one` facts and
+  `group_ended` (`chats::group_ended`, which both sides derive from the
+  core's chat). An ended group shows a Delete footer and refuses sends.
+  `only_a_live_chat_is_written_to` fails without it.
+- (low) `erasable` was computed when a message loaded, from whether the
+  request was open, and went stale once it was answered. The view now
+  counts a request's system messages as erasable (`may_erase`); the
+  session checks the real state.
+- (low) The edit history converted every version before keeping 20:
+  only the shown ones are converted now (`EditHistory::new` takes how
+  many were skipped).
+- (low) Two doc comments sat on the wrong items (`load_chat`,
+  `contact_confirmation`).
+- (low) Muting left the chat's alert on screen: it is dismissed now.
+- Tests: the details step (only "a dialog opened") and the e2e mute
+  block (the core's call, not the session's) are dropped; the mute test
+  keeps only the expiry the list redraws on.

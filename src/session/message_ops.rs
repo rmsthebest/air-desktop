@@ -7,17 +7,30 @@
 //! the core's delete for everyone doesn't check the sender itself.
 
 use aircoreclient::clients::CoreUser;
-use aircoreclient::{ChatId as CoreChatId, ChatMessage, ChatStatus, EventMessage};
+use aircoreclient::{ChatId as CoreChatId, ChatMessage, EventMessage};
 use aircoreclient::{Message as CoreMessage, MessageId as CoreMessageId};
 use chrono::{DateTime, Utc};
 use gpui_kit::App;
 use mimi_content::MessageStatus as CoreStatus;
 
-use super::chats::one_to_one;
+use super::chats::{group_ended, one_to_one};
 use super::contacts::{Failure, on_tokio};
 use super::messages::{Messages, core_message_id};
 use super::preview::{Body, body_of};
-use crate::model::{ChatFacts, DeleteFor, EditHistory, MessageFacts, MessageId, Side, Stage};
+use crate::model::{
+    ChatFacts, DeleteFor, EditHistory, MAX_VERSIONS, MessageFacts, MessageId, takes_messages,
+};
+
+/// What the view shows as deletable for the user: as [`erasable`], but
+/// a request's system messages count as erasable whatever the chat's
+/// state, as they become once it is answered; the window isn't reloaded
+/// when that happens, and the session checks the real state.
+pub(super) fn may_erase(message: &ChatMessage) -> bool {
+    match message.message() {
+        CoreMessage::Event(EventMessage::System(system)) => system.is_deletable(false),
+        _ => true,
+    }
+}
 
 /// The core lets the user delete `message` on their devices: everything
 /// but some system messages (as `ChatMessage::is_deletable`, which isn't
@@ -58,14 +71,10 @@ async fn facts(
         .await
         .ok_or_else(|| Failure::Shown("The chat is gone".into()))?;
     let self_chat = user.chat_is_self_group(&room.group_id).await?;
-    // As `ChatSummary::composes`: a contact's open chat, or an active
-    // group.
-    let live = match one_to_one(&room.chat_type, room.status()) {
-        Some(chat) => {
-            chat.side == Side::Contact && matches!(chat.stage, Stage::Open | Stage::Sending)
-        }
-        None => matches!(room.status(), ChatStatus::Active),
-    };
+    let live = takes_messages(
+        one_to_one(&room.chat_type, room.status()),
+        group_ended(&room),
+    );
     let message_facts = MessageFacts {
         content: matches!(message.message(), CoreMessage::Content(_)),
         own: message.message().sender() == Some(user.user_id()),
@@ -113,7 +122,9 @@ pub(super) async fn history(
         return Ok(EditHistory::default());
     }
     let versions = user.message_versions(message.id()).await?;
-    let sources: Vec<(Option<String>, DateTime<Utc>)> = versions
+    // A sender can edit often: only the shown versions are converted.
+    let skipped = versions.len().saturating_sub(MAX_VERSIONS);
+    let sources: Vec<(Option<String>, DateTime<Utc>)> = versions[skipped..]
         .iter()
         .map(|version| {
             let source = match body_of(&version.content) {
@@ -124,6 +135,7 @@ pub(super) async fn history(
         })
         .collect();
     Ok(EditHistory::new(
+        skipped,
         sources
             .iter()
             .map(|(source, at)| (source.as_deref(), *at))

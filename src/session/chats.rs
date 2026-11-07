@@ -286,11 +286,9 @@ pub(super) async fn summary(user: &CoreUser, chat: Chat) -> ChatSummary {
     load_chat(user, chat).await.0
 }
 
-/// Loads what the list shows for a chat. Port of `load_chat_details`, minus
-/// what the list doesn't show yet.
 impl Session {
     /// Mutes the chat's alerts (`None` unmutes), on this device only, as
-    /// upstream.
+    /// upstream, and dismisses the one shown.
     pub fn set_muted(
         &self,
         chat: &ChatId,
@@ -307,12 +305,23 @@ impl Session {
             Mute::Until(until) => ChatMuted::Until(until),
             Mute::Forever => ChatMuted::Forever,
         });
+        let alerts = self.alerts.clone();
         super::contacts::on_tokio(cx, what, async move {
             user.set_chat_muted_until(chat, muted)
                 .await
-                .map_err(|err| super::contacts::Failure::from(err).local(what))
+                .map_err(|err| super::contacts::Failure::from(err).local(what))?;
+            // Its alert on screen goes with it; new ones are skipped.
+            if muted.is_some() {
+                alerts.dismiss(super::alerts::Dismiss::Chat(chat));
+            }
+            Ok(())
         })
     }
+}
+
+/// A group the user is no longer in: the core keeps it inactive.
+pub(super) fn group_ended(chat: &Chat) -> bool {
+    matches!(chat.chat_type, ChatType::Group(_)) && matches!(chat.status(), ChatStatus::Inactive(_))
 }
 
 /// The core stores "forever" as the start of 9999 but reads back only
@@ -324,6 +333,8 @@ fn mute(muted: &ChatMuted) -> Mute {
     }
 }
 
+/// Loads what the list shows for a chat. Port of `load_chat_details`, minus
+/// what the list doesn't show yet.
 async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
     let unread = user.unread_messages_count(chat.id).await;
     let last = user
@@ -390,6 +401,7 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
             .or(chat.last_message_at),
         unread: u32::try_from(unread).unwrap_or(u32::MAX),
         muted: chat.muted_until.as_ref().map(mute),
+        group_ended: group_ended(&chat),
     };
     let keys = ChatKeys {
         last_message: last.map(|message| message.id()),
@@ -612,6 +624,7 @@ mod tests {
             last_activity: None,
             unread: 0,
             muted: None,
+            group_ended: false,
         }
     }
 

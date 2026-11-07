@@ -1204,7 +1204,7 @@ impl Worker {
             reactions,
             more_reactions,
             deleted,
-            erasable: super::message_ops::erasable(&self.user, &message).await,
+            erasable: super::message_ops::may_erase(&message),
         };
         (key, item)
     }

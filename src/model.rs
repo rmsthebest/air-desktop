@@ -88,6 +88,9 @@ pub struct ChatSummary {
     pub unread: u32,
     /// Alerts are off for it until then (this device only, as upstream).
     pub muted: Option<Mute>,
+    /// A group the user is no longer in (left, removed, or it was
+    /// deleted): only deleting it is left.
+    pub group_ended: bool,
 }
 
 impl ChatSummary {
@@ -111,13 +114,9 @@ impl ChatSummary {
             .is_some_and(|chat| chat.stage == Stage::Blocked)
     }
 
-    /// Messages and files can be sent: no request, not blocked, and not
-    /// a contact's chat that ended (they deleted it).
+    /// Messages and files can be sent: see [`takes_messages`].
     pub fn composes(&self) -> bool {
-        self.request.is_none()
-            && self
-                .one_to_one
-                .is_none_or(|chat| matches!(chat.stage, Stage::Open | Stage::Sending))
+        self.request.is_none() && takes_messages(self.one_to_one, self.group_ended)
     }
 
     /// A contact's chat that ended: they deleted it.
@@ -128,6 +127,17 @@ impl ChatSummary {
                 ..OneToOne::CONTACT
             })
     }
+}
+
+/// Messages and files can be sent to a chat: no request, not blocked,
+/// not a contact's chat that ended (they deleted it), not a group the
+/// user is out of. The one rule, from facts the view's summary and the
+/// session's core state both have.
+pub fn takes_messages(one_to_one: Option<OneToOne>, group_ended: bool) -> bool {
+    !group_ended
+        && one_to_one.is_none_or(|chat| {
+            chat.side == Side::Contact && matches!(chat.stage, Stage::Open | Stage::Sending)
+        })
 }
 
 /// A one-to-one chat as contact operations see it.
@@ -735,7 +745,7 @@ pub struct Version {
 }
 
 /// Versions of a message the details show; a sender can edit often.
-const MAX_VERSIONS: usize = 20;
+pub const MAX_VERSIONS: usize = 20;
 
 /// A message's edit history as the details show it.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -748,13 +758,14 @@ pub struct EditHistory {
 }
 
 impl EditHistory {
-    /// From the core's versions, oldest first. A message never edited
-    /// has no history.
-    pub fn new(oldest_first: Vec<(Option<&str>, DateTime<Utc>)>) -> Self {
-        if oldest_first.len() < 2 {
+    /// From the core's versions, oldest first, after the oldest
+    /// `skipped` (the caller may leave out what won't be shown). A
+    /// message never edited has no history.
+    pub fn new(skipped: usize, oldest_first: Vec<(Option<&str>, DateTime<Utc>)>) -> Self {
+        if skipped + oldest_first.len() < 2 {
             return Self::default();
         }
-        let older = oldest_first.len().saturating_sub(MAX_VERSIONS);
+        let older = skipped + oldest_first.len().saturating_sub(MAX_VERSIONS);
         let versions = oldest_first
             .into_iter()
             .rev()
@@ -1087,6 +1098,7 @@ pub mod mock {
                 last_activity: Some(now - ago),
                 unread,
                 muted: None,
+                group_ended: false,
             }
         };
         vec![
@@ -1358,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mute_ends_when_it_says() {
+    fn the_list_redraws_when_the_soonest_mute_ends() {
         let now = Utc::now();
         let chat = |muted| ChatSummary {
             muted,
@@ -1374,11 +1386,6 @@ mod tests {
             chat(Some(Mute::Until(soon))),
         ];
         assert_eq!(next_mute_expiry(&chats, now), Some(soon));
-        assert!(!chats[0].is_muted(now));
-        assert!(chats[1].is_muted(now));
-        assert!(!chats[2].is_muted(now));
-        assert!(chats[4].is_muted(now));
-        assert!(!chats[4].is_muted(soon));
         assert_eq!(next_mute_expiry(&chats[..3], now), None);
     }
 
@@ -1386,22 +1393,33 @@ mod tests {
     fn edit_history_is_newest_first_and_bounded() {
         let at = |n: i64| DateTime::from_timestamp(n, 0).unwrap();
         assert_eq!(
-            EditHistory::new(vec![(Some("only"), at(0))]),
+            EditHistory::new(0, vec![(Some("only"), at(0))]),
             EditHistory::default()
         );
-        let history = EditHistory::new(vec![
-            (Some("first"), at(0)),
-            (None, at(1)),
-            (Some("now"), at(2)),
-        ]);
+        let history = EditHistory::new(
+            0,
+            vec![(Some("first"), at(0)), (None, at(1)), (Some("now"), at(2))],
+        );
         let times: Vec<_> = history.versions.iter().map(|v| v.at).collect();
         assert_eq!(times, [at(2), at(1), at(0)]);
         assert!(history.versions[1].markdown.is_none());
         assert_eq!(history.older, 0);
-        let many = EditHistory::new((0..25).map(|n| (Some("x"), at(n))).collect());
+        let many = EditHistory::new(0, (0..25).map(|n| (Some("x"), at(n))).collect());
         assert_eq!(many.versions.len(), MAX_VERSIONS);
         assert_eq!(many.older, 5);
         assert_eq!(many.versions[0].at, at(24));
+        // As the session passes them: the oldest left out unconverted.
+        let kept = EditHistory::new(980, (980..1000).map(|n| (Some("x"), at(n))).collect());
+        assert_eq!(kept.older, 980);
+        assert_eq!(kept.versions.len(), MAX_VERSIONS);
+        assert_eq!(kept.versions[0].at, at(999));
+        // The last of many edits is still history, if only one is kept.
+        assert_eq!(
+            EditHistory::new(1, vec![(Some("now"), at(1))])
+                .versions
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1468,6 +1486,7 @@ mod tests {
             last_activity: None,
             unread: 0,
             muted: None,
+            group_ended: false,
         };
         let stage = |stage| {
             Some(OneToOne {
@@ -1485,6 +1504,30 @@ mod tests {
             ..OneToOne::CONTACT
         };
         assert!(!chat(Some(incoming), Some(Request::Incoming)).composes());
+        // A group the user is out of takes nothing, and deleting a
+        // message for everyone there is refused before asking.
+        let out = ChatSummary {
+            group_ended: true,
+            ..chat(None, None)
+        };
+        assert!(!out.composes());
+        let own = MessageFacts {
+            content: true,
+            own: true,
+            sent: true,
+            deleted: false,
+            erasable: true,
+        };
+        assert!(
+            DeleteFor::Everyone
+                .check(own, out.deletion_facts())
+                .is_err()
+        );
+        // The session's rule is the same one.
+        assert!(!takes_messages(None, true));
+        assert!(!takes_messages(stage(Stage::Ended), false));
+        assert!(!takes_messages(Some(incoming), false));
+        assert!(takes_messages(stage(Stage::Sending), false));
     }
 
     #[test]
@@ -1503,6 +1546,7 @@ mod tests {
                 last_activity: None,
                 unread,
                 muted: None,
+                group_ended: false,
             })
             .collect();
         assert_eq!(next_unread(&chats, None, true), Some(1));

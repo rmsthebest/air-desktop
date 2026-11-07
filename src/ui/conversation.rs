@@ -83,10 +83,11 @@ pub struct Conversation {
     _messages_subscription: Option<Subscription>,
     _compose_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
-    /// The message details or image being loaded; replaced by the next request,
+    /// The message details being loaded; replaced by the next request,
     /// dropped (never shown) when the chat changes.
     details: Option<gpui::Task<()>>,
-    /// The image being opened (one at a time: another `v` waits for it).
+    /// The image being opened (one at a time: another `v` waits for it);
+    /// dropped (never shown) when the chat changes.
     viewing: Option<gpui::Task<()>>,
     /// The composer's text as last seen, to tell what an edit typed.
     typed: String,
@@ -234,6 +235,7 @@ impl Conversation {
     ) {
         self.leave_chat(window, cx);
         self.details = None;
+        self.viewing = None;
         self._compose_subscription =
             Some(
                 cx.subscribe_in(&compose, window, |this, _, event, window, cx| match event {
@@ -339,6 +341,7 @@ impl Conversation {
         self.cursor = None;
         self.reacting = false;
         self.details = None;
+        self.viewing = None;
         cx.notify();
     }
 

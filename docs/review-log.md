@@ -1267,3 +1267,14 @@ Deferred to milestone 20: an e2e or seam test that `:contact-member`
 works again after a request through a group was retracted or expired.
 Accepted: `the_viewer_opens_one_image_at_a_time` tests only the guard;
 the session test is deferred with the account seam.
+
+## Gate 21c — gate 21b fixes (`71c3280..f440395`): PASS
+
+Fixed (medium): the viewer's own pending slot wasn't dropped when the
+chat changed (the shared `details` slot had been), so an image still
+opening could show over the next chat, and `v` there was refused until
+it ended. Opening or leaving a chat drops it now.
+
+Deferred to milestone 20 (account seam): a gpui test that a pending view
+is dropped on a chat change (mock chats have no account, so no load
+ever starts).

@@ -13,7 +13,7 @@ use aircoreclient::SafetyCode;
 use aircoreclient::clients::CoreUser;
 use gpui::SharedString;
 use gpui_kit::App;
-use tracing::error;
+use tracing::{error, warn};
 
 use super::Session;
 use super::contacts::{Failure, on_tokio};
@@ -52,16 +52,22 @@ pub(super) async fn with(user: &CoreUser, peer: &CoreUserId) -> Result<SafetyLin
     // credential may simply not be here yet (it arrives with their first
     // message or a group's member list); the core can't tell us apart from
     // a database error, so the message covers both and the log has which.
-    let local = |err: anyhow::Error| {
-        error!("failed to compute a safety code: {err:#}");
+    let local = || {
         Failure::Shown(
             "Couldn't compute the safety code on this device. If you just \
              became contacts, try again in a moment."
                 .into(),
         )
     };
-    let own = user.safety_code(user.user_id()).await.map_err(local)?;
-    let theirs = user.safety_code(peer).await.map_err(local)?;
+    // The own credential is always here: failing is an error.
+    let own = user.safety_code(user.user_id()).await.map_err(|err| {
+        error!("failed to compute the own safety code: {err:#}");
+        local()
+    })?;
+    let theirs = user.safety_code(peer).await.map_err(|err| {
+        warn!("failed to compute a peer's safety code: {err:#}");
+        local()
+    })?;
     Ok(lines(own, theirs))
 }
 

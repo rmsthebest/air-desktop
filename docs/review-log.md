@@ -1009,3 +1009,9 @@ Accepted: a code that resolves while another dialog is open opens over
 it (it is still the open chat's code). Deferred (account seam): a
 `#[gpui::test]` that a late code for another chat is dropped and a new
 request replaces a pending one; mock data stops before the lookup.
+
+## Gate 16c — gate 16b fixes (`9265ad7..4e4f7d8`): PASS
+
+Fixed (low): a peer credential that hasn't arrived yet (expected) was
+logged as an error; the peer lookup logs a warning, the own lookup
+(which should never fail) an error.

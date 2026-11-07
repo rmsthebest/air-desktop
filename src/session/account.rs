@@ -57,6 +57,15 @@ pub fn mark_deleted(dir: &std::path::Path, id: Uuid) -> std::io::Result<()> {
     std::fs::write(dir.join(format!("{id}.deleted")), b"")
 }
 
+/// Drops `id`'s mark once its files are gone.
+pub fn unmark_deleted(dir: &std::path::Path, id: Uuid) {
+    match std::fs::remove_file(dir.join(format!("{id}.deleted"))) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => error!("failed to remove a deletion mark: {err}"),
+    }
+}
+
 /// Removes the database files (`<id>.db`, `-shm`, `-wal`) of accounts
 /// marked by [`mark_deleted`], then the mark. Only marked ones: a database
 /// without a record may be a sign-up or link still under way in another
@@ -89,8 +98,8 @@ pub fn remove_marked(dir: &std::path::Path, known: &std::collections::HashSet<Uu
                 }
             }
         }
-        if removed && let Err(err) = std::fs::remove_file(entry.path()) {
-            error!("failed to remove a deletion mark: {err}");
+        if removed {
+            unmark_deleted(dir, id);
         }
     }
 }
@@ -332,6 +341,16 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(left, expected);
+
+        // A file that can't be removed keeps the mark, so a later load
+        // tries again; the rest goes.
+        let stuck = Uuid::new_v4();
+        std::fs::write(dir.path().join(format!("{stuck}.db")), b"").unwrap();
+        std::fs::create_dir(dir.path().join(format!("{stuck}.db-wal"))).unwrap();
+        mark_deleted(dir.path(), stuck).unwrap();
+        remove_marked(dir.path(), &[recorded].into());
+        assert!(!dir.path().join(format!("{stuck}.db")).exists());
+        assert!(dir.path().join(format!("{stuck}.deleted")).exists());
     }
 
     #[test]

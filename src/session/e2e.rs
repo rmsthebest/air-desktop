@@ -991,10 +991,13 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
         .unwrap();
     assert_eq!(reason, Some(aircoreclient::UnlinkReason::Unlinked));
     drop(_desk_queue);
+    let desk_record = desk.client_record_id();
     assert_eq!(
         devices::tear_down(desk, desk_path.clone()).await,
         devices::TornDown::Deleted
     );
+    // Marked while deleting; nothing is left to remove, so no mark stays.
+    assert!(!desk_dir.join(format!("{desk_record}.deleted")).exists());
     assert!(account::load_default(desk_path).await.unwrap().is_none());
     eventually("Ada's device lists itself alone", async || {
         (listed(&ada).await.len() == 1).then_some(())

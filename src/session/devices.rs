@@ -636,8 +636,8 @@ pub enum TornDown {
     Deleted,
     /// Some of it failed. The record decides what happens next: kept, the
     /// account loads again (and fails again); gone, it never loads again,
-    /// and the files left are marked for the next load to remove (see
-    /// [`super::account::remove_marked`]).
+    /// and the files left are removed by the next load (they were marked
+    /// first, see [`super::account::remove_marked`]).
     Failed {
         record_kept: bool,
     },
@@ -651,7 +651,15 @@ pub async fn tear_down(user: CoreUser, db_path: String) -> TornDown {
     let record = user.client_record_id();
     user.close_local_database().await;
     drop(user);
+    // Marked first: a quit (or a failed read below) between the core
+    // dropping the record and marking would leave the files unmarked for
+    // good. A mark on an id that keeps its record is skipped.
+    let dir = std::path::Path::new(&db_path);
+    if let Err(err) = super::account::mark_deleted(dir, record) {
+        error!("failed to mark the unlinked account's data for removal: {err}");
+    }
     let Err(err) = aircoreclient::delete_client_database(&db_path, record).await else {
+        super::account::unmark_deleted(dir, record);
         return TornDown::Deleted;
     };
     error!("failed to delete the unlinked account's data: {err:#}");
@@ -660,11 +668,6 @@ pub async fn tear_down(user: CoreUser, db_path: String) -> TornDown {
         // Can't tell: assume the worst (don't load again).
         Err(_) => true,
     };
-    if !record_kept
-        && let Err(err) = super::account::mark_deleted(std::path::Path::new(&db_path), record)
-    {
-        error!("failed to mark the unlinked account's data for removal: {err}");
-    }
     TornDown::Failed { record_kept }
 }
 

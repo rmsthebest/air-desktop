@@ -937,3 +937,18 @@ Fixed:
   `a_change_during_a_lookup_gets_one_more_lookup`.
 
 Still deferred (account seam): `AppRoot::tear_down`'s routing.
+
+## Gate 15e — gate 15d fixes (`433483d..b6ba09e`): PASS
+
+Fixed (low):
+- **A quit or unreadable records after the core dropped the record left
+  the files unmarked for good.** The mark is written before deleting and
+  dropped on success. The e2e test checks no mark stays after a clean
+  teardown.
+- A file that can't be removed keeps its mark (tested with a directory
+  in the way), so a later load retries.
+
+Accepted: such a file logs an error on every load until it goes; the
+user isn't told (nothing they can act on in the app).
+Deferred (account seam): the subscriber's "look again, don't replace"
+branch; only `after_probe` is tested.

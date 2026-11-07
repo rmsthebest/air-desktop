@@ -15,14 +15,15 @@ use std::path::PathBuf;
 use crate::actions::{
     self, AcceptRequest, AddContact, AttachFile, DeclineRequest, FindChat, FocusChatList,
     FocusComposer, FocusConversation, FocusMessages, FocusNextPane, InviteToGroup, JumpBack,
-    JumpForward, NewGroup, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette,
-    OpenSettings, PickTheme, PrevChat, PrevUnreadChat, SelectFirst, SelectLast, ShowShortcuts,
-    ToggleAppearance, ToggleDetails, ToggleHelixMode,
+    JumpForward, LinkDevice, NewGroup, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine,
+    OpenPalette, OpenSettings, PickTheme, PrevChat, PrevUnreadChat, SelectFirst, SelectLast,
+    ShowShortcuts, ToggleAppearance, ToggleDetails, ToggleHelixMode,
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, Request, UserId, mock};
 use crate::session::chats::{Chats, LoadState};
 use crate::session::composer::Composer;
+use crate::session::devices::{self, Devices, Link, LinkEvent};
 use crate::session::groups::Members;
 use crate::session::messages::Messages;
 use crate::session::{OpenFromAlert, Session};
@@ -32,6 +33,7 @@ use crate::ui::chat_list::{ChatList, ChatListEvent};
 use crate::ui::command_line::{CommandLine, CommandLineEvent};
 use crate::ui::conversation::{Conversation, ConversationEvent};
 use crate::ui::details_pane::details_pane;
+use crate::ui::link_view::{LinkPhase, LinkView, LinkViewEvent};
 use crate::ui::nav_rail::{Account, nav_rail};
 use crate::ui::palette::{self, Scope};
 use crate::ui::settings_view::{SettingsEvent, SettingsView};
@@ -62,7 +64,22 @@ pub struct Workspace {
     settings_open: bool,
     /// A chat opened before it was listed, and how to focus it once it is.
     focus_when_opened: Option<(ChatId, FocusChat)>,
+    /// The user's devices (with an account).
+    devices: Option<Entity<Devices>>,
+    /// Linking a new device from this one.
+    linking: Option<Linking>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A link to a new device in progress (or just ended, while its pane shows).
+struct Linking {
+    /// Until the user confirms: dropping it turns the link down.
+    link: Option<Link>,
+    /// Linked or failed.
+    finished: bool,
+    /// Shown in place of the settings rows.
+    pane: Option<(Entity<LinkView>, Subscription)>,
+    _receive: Task<()>,
 }
 
 /// Focuses the open chat one way or another.
@@ -82,7 +99,10 @@ impl Workspace {
             None => ChatList::new(mock::chats(), LoadState::Loaded, cx),
         });
         let conversation = cx.new(|cx| Conversation::new(window, cx));
-        let settings_view = cx.new(|cx| SettingsView::new(session.clone(), cx));
+        let devices = session
+            .as_ref()
+            .map(|session| cx.new(|cx| Devices::new(session, cx)));
+        let settings_view = cx.new(|cx| SettingsView::new(session.clone(), devices.clone(), cx));
 
         let mut subscriptions = vec![
             cx.subscribe_in(
@@ -203,6 +223,8 @@ impl Workspace {
             settings_view,
             settings_open: false,
             focus_when_opened: None,
+            devices,
+            linking: None,
             _subscriptions: subscriptions,
         };
         this.report_attention(window, cx);
@@ -361,8 +383,211 @@ impl Workspace {
         self.settings_open = false;
         self.conversation
             .update(cx, |conversation, _| conversation.set_hidden(false));
+        // Hidden with the settings: an unconfirmed link is turned down.
+        self.close_link_pane(cx);
         cx.notify();
         true
+    }
+
+    /// Starts linking the new device showing `code`, in a pane in place of
+    /// the settings rows.
+    fn start_link(&mut self, code: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            show_refusal("That needs an account".into(), window, cx);
+            return;
+        };
+        if self
+            .linking
+            .as_ref()
+            .is_some_and(|linking| linking.link.is_none() && !linking.finished)
+        {
+            show_refusal("Still linking the previous device".into(), window, cx);
+            return;
+        }
+        let code = match devices::parse_code(code) {
+            Ok(code) => code,
+            Err(refusal) => return show_refusal(refusal, window, cx),
+        };
+        // Replacing an unconfirmed link turns it down.
+        self.linking = None;
+        let (link, events) = session.read(cx).link_device(code, cx);
+        self.show_link(link, events, window, cx);
+    }
+
+    fn show_link(
+        &mut self,
+        link: Link,
+        mut events: tokio::sync::mpsc::UnboundedReceiver<LinkEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.new(|cx| LinkView::new(window, cx));
+        let view_events =
+            cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+                LinkViewEvent::Confirm(name) => this.confirm_link(name.clone(), window, cx),
+                LinkViewEvent::Close => {
+                    this.close_link_pane(cx);
+                    this.settings_view.focus_handle(cx).focus(window, cx);
+                }
+            });
+        let receive = cx.spawn_in(window, async move |this, cx| {
+            while let Some(event) = events.recv().await {
+                let finished = !matches!(event, LinkEvent::AwaitingConfirmation);
+                let shown = this.update_in(cx, |this, window, cx| {
+                    this.link_progressed(event, window, cx)
+                });
+                if finished || shown.is_err() {
+                    return;
+                }
+            }
+        });
+        self.linking = Some(Linking {
+            link: Some(link),
+            finished: false,
+            pane: Some((view.clone(), view_events)),
+            _receive: receive,
+        });
+        self.open_settings(&OpenSettings, window, cx);
+        view.focus_handle(cx).focus(window, cx);
+    }
+
+    fn link_progressed(&mut self, event: LinkEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(linking) = &mut self.linking else {
+            return;
+        };
+        let phase = match event {
+            LinkEvent::AwaitingConfirmation => LinkPhase::Confirm,
+            LinkEvent::Linked => {
+                if let Some(devices) = &self.devices {
+                    devices.update(cx, |devices, cx| devices.reload(cx));
+                }
+                LinkPhase::Linked
+            }
+            LinkEvent::Failed(message) => LinkPhase::Failed(message.into()),
+        };
+        if phase != LinkPhase::Confirm {
+            linking.finished = true;
+            linking.link = None;
+        }
+        match &linking.pane {
+            Some((view, _)) => {
+                view.update(cx, |view, cx| view.set_phase(phase, window, cx));
+            }
+            // The pane was closed after the user confirmed: say how it went.
+            None => {
+                self.linking = None;
+                match phase {
+                    LinkPhase::Linked => show_info("Device linked".into(), window, cx),
+                    LinkPhase::Failed(message) => show_refusal(message.to_string(), window, cx),
+                    _ => {}
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Asks before giving the new device the account, then lets it link.
+    fn confirm_link(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let title = match name.trim() {
+            "" => "Link this device?".to_string(),
+            name => format!("Link {}?", crate::model::name_line(name)),
+        };
+        self.confirm(
+            title,
+            "It gets full access to your Air account: your chats, contacts and \
+             devices. Only link a device you own."
+                .into(),
+            "Link",
+            move |this, window, cx| {
+                let Some(linking) = &mut this.linking else {
+                    return;
+                };
+                let Some(link) = &mut linking.link else {
+                    return;
+                };
+                if let Err(refusal) = link.confirm(&name) {
+                    return show_refusal(refusal, window, cx);
+                }
+                linking.link = None;
+                if let Some((view, _)) = &linking.pane {
+                    view.update(cx, |view, cx| {
+                        view.set_phase(LinkPhase::Linking, window, cx)
+                    });
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Hides the link pane. A link not confirmed yet (or ended) goes with
+    /// it; a confirmed one runs on and reports how it went.
+    fn close_link_pane(&mut self, cx: &mut Context<Self>) {
+        let Some(linking) = &mut self.linking else {
+            return;
+        };
+        if linking.link.is_some() || linking.finished {
+            self.linking = None;
+        } else {
+            linking.pane = None;
+        }
+        cx.notify();
+    }
+
+    fn link_pane(&self) -> Option<&Entity<LinkView>> {
+        self.linking.as_ref()?.pane.as_ref().map(|(view, _)| view)
+    }
+
+    fn rename_device(&mut self, input: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(devices) = self.devices.clone() else {
+            return show_refusal("That needs an account".into(), window, cx);
+        };
+        let (tag, name) = devices::split_rename(input);
+        if name.is_empty() {
+            return show_refusal(":device-name needs a name".into(), window, cx);
+        }
+        let target = match devices.read(cx).resolve(tag.unwrap_or(""), false) {
+            Ok(target) => target,
+            Err(refusal) => return show_refusal(refusal, window, cx),
+        };
+        let name = name.to_string();
+        self.contact_op(
+            window,
+            cx,
+            move |_, cx| devices.read(cx).rename(&target, &name, cx),
+            |(), _, _, _| {},
+        );
+    }
+
+    fn unlink_device(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(devices) = self.devices.clone() else {
+            return show_refusal("That needs an account".into(), window, cx);
+        };
+        let target = match devices.read(cx).resolve(query, true) {
+            Ok(target) => target,
+            Err(refusal) => return show_refusal(refusal, window, cx),
+        };
+        // Names are alike more often than not: the tag says which it is.
+        let title = format!("Unlink {} (#{})?", target.name, target.tag);
+        self.confirm(
+            title,
+            "It loses access to your account, and deletes its data the next \
+             time it connects. To use it again, link it again."
+                .into(),
+            "Unlink",
+            move |this, window, cx| {
+                let (devices, target) = (devices.clone(), target.clone());
+                let name = target.name.clone();
+                this.contact_op(
+                    window,
+                    cx,
+                    move |_, cx| devices.read(cx).unlink(&target, cx),
+                    move |(), _, window, cx| show_info(format!("Unlinked {name}"), window, cx),
+                );
+            },
+            window,
+            cx,
+        );
     }
 
     /// Closes the settings, back to the open chat if there is one.
@@ -419,6 +644,11 @@ impl Workspace {
                     cx,
                 );
             }
+            SettingsEvent::EditDeviceName { tag, name } => {
+                self.prompt(&format!("device-name #{tag} {name}"), window, cx)
+            }
+            SettingsEvent::UnlinkDevice(tag) => self.unlink_device(&format!("#{tag}"), window, cx),
+            SettingsEvent::LinkDevice => self.prompt("link ", window, cx),
             SettingsEvent::Close => self.close_settings(window, cx),
         }
     }
@@ -509,6 +739,10 @@ impl Workspace {
     /// line, prefilled with the command.
     fn add_contact(&mut self, _: &AddContact, window: &mut Window, cx: &mut Context<Self>) {
         self.prompt("contact ", window, cx);
+    }
+
+    fn link_device_prompt(&mut self, _: &LinkDevice, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt("link ", window, cx);
     }
 
     fn new_group(&mut self, _: &NewGroup, window: &mut Window, cx: &mut Context<Self>) {
@@ -674,6 +908,24 @@ impl Workspace {
                 .members
                 .as_ref()
                 .map(|(members, _)| members.read(cx).candidates())
+                .unwrap_or_default(),
+            devices: self
+                .devices
+                .as_ref()
+                .map(|devices| {
+                    devices
+                        .read(cx)
+                        .devices()
+                        .iter()
+                        .filter(|device| !device.this_device)
+                        .map(|device| {
+                            (
+                                format!("#{}", device.tag),
+                                format!("{} #{}", device.name, device.tag),
+                            )
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
         };
         let previous_focus = window.focused(cx);
@@ -869,6 +1121,9 @@ impl Workspace {
                     cx,
                 );
             }
+            Command::Link(code) => self.start_link(&code, window, cx),
+            Command::DeviceName(input) => self.rename_device(&input, window, cx),
+            Command::Unlink(query) => self.unlink_device(&query, window, cx),
             Command::DeleteChat => {
                 let Some(chat) = self.open_group(window, cx) else {
                     return;
@@ -1279,6 +1534,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_command_line))
             .on_action(cx.listener(Self::add_contact))
             .on_action(cx.listener(Self::new_group))
+            .on_action(cx.listener(Self::link_device_prompt))
             .on_action(cx.listener(Self::attach_file))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::invite_to_group))
@@ -1324,7 +1580,10 @@ impl Render for Workspace {
                                     .child(self.chat_list.clone()),
                             )
                             .child(resizable_panel().child(if self.settings_open {
-                                self.settings_view.clone().into_any_element()
+                                match self.link_pane() {
+                                    Some(view) => view.clone().into_any_element(),
+                                    None => self.settings_view.clone().into_any_element(),
+                                }
                             } else {
                                 self.conversation.clone().into_any_element()
                             }))
@@ -1981,6 +2240,90 @@ mod tests {
             // Focus is back where the command was typed.
             assert_eq!(focus(cx), Focus::Messages);
         }
+    }
+
+    #[gpui::test]
+    fn a_link_goes_ahead_only_once_confirmed_and_closing_turns_it_down(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let start = |cx: &mut VisualTestContext| {
+            let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel();
+            let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.show_link(Link::fake(confirm_tx), events_rx, window, cx)
+            });
+            cx.run_until_parked();
+            (confirm_rx, events_tx)
+        };
+        let phase = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .link_pane()
+                    .map(|view| view.read(cx).phase().clone())
+            })
+        };
+        let pane_focused = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let workspace = workspace.read(cx);
+                workspace
+                    .link_pane()
+                    .is_some_and(|view| view.focus_handle(cx).contains_focused(window, cx))
+            })
+        };
+        let asking =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| window.has_active_dialog(cx));
+
+        // Shown in place of the settings, focused.
+        let (mut confirm_rx, events) = start(cx);
+        assert_eq!(phase(cx), Some(LinkPhase::Connecting));
+        assert!(pane_focused(cx));
+        // Escape before confirming: the pane goes and the link is turned
+        // down (the core sees the confirmation dropped).
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(phase(cx), None);
+        assert!(
+            confirm_rx
+                .try_recv()
+                .is_err_and(|err| err == tokio::sync::oneshot::error::TryRecvError::Closed)
+        );
+        drop(events);
+
+        // Asked for, the name field takes focus; Enter asks first.
+        let (mut confirm_rx, events) = start(cx);
+        events.send(LinkEvent::AwaitingConfirmation).unwrap();
+        cx.run_until_parked();
+        assert_eq!(phase(cx), Some(LinkPhase::Confirm));
+        cx.simulate_input("Phone");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(asking(cx));
+        // Not confirmed in the dialog: nothing is sent.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert!(
+            confirm_rx
+                .try_recv()
+                .is_err_and(|err| err == tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(confirm_rx.try_recv().as_deref(), Ok("Phone"));
+        assert_eq!(phase(cx), Some(LinkPhase::Linking));
+
+        // Confirmed, closing only hides it: the outcome is told anyway.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(phase(cx), None);
+        let told =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| window.notifications(cx).len());
+        let before = told(cx);
+        events.send(LinkEvent::Linked).unwrap();
+        cx.run_until_parked();
+        assert_eq!(told(cx), before + 1);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.linking.is_none()));
     }
 
     #[gpui::test]

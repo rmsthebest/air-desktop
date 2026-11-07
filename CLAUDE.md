@@ -117,6 +117,21 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     setting) decides what is shown and the suppression reported to the
     user's other devices (re-reported when it changes). The workspace
     reports attention on chat open/close and window activation.
+  - `devices.rs`: port of upstream `LinkedDevicesCubit` + `multi_device.rs`.
+    `Devices` entity: one row per self-group member, named from the synced
+    `LinkedDevicesSetting` (bounded lines), reloaded on that setting or the
+    self chat; `#tag` is a client-id prefix grown until unique (names are
+    often alike). Rename any device, unlink any other (confirmed with name
+    and tag; not revocation: it deletes its own data once it processes the
+    removal). Linking from this device (`:link <code>`, `Session::link_device`)
+    runs detached; dropping the `Link` before `confirm` turns it down, after
+    it the core finishes or undoes it. Linking this device at onboarding
+    (`provision`) is cancelled through its token, never aborted: the core
+    deletes the half-made database. The QR code carries upstream's
+    `air://<domain>/multiDeviceLinkingCode?code=…` URL. `unlinked` watches
+    the own user for the core's unlink reason; the app root then drops the
+    workspace, closes and deletes this client's database (as upstream's
+    `deleteCurrentDatabase`) and shows onboarding with a notice.
 - `src/notifier.rs` — shows alerts via `org.freedesktop.Notifications`
   (zbus 5 on async-io, gpui's own copy). Replaces a chat's notification
   instead of stacking, closes it on dismissal, escapes bodies when the
@@ -176,11 +191,19 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   text input (they'd steal typing): use `ChatList`/`MessageList`, or
   `Workspace && helix && !Input`.
 - `src/settings.rs` — `<config>/settings.json` (`SettingsStore` global).
+- `src/ui/link_view.rs` — linking a new device from this one, shown in place
+  of the settings rows; the workspace runs the link and asks before
+  confirming (full account access). Hiding the settings turns an
+  unconfirmed link down; a confirmed one reports its outcome as a toast.
+  Onboarding's link mode (`secondary-l`, Escape back) shows the code
+  (`ui/qr.rs`, dark on white with a quiet zone).
 - `src/ui/settings_view.rs` — the settings screen (`OpenSettings`,
   `ctrl-,` / `space s`), shown in place of the conversation. A list of
   rows: up/down (j/k) pick, left/right (h/l, enter) step a choice; it
   only emits `SettingsEvent`s, which the workspace carries out the way
-  the matching command does. Text (display name, a new username) is
+  the matching command does. Delete removes the selected username or
+  unlinks the selected device; enter on a device prefills
+  `:device-name #<tag> <name>`. Text (display name, a new username) is
   typed on the command line, prefilled (`:name`, `:username`); removing
   a username is confirmed. Themes step within their mode and keep the
   appearance (`theme::set_theme`). Opening a chat or focusing the
@@ -218,7 +241,8 @@ From an Air checkout:
    (the local server requires them).
 Clients use domain `localhost`. E2E: `AIR_E2E_CODE=<code> cargo test e2e_sign_up --
 --ignored`, and the two-user test with `AIR_E2E_CODES=<code>,<code> cargo test
-e2e_two -- --ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
+e2e_two -- --ignored`; linked devices with `AIR_E2E_CODES=<code>,<code> cargo test e2e_linked --
+--ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
 `AIR_DESKTOP_DATA_DIR=<dir> cargo run`. E2E tests use `flavor = "multi_thread"`: the
 core calls `block_in_place`.
 

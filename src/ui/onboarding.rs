@@ -1,7 +1,11 @@
-//! First-run sign-up: server, display name and (when the server asks for
-//! one) an invitation code. One screen, keyboard first: Tab moves between
-//! fields, Enter in any field signs up.
+//! First run: sign up (server, display name and, when the server asks for
+//! one, an invitation code), or link this device into an existing account
+//! (`secondary-l`): it shows a code, as a QR code and as digits, that a
+//! device already in the account enters. Keyboard first: Tab moves between
+//! fields, Enter signs up or (in the server field, linking) asks for a code
+//! there; Escape leaves linking.
 
+use std::rc::Rc;
 use std::time::Duration;
 
 use aircoreclient::clients::CoreUser;
@@ -15,8 +19,11 @@ use gpui_kit::{
     Window, div, px,
 };
 
+use crate::actions::{CancelLink, LinkExistingAccount};
 use crate::runtime::Tokio;
 use crate::session::account::{self, SignUp, SignUpError};
+use crate::session::devices::{self, Provision, ProvisionEvent};
+use crate::ui::qr::{QrModules, qr_code};
 
 /// How long typing in the server field settles before the server is asked
 /// what sign-up needs. As upstream.
@@ -25,11 +32,32 @@ const DOMAIN_SETTLE: Duration = Duration::from_millis(500);
 const DEFAULT_DOMAIN: &str = "air.ms";
 
 pub enum OnboardingEvent {
+    /// Signed up, or linked into an existing account.
     SignedUp(CoreUser),
+}
+
+/// Where linking this device stands.
+enum Linking {
+    /// Waiting for the user to pick the server (or after a failure).
+    Idle,
+    Connecting,
+    /// Showing a code; an unanswered one is replaced after a minute.
+    Code {
+        code: SharedString,
+        qr: Option<Rc<QrModules>>,
+    },
+    /// The other device answered; the user confirms there.
+    Answered,
 }
 
 pub struct Onboarding {
     db_path: String,
+    /// Why the user is here again (the last account was unlinked).
+    notice: Option<SharedString>,
+    /// `Some` while linking to an existing account instead of signing up.
+    linking: Option<Linking>,
+    /// The link in progress; dropping it cancels the link.
+    provision: Option<(Provision, Task<()>)>,
     domain: Entity<InputState>,
     display_name: Entity<InputState>,
     code: Entity<InputState>,
@@ -52,7 +80,12 @@ impl Focusable for Onboarding {
 }
 
 impl Onboarding {
-    pub fn new(db_path: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        db_path: String,
+        notice: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let domain = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(DEFAULT_DOMAIN)
@@ -77,6 +110,9 @@ impl Onboarding {
                 window,
                 |this, _, event: &InputEvent, window, cx| match event {
                     InputEvent::Change => this.domain_changed(cx),
+                    InputEvent::PressEnter { .. } if this.linking.is_some() => {
+                        this.start_linking(window, cx)
+                    }
                     InputEvent::PressEnter { .. } => this.submit(window, cx),
                     _ => {}
                 },
@@ -88,6 +124,9 @@ impl Onboarding {
         // signs up, not merely because the app was opened.
         Self {
             db_path,
+            notice,
+            linking: None,
+            provision: None,
             domain,
             display_name,
             code,
@@ -102,7 +141,86 @@ impl Onboarding {
 
     fn domain_changed(&mut self, cx: &mut Context<Self>) {
         self.error = None;
-        self.lookup_registration_info(cx);
+        if self.linking.is_none() {
+            self.lookup_registration_info(cx);
+        }
+        cx.notify();
+    }
+
+    fn link_existing_account(
+        &mut self,
+        _: &LinkExistingAccount,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy || self.linking.is_some() {
+            return;
+        }
+        self.linking = Some(Linking::Idle);
+        self.info_task = None;
+        self.start_linking(window, cx);
+    }
+
+    /// Asks the server in the server field for a linking code, ending any
+    /// link already in progress (the core deletes what it made).
+    fn start_linking(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.provision = None;
+        self.error = None;
+        let domain = match account::parse_domain(self.domain.read(cx).value().as_ref()) {
+            Ok(domain) => domain,
+            Err(err) => {
+                self.linking = Some(Linking::Idle);
+                return self.fail(err, window, cx);
+            }
+        };
+        self.linking = Some(Linking::Connecting);
+        let (provision, mut events) = devices::provision(self.db_path.clone(), domain.clone(), cx);
+        let receive = cx.spawn_in(window, async move |this, cx| {
+            while let Some(event) = events.recv().await {
+                let done = matches!(event, ProvisionEvent::Linked(_) | ProvisionEvent::Failed);
+                let shown = this.update_in(cx, |this, window, cx| {
+                    this.linking = Some(match event {
+                        ProvisionEvent::Code(code) => Linking::Code {
+                            qr: QrModules::encode(&devices::linking_url(&domain, &code))
+                                .map(Rc::new),
+                            code: devices::spaced(&code).into(),
+                        },
+                        ProvisionEvent::Linking => Linking::Answered,
+                        ProvisionEvent::Linked(user) => {
+                            this.provision = None;
+                            cx.emit(OnboardingEvent::SignedUp(user));
+                            Linking::Answered
+                        }
+                        ProvisionEvent::Failed => {
+                            this.provision = None;
+                            this.error = Some(
+                                "Linking failed. Check the server and your connection, \
+                                 then press Enter to try again."
+                                    .into(),
+                            );
+                            this.domain.focus_handle(cx).focus(window, cx);
+                            Linking::Idle
+                        }
+                    });
+                    cx.notify();
+                });
+                if done || shown.is_err() {
+                    return;
+                }
+            }
+        });
+        self.provision = Some((provision, receive));
+        cx.notify();
+    }
+
+    /// Back to signing up, cancelling any link in progress.
+    fn cancel_link(&mut self, _: &CancelLink, window: &mut Window, cx: &mut Context<Self>) {
+        if self.linking.take().is_none() {
+            return;
+        }
+        self.provision = None;
+        self.error = None;
+        self.display_name.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
@@ -131,7 +249,7 @@ impl Onboarding {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy || self.linking.is_some() {
             return;
         }
         let sign_up = SignUp {
@@ -194,6 +312,69 @@ impl Onboarding {
     pub fn shows_code(&self) -> bool {
         self.show_code
     }
+
+    fn render_linking(&self, linking: &Linking, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let muted = |text: &'static str| {
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(text)
+        };
+        let body: AnyElement = match linking {
+            Linking::Idle => {
+                muted("Enter the account's server, then press Enter for a code.").into_any_element()
+            }
+            Linking::Connecting => muted("Asking the server for a code…").into_any_element(),
+            Linking::Code { code, qr } => v_flex()
+                .gap_3()
+                .items_center()
+                .child(div().text_sm().text_color(theme.muted_foreground).child(
+                    "On a device already in your account, open Air, go to \
+                             Devices and choose Link a device. Scan this code, or \
+                             enter the digits.",
+                ))
+                .when_some(qr.clone(), |column, qr| column.child(qr_code(qr, px(232.))))
+                .child(
+                    div()
+                        .text_2xl()
+                        .font_family("monospace")
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(code.clone()),
+                )
+                .child(muted("A new code appears every minute until one is used."))
+                .into_any_element(),
+            Linking::Answered => muted("Confirm on your other device. Linking…").into_any_element(),
+        };
+        v_flex()
+            .gap_4()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Link to an existing account"),
+                    )
+                    .child(muted("Use this device with an account you already have.")),
+            )
+            .child(field("Server", &self.domain, cx))
+            .child(body)
+            .when_some(self.error.clone(), |card, error| {
+                card.child(div().text_sm().text_color(theme.danger).child(error))
+            })
+            .child(
+                Button::new("back-to-sign-up")
+                    .label("Back to sign-up (Esc)")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.cancel_link(&CancelLink, window, cx)
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
 fn field(label: &'static str, input: &Entity<InputState>, cx: &gpui::App) -> AnyElement {
@@ -212,9 +393,15 @@ fn field(label: &'static str, input: &Entity<InputState>, cx: &gpui::App) -> Any
 
 impl Render for Onboarding {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = match &self.linking {
+            Some(linking) => self.render_linking(linking, cx),
+            None => self.render_sign_up(cx),
+        };
         let theme = cx.theme();
         let card = v_flex()
             .key_context("Onboarding")
+            .on_action(cx.listener(Self::link_existing_account))
+            .on_action(cx.listener(Self::cancel_link))
             .w(px(420.))
             .gap_4()
             .p_8()
@@ -223,6 +410,25 @@ impl Render for Onboarding {
             .border_color(theme.border)
             .bg(theme.popover)
             .shadow_lg()
+            .when_some(self.notice.clone(), |card, notice| {
+                card.child(div().text_sm().text_color(theme.warning).child(notice))
+            })
+            .child(content);
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme.background)
+            .child(card)
+    }
+}
+
+impl Onboarding {
+    fn render_sign_up(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        v_flex()
+            .gap_4()
             .child(
                 v_flex()
                     .gap_1()
@@ -258,14 +464,16 @@ impl Render for Onboarding {
                     .loading(self.busy)
                     .disabled(self.busy)
                     .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-            );
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme.background)
-            .child(card)
+            )
+            .child(
+                Button::new("link-existing")
+                    .label("Link to an existing account (Ctrl+L)")
+                    .disabled(self.busy)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.link_existing_account(&LinkExistingAccount, window, cx)
+                    })),
+            )
+            .into_any_element()
     }
 }
 
@@ -280,9 +488,11 @@ mod tests {
         let (window, onboarding) = cx.update(|cx| {
             gpui_kit::init(cx);
             crate::runtime::init(cx).unwrap();
+            crate::settings::SettingsStore::init(None, Default::default(), cx);
+            assert_eq!(crate::keymap::load(None, cx), Vec::<String>::new());
             // Nothing is looked up until the server field is edited.
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
-                cx.new(|cx| Onboarding::new(String::new(), window, cx))
+                cx.new(|cx| Onboarding::new(String::new(), None, window, cx))
             })
             .unwrap()
         });
@@ -345,6 +555,36 @@ mod tests {
         assert!(focused(|this| &this.domain, cx));
         // Typing a new name doesn't hide the code field again.
         assert!(onboarding.read_with(cx, |this, _| this.shows_code()));
+    }
+
+    #[gpui::test]
+    fn linking_is_entered_and_left_by_keyboard(cx: &mut TestAppContext) {
+        let (onboarding, cx) = setup(cx);
+        let linking =
+            |cx: &mut VisualTestContext| onboarding.read_with(cx, |this, _| this.linking.is_some());
+        // A server that can't be one: asked for nothing, focus goes there.
+        cx.simulate_keystrokes(&format!("tab {MOD}-a"));
+        cx.simulate_input("not a server!");
+        cx.simulate_keystrokes(&format!("shift-tab {MOD}-l"));
+        assert!(linking(cx));
+        assert_eq!(
+            error(&onboarding, cx),
+            Some(SignUpError::InvalidDomain.to_string())
+        );
+        assert!(cx.update(|window, cx| {
+            onboarding
+                .read(cx)
+                .domain
+                .focus_handle(cx)
+                .is_focused(window)
+        }));
+        assert!(onboarding.read_with(cx, |this, _| this.provision.is_none()));
+        // Enter there retries linking, never signs up.
+        cx.simulate_keystrokes("enter");
+        assert!(linking(cx) && !onboarding.read_with(cx, |this, _| this.busy));
+        cx.simulate_keystrokes("escape");
+        assert!(!linking(cx));
+        assert_eq!(error(&onboarding, cx), None);
     }
 
     const MOD: &str = if cfg!(target_os = "macos") {

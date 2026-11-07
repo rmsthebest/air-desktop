@@ -8,6 +8,7 @@ mod attachments;
 pub mod chats;
 pub mod composer;
 mod contacts;
+pub mod devices;
 #[cfg(test)]
 mod e2e;
 pub mod groups;
@@ -65,6 +66,14 @@ pub enum SessionEvent {
 /// window.
 pub struct OpenFromAlert(pub ChatId);
 
+/// This device may no longer use the account: it must delete its data
+/// (see [`devices::tear_down`]) and start over.
+pub struct Unlinked {
+    /// The account itself is gone (deleted from this or another device),
+    /// rather than only this device unlinked.
+    pub account_deleted: bool,
+}
+
 /// Clicks waiting for the UI. A handful at most: the user clicks one
 /// notification at a time.
 const CLICKS_BUFFER: usize = 8;
@@ -94,11 +103,12 @@ pub struct Session {
     _drafts: TokioTask<()>,
     _forward: TokioTask<()>,
     _downloads: TokioTask<()>,
-    _receive: [Task<()>; 4],
+    _receive: [Task<()>; 5],
 }
 
 impl EventEmitter<SessionEvent> for Session {}
 impl EventEmitter<OpenFromAlert> for Session {}
+impl EventEmitter<Unlinked> for Session {}
 
 impl Session {
     pub fn start(user: CoreUser, cx: &mut App) -> Entity<Self> {
@@ -188,7 +198,17 @@ impl Session {
                 }),
             );
 
+            // Subscribed now, so a removal processed meanwhile isn't missed.
+            let unlinked =
+                Tokio::spawn(cx, devices::unlinked(user.clone(), user.db_notifications()));
+
             let receive = [
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Some(reason)) = unlinked.await {
+                        let account_deleted = reason == aircoreclient::UnlinkReason::AccountDeleted;
+                        _ = this.update(cx, |_, cx| cx.emit(Unlinked { account_deleted }));
+                    }
+                }),
                 cx.spawn(async move |this, cx| {
                     receive_changes(this, changes_rx, overflowed, cx).await
                 }),

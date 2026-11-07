@@ -60,7 +60,21 @@
       "l": "air::SettingNext",
       "h": "air::SettingPrev",
       "enter": "air::SettingNext",
+      "delete": "air::SettingRemove",
       "escape": "air::CloseSettings"
+    }
+  },
+  {
+    "context": "LinkDevice",
+    "bindings": {
+      "escape": "air::CancelLink"
+    }
+  },
+  {
+    "context": "Onboarding",
+    "bindings": {
+      "secondary-l": "air::LinkExistingAccount",
+      "escape": "air::CancelLink"
     }
   },
   {

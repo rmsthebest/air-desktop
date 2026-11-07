@@ -13,7 +13,7 @@ use gpui_kit::{
 
 use crate::paths;
 use crate::runtime::Tokio;
-use crate::session::{Session, account};
+use crate::session::{Session, Unlinked, account, devices};
 use crate::settings::{Appearance, SettingsStore};
 use crate::theme;
 use crate::ui::Workspace;
@@ -25,12 +25,19 @@ enum Screen {
         view: Entity<Onboarding>,
         _subscription: Subscription,
     },
-    Ready(Entity<Workspace>),
+    Ready {
+        workspace: Entity<Workspace>,
+        _unlinked: Subscription,
+    },
+    /// Deleting the data of an account this device may no longer use.
+    TearingDown,
     Failed(SharedString),
 }
 
 pub struct AppRoot {
     data_dir: PathBuf,
+    /// The core's `db_path` (the data dir), once prepared.
+    db_path: String,
     screen: Screen,
     _subscriptions: Vec<Subscription>,
 }
@@ -45,6 +52,7 @@ impl AppRoot {
         })];
         let mut this = Self {
             data_dir: data_dir.clone().unwrap_or_default(),
+            db_path: String::new(),
             screen: Screen::Loading,
             _subscriptions: subscriptions,
         };
@@ -52,7 +60,10 @@ impl AppRoot {
             .ok_or_else(|| "No data directory: is $HOME set?".to_string())
             .and_then(|dir| prepare_data_dir(&dir))
         {
-            Ok(db_path) => this.load(db_path, window, cx),
+            Ok(db_path) => {
+                this.db_path = db_path.clone();
+                this.load(db_path, window, cx)
+            }
             Err(err) => this.screen = Screen::Failed(err.into()),
         }
         this
@@ -67,7 +78,7 @@ impl AppRoot {
                 this.restrict_files();
                 match result {
                     Ok(Some(user)) => this.start(user, window, cx),
-                    Ok(None) => this.onboard(db_path, window, cx),
+                    Ok(None) => this.onboard(db_path, None, window, cx),
                     Err(err) => {
                         tracing::error!("failed to load account: {err:#}");
                         this.screen =
@@ -80,8 +91,14 @@ impl AppRoot {
         .detach();
     }
 
-    fn onboard(&mut self, db_path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let onboarding = cx.new(|cx| Onboarding::new(db_path, window, cx));
+    fn onboard(
+        &mut self,
+        db_path: String,
+        notice: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let onboarding = cx.new(|cx| Onboarding::new(db_path, notice, window, cx));
         let subscription =
             cx.subscribe_in(
                 &onboarding,
@@ -100,10 +117,52 @@ impl AppRoot {
     fn start(&mut self, user: CoreUser, window: &mut Window, cx: &mut Context<Self>) {
         // Sign-up created the account's databases with the umask.
         self.restrict_files();
-        let session = Session::start(user, cx);
+        let session = Session::start(user.clone(), cx);
+        let unlinked = cx.subscribe_in(&session, window, move |this, _, event, window, cx| {
+            this.tear_down(user.clone(), event, window, cx)
+        });
         let workspace = cx.new(|cx| Workspace::new(Some(session), window, cx));
-        self.screen = Screen::Ready(workspace);
+        self.screen = Screen::Ready {
+            workspace,
+            _unlinked: unlinked,
+        };
         cx.notify();
+    }
+
+    /// Drops the account (the workspace and session go, stopping their
+    /// work), deletes its data and starts over, saying why. As upstream,
+    /// a failed deletion still signs out: staying in an account the user
+    /// took this device out of is worse than data left behind (the next
+    /// start finds it unlinked again and retries).
+    fn tear_down(
+        &mut self,
+        user: CoreUser,
+        event: &Unlinked,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.screen, Screen::Ready { .. }) {
+            return;
+        }
+        let notice: SharedString = if event.account_deleted {
+            "Your Air account was deleted. This device has been reset.".into()
+        } else {
+            "This device was unlinked from your account, and its data deleted.".into()
+        };
+        self.screen = Screen::TearingDown;
+        cx.notify();
+        let db_path = self.db_path.clone();
+        let task = Tokio::spawn(cx, devices::tear_down(user, db_path.clone()));
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(err) = task.await.and_then(|done| done) {
+                tracing::error!("failed to delete the unlinked account's data: {err:#}");
+            }
+            _ = this.update_in(cx, |this, window, cx| {
+                this.onboard(db_path, Some(notice), window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
@@ -149,7 +208,15 @@ impl Render for AppRoot {
                 .child("Opening your account…")
                 .into_any_element(),
             Screen::Onboarding { view, .. } => view.clone().into_any_element(),
-            Screen::Ready(workspace) => workspace.clone().into_any_element(),
+            Screen::Ready { workspace, .. } => workspace.clone().into_any_element(),
+            Screen::TearingDown => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme.muted_foreground)
+                .child("Removing this device's data…")
+                .into_any_element(),
             Screen::Failed(message) => v_flex()
                 .size_full()
                 .items_center()

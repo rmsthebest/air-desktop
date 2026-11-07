@@ -42,6 +42,33 @@ pub struct Member {
     pub tag: SharedString,
 }
 
+/// One of the user's devices (a leaf of their self group).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Device {
+    /// One bounded line. The user's devices name each other, so names are
+    /// often alike (two "Linux"): the tag tells them apart.
+    pub name: SharedString,
+    /// What the device runs on, as it said when linked ("" if unknown).
+    pub platform: SharedString,
+    pub linked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub this_device: bool,
+    /// Unique among the devices, a prefix of the client id:
+    /// `:device-name #<tag> …`, `:unlink #<tag>`.
+    pub tag: SharedString,
+}
+
+/// The fewest leading characters, from `min` up, that tell `ids` apart
+/// (all of them if nothing shorter does).
+pub fn unique_prefix_len(ids: &[String], min: usize) -> usize {
+    let longest = ids.iter().map(String::len).max().unwrap_or(0);
+    let unique = |len: usize| {
+        let prefixes: std::collections::HashSet<_> =
+            ids.iter().map(|id| &id[..len.min(id.len())]).collect();
+        prefixes.len() == ids.len()
+    };
+    (min..longest).find(|&len| unique(len)).unwrap_or(longest)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatSummary {
     pub id: ChatId,

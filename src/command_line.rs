@@ -38,6 +38,12 @@ pub enum Command {
     Attach(String),
     /// Change the user's display name.
     DisplayName(String),
+    /// Link the new device that shows this code (as typed).
+    Link(String),
+    /// Rename a device: `[#tag] <name>`, as typed (no tag: this device).
+    DeviceName(String),
+    /// Unlink a device, by `#tag` or name as typed (after confirming).
+    Unlink(String),
 }
 
 /// What arguments complete from.
@@ -50,6 +56,8 @@ pub struct Candidates {
     /// The open group's members other than the user: what to insert, and
     /// what to show (and match) for it.
     pub members: Vec<(String, String)>,
+    /// The user's other devices: their `#tag` to insert, and what to show.
+    pub devices: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -62,6 +70,8 @@ enum Arg {
     Notifications,
     Contact,
     Member,
+    /// One of the user's other devices.
+    Device,
     /// Free text, not completed (e.g. a username).
     Text,
 }
@@ -174,6 +184,21 @@ const SPECS: &[Spec] = &[
         help: "Remove one of your usernames",
     },
     Spec {
+        names: &["link"],
+        arg: Arg::Text,
+        help: "Link a new device: the code it shows",
+    },
+    Spec {
+        names: &["device-name"],
+        arg: Arg::Text,
+        help: "Rename this device, or another: #tag name",
+    },
+    Spec {
+        names: &["unlink"],
+        arg: Arg::Device,
+        help: "Unlink one of your other devices",
+    },
+    Spec {
         names: &["help", "shortcuts"],
         arg: Arg::None,
         help: "Show keyboard shortcuts",
@@ -237,6 +262,9 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "delete-chat" => Command::DeleteChat,
         "attach" => Command::Attach(need("a file path")?),
         "name" => Command::DisplayName(need("a name")?),
+        "link" => Command::Link(need("the code the new device shows")?),
+        "device-name" => Command::DeviceName(need("a name")?),
+        "unlink" => Command::Unlink(need("a device")?),
         other => unreachable!("spec {other} has no parser"),
     })
 }
@@ -260,9 +288,13 @@ pub fn complete(input: &str, candidates: &Candidates) -> Vec<(String, String)> {
     let candidates: Vec<String> = match spec.arg {
         Arg::None | Arg::Text => return Vec::new(),
         // Matched on what is shown, which names the member.
-        Arg::Member => {
-            return candidates
-                .members
+        Arg::Member | Arg::Device => {
+            let named = if spec.arg == Arg::Member {
+                &candidates.members
+            } else {
+                &candidates.devices
+            };
+            return named
                 .iter()
                 .filter(|(_, shown)| normalize(shown).contains(&arg))
                 .map(|(insert, shown)| (format!("{name} {insert}"), shown.clone()))
@@ -391,6 +423,7 @@ mod tests {
             themes: vec!["Air Dark".to_string(), "Air Light".to_string()],
             contacts: vec!["Grace Hopper".to_string()],
             members: vec![("#1a2b3c4d".to_string(), "Alan Turing #1a2b3c4d".to_string())],
+            devices: vec![("#9f00".to_string(), "Phone #9f00".to_string())],
             ..Candidates::default()
         };
         let first = |input| -> Vec<String> {
@@ -405,6 +438,10 @@ mod tests {
         assert_eq!(first(":invite gr"), ["invite Grace Hopper"]);
         assert_eq!(first(":kick al"), ["kick #1a2b3c4d"]);
         assert!(first(":kick gr").is_empty());
+        // Devices complete to their tag, matched on name or tag.
+        assert_eq!(first(":unlink ph"), ["unlink #9f00"]);
+        assert_eq!(first(":unlink 9f"), ["unlink #9f00"]);
+        assert!(first(":unlink al").is_empty());
         assert!(first(":q x").is_empty());
         assert!(first(":nope x").is_empty());
     }
@@ -418,7 +455,12 @@ mod tests {
                     Arg::Appearance => format!("{name} dark"),
                     Arg::Keymap => format!("{name} helix"),
                     Arg::Notifications => format!("{name} private"),
-                    Arg::Theme | Arg::Chat | Arg::Contact | Arg::Member | Arg::Text => {
+                    Arg::Theme
+                    | Arg::Chat
+                    | Arg::Contact
+                    | Arg::Member
+                    | Arg::Device
+                    | Arg::Text => {
                         format!("{name} x")
                     }
                 };

@@ -60,6 +60,10 @@ gpui_kit::actions!(
         ClearCursor,
         CommandComplete,
         CommandCancel,
+        SettingRemove,
+        LinkDevice,
+        LinkExistingAccount,
+        CancelLink,
     ]
 );
 
@@ -113,6 +117,7 @@ pub fn commands() -> Vec<Command> {
         cmd("Invite to the open group", InviteToGroup, "Workspace"),
         cmd("Attach a file", AttachFile, "Workspace"),
         cmd("Settings", OpenSettings, "Workspace"),
+        cmd("Link a device", LinkDevice, "Workspace"),
         cmd("Accept contact request", AcceptRequest, "Workspace"),
         cmd("Decline contact request", DeclineRequest, "Workspace"),
         cmd("Toggle details pane", ToggleDetails, "Workspace"),
@@ -173,6 +178,10 @@ pub fn label(action: &dyn Action) -> String {
         "CloseSettings" => "close settings",
         "SettingNext" => "next value",
         "SettingPrev" => "previous value",
+        "SettingRemove" => "remove or unlink",
+        "LinkDevice" => "link a device",
+        "LinkExistingAccount" => "link to an existing account",
+        "CancelLink" => "cancel linking",
         "AddContact" => "add contact",
         "NewGroup" => "new group",
         "InviteToGroup" => "invite to group",

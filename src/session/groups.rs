@@ -346,7 +346,7 @@ impl Members {
 /// The tag in `query`, if all of it is one: `#` and hex digits. Only then
 /// is it read as a tag; anything else is matched against names, so a
 /// (peer-chosen) name can't smuggle in another member's tag.
-fn as_tag(query: &str) -> Option<&str> {
+pub(super) fn as_tag(query: &str) -> Option<&str> {
     let tag = query.trim().strip_prefix('#')?;
     (!tag.is_empty() && tag.chars().all(|c| c.is_ascii_hexdigit())).then_some(tag)
 }
@@ -468,11 +468,7 @@ fn identify(members: &mut [(Member, CoreUserId)]) {
 
 /// The fewest digits, from [`TAG_LEN`] up, that tell `hashes` apart.
 fn tag_len(hashes: &[String]) -> usize {
-    let unique = |len: usize| {
-        let tags: std::collections::HashSet<_> = hashes.iter().map(|hash| &hash[..len]).collect();
-        tags.len() == hashes.len()
-    };
-    (TAG_LEN..64).find(|&len| unique(len)).unwrap_or(64)
+    crate::model::unique_prefix_len(hashes, TAG_LEN)
 }
 
 /// Hex SHA-256 of the user id's wire form (uuid and domain).

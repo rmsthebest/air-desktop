@@ -19,7 +19,7 @@ use super::chats::{self, Update};
 use super::contacts::{self, Failure};
 use super::pending::Pending;
 use super::queue::{self, ConnectionStatus, QueueEvent};
-use super::{attachments, composer, groups, messages};
+use super::{attachments, composer, devices, groups, messages};
 use crate::model::{AttachmentState, Message, MessageBody, MessageStatus, Quote};
 use crate::settings::Notifications;
 use aircoreclient::clients::CoreUser;
@@ -795,6 +795,198 @@ async fn e2e_two_users_connect_by_username_and_talk() {
         .await
         .unwrap();
     while !next(&mut names).await.is_empty() {}
+}
+
+/// Ada links a second device, which then hides alerts from her first for
+/// the chat it shows (re-reported as it changes), is renamed, and is
+/// unlinked, deleting its data.
+/// `AIR_E2E_CODES=XXXXXXXX,YYYYYYYY cargo test e2e_linked -- --ignored`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Air server and AIR_E2E_CODES"]
+async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
+    let codes = std::env::var("AIR_E2E_CODES").expect("set AIR_E2E_CODES to two codes");
+    let [ada_code, bob_code] = codes.split(',').collect::<Vec<_>>()[..] else {
+        panic!("AIR_E2E_CODES takes two comma-separated codes");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ada = new_account(dir.path(), "Ada Lovelace", ada_code).await;
+    let bob = new_account(dir.path(), "Bob", bob_code).await;
+    let (ada_alerts, _, ada_notices) = alerts();
+    let (bob_alerts, _, _) = alerts();
+    let _queues = [
+        listen_queue(&ada, ada_alerts.clone()).await,
+        listen_queue(&bob, bob_alerts).await,
+    ];
+
+    // The new device shows a code; Ada's first device answers it and,
+    // once the new device proved it has it, confirms with a name.
+    let desk_dir = dir.path().join("Ada desk");
+    crate::paths::ensure_private_dir(&desk_dir).unwrap();
+    let handle = tokio::runtime::Handle::current();
+    let (_provision, mut provisioning) = devices::provision_on(
+        &handle,
+        desk_dir.to_str().unwrap().into(),
+        "localhost".parse().unwrap(),
+    );
+    let devices::ProvisionEvent::Code(code) = next(&mut provisioning).await else {
+        panic!("no code first");
+    };
+    // A mistyped code is told, not linked.
+    let wrong = format!("9{code}");
+    let (_wrong, mut wrong_events) = devices::link_on(&handle, ada.clone(), wrong);
+    assert!(matches!(
+        next(&mut wrong_events).await,
+        devices::LinkEvent::Failed(_)
+    ));
+    let (mut link, mut linking) = devices::link_on(&handle, ada.clone(), code);
+    assert_eq!(
+        next(&mut linking).await,
+        devices::LinkEvent::AwaitingConfirmation
+    );
+    link.confirm(" Ada's desk ").unwrap();
+    assert_eq!(next(&mut linking).await, devices::LinkEvent::Linked);
+    let desk = loop {
+        match next(&mut provisioning).await {
+            devices::ProvisionEvent::Linked(user) => break user,
+            devices::ProvisionEvent::Failed => panic!("the new device failed to link"),
+            _ => {}
+        }
+    };
+    assert_eq!(desk.user_id(), ada.user_id());
+    let (desk_alerts, desk_attention, _) = alerts();
+    let _desk_queue = listen_queue(&desk, desk_alerts).await;
+
+    // Both list both devices, named as confirmed, each itself first, with
+    // the same tags.
+    let listed = async |user: &CoreUser| {
+        let devices = devices::load(user.clone()).await.unwrap().devices;
+        devices
+            .into_iter()
+            .map(|(device, _)| {
+                (
+                    device.name.to_string(),
+                    device.tag.to_string(),
+                    device.this_device,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let on_ada = eventually("Ada's device lists the desk", async || {
+        let devices = listed(&ada).await;
+        (devices.len() == 2 && devices[1].0 == "Ada's desk").then_some(devices)
+    })
+    .await;
+    assert!(on_ada[0].2 && !on_ada[1].2);
+    let on_desk = eventually("the desk lists Ada's device", async || {
+        let devices = listed(&desk).await;
+        (devices.len() == 2).then_some(devices)
+    })
+    .await;
+    assert_eq!(on_desk[0], (on_ada[1].0.clone(), on_ada[1].1.clone(), true));
+    assert_eq!(on_desk[1].1, on_ada[0].1);
+
+    // Bob and Ada become contacts.
+    let (names_tx, mut names) = mpsc::unbounded_channel();
+    let _ada_usernames = Aborting(tokio::spawn(contacts::run(
+        ada.clone(),
+        ada_alerts,
+        move |usernames| {
+            let _ = names_tx.send(usernames);
+        },
+    )));
+    assert!(next(&mut names).await.is_empty());
+    let name = format!("ada-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    eventually("Ada gets her username", async || {
+        contacts::add_username(ada.clone(), name.clone()).await.ok()
+    })
+    .await;
+    eventually("Bob sends a request", async || {
+        contacts::add_contact(bob.clone(), name.clone()).await.ok()
+    })
+    .await;
+    let request = eventually("Ada gets the request", async || {
+        for id in ada.ordered_chat_ids().await.unwrap() {
+            if let Some(chat) = ada.chat(&id).await
+                && matches!(chat.chat_type, ChatType::PendingConnection(_))
+            {
+                return Some(id);
+            }
+        }
+        None
+    })
+    .await;
+    let chat = contacts::accept_request(ada.clone(), request)
+        .await
+        .unwrap();
+    let chat = messages::core_chat_id(&chat);
+    let bob_chat = eventually("Bob's request is accepted", async || {
+        for id in bob.ordered_chat_ids().await.unwrap() {
+            if let Some(found) = bob.chat(&id).await
+                && matches!(found.chat_type, ChatType::Connection(_))
+            {
+                return Some(id);
+            }
+        }
+        None
+    })
+    .await;
+    eventually("the desk has the chat", async || desk.chat(&chat).await).await;
+
+    // Bob writes until Ada's first device's next notice for the chat is a
+    // `quiet` one (dismissed, the desk shows it) or not.
+    let sent = std::cell::Cell::new(0);
+    let until_quiet = async |quiet: bool| {
+        eventually("the desk's attention reaches Ada's device", async || {
+            sent.set(sent.get() + 1);
+            let text = format!("message {}", sent.get());
+            let result = composer::send(&bob, bob_chat, text, None).await;
+            assert!(matches!(result, composer::Sent::Ok), "{result:?}");
+            let notice = next_notice(&ada_notices, |n| notice_chat(n) == Some(chat)).await;
+            (matches!(notice, Notice::Dismiss(_)) == quiet).then_some(())
+        })
+        .await
+    };
+    // The desk shows the chat: Ada's other device stays quiet about it.
+    desk_attention.send_replace(Attention {
+        window_active: true,
+        open_chat: Some(chat),
+        content: Notifications::Full,
+    });
+    until_quiet(true).await;
+    // The desk looks away: the change is reported again, and Ada's device
+    // alerts once more.
+    desk_attention.send_replace(Attention {
+        window_active: false,
+        open_chat: Some(chat),
+        content: Notifications::Full,
+    });
+    until_quiet(false).await;
+
+    // Either device renames the other, for both.
+    let desk_id = devices::load(ada.clone()).await.unwrap().devices[1].1;
+    ada.rename_device(desk_id, "Desk".into()).await.unwrap();
+    eventually("the desk learns its new name", async || {
+        (listed(&desk).await[0].0 == "Desk").then_some(())
+    })
+    .await;
+
+    // Unlinked, the desk learns it, and deleting its data leaves no account
+    // to load there.
+    let unlinked = tokio::spawn(devices::unlinked(desk.clone(), desk.db_notifications()));
+    ada.unlink_device(desk_id).await.unwrap();
+    let reason = tokio::time::timeout(Duration::from_secs(30), unlinked)
+        .await
+        .expect("the desk didn't learn it was unlinked")
+        .unwrap();
+    assert_eq!(reason, Some(aircoreclient::UnlinkReason::Unlinked));
+    drop(_desk_queue);
+    let desk_path = desk_dir.to_str().unwrap().to_string();
+    devices::tear_down(desk, desk_path.clone()).await.unwrap();
+    assert!(account::load_default(desk_path).await.unwrap().is_none());
+    eventually("Ada's device lists itself alone", async || {
+        (listed(&ada).await.len() == 1).then_some(())
+    })
+    .await;
 }
 
 async fn new_account(dir: &std::path::Path, name: &str, code: &str) -> CoreUser {

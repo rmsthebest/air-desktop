@@ -29,6 +29,11 @@ const REGISTRATION_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 /// anything. Sign-up resumes it instead, see [`sign_up`].
 pub async fn load_default(db_path: String) -> anyhow::Result<Option<CoreUser>> {
     let mut records = ClientRecord::load_all_from_air_db(&db_path).await?;
+    let known: std::collections::HashSet<Uuid> = records
+        .iter()
+        .map(|record| record.client_record_id)
+        .collect();
+    remove_orphans(std::path::Path::new(&db_path), &known);
     records.retain(|record| record.client_record_state == ClientRecordState::Finished);
     records.sort_unstable_by_key(|record| Reverse((record.is_default, record.created_at)));
     for record in records {
@@ -42,6 +47,40 @@ pub async fn load_default(db_path: String) -> anyhow::Result<Option<CoreUser>> {
         }
     }
     Ok(None)
+}
+
+/// Removes account databases without a record (`<id>.db` and its `-shm` /
+/// `-wal`): what a deletion that failed partway left (the core drops the
+/// record even when a file stays), or a link cut short by a crash. Nothing
+/// can load them, and they hold keys and history. Runs only when an
+/// account is loaded (at startup, after a teardown), never while sign-up or
+/// linking creates one.
+pub fn remove_orphans(dir: &std::path::Path, known: &std::collections::HashSet<Uuid>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(client_db_id) else {
+            continue;
+        };
+        if known.contains(&id) || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        info!("removing the data of a deleted account");
+        if let Err(err) = std::fs::remove_file(entry.path()) {
+            error!("failed to remove a deleted account's data: {err}");
+        }
+    }
+}
+
+/// The account a file of the core's belongs to, if it is a client
+/// database (`<uuid>.db`, `.db-shm` or `.db-wal`).
+fn client_db_id(name: &str) -> Option<Uuid> {
+    let (stem, extension) = name.split_once('.')?;
+    matches!(extension, "db" | "db-shm" | "db-wal")
+        .then(|| Uuid::parse_str(stem).ok())
+        .flatten()
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +283,40 @@ mod tests {
             challenge_required: required,
             accepted_challenges: accepted.to_vec(),
         }
+    }
+
+    #[test]
+    fn only_client_databases_without_a_record_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kept, orphan) = (Uuid::new_v4(), Uuid::new_v4());
+        let files = [
+            format!("{kept}.db"),
+            format!("{kept}.db-wal"),
+            format!("{orphan}.db"),
+            format!("{orphan}.db-shm"),
+            format!("{orphan}.db-wal"),
+            "air.db".into(),
+            format!("{orphan}.txt"),
+            "notes.db".into(),
+        ];
+        for file in &files {
+            std::fs::write(dir.path().join(file), b"").unwrap();
+        }
+        remove_orphans(dir.path(), &[kept].into());
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut expected = vec![
+            format!("{kept}.db"),
+            format!("{kept}.db-wal"),
+            "air.db".into(),
+            format!("{orphan}.txt"),
+            "notes.db".into(),
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
     }
 
     #[test]

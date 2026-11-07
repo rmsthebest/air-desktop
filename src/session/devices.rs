@@ -12,6 +12,7 @@ use aircommon::crypto::mdl::code::{LinkingCode, LinkingCodeError, MIN_CODE_DIGIT
 use aircommon::identifiers::Fqdn;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::clients::multi_device::{MultiDeviceLinkClientError, MultiDeviceProvisionStep};
+use aircoreclient::clients::store::ClientRecord;
 use aircoreclient::db::notification::{DbEntityId, DbNotification};
 use aircoreclient::{ChatId as CoreChatId, LinkedDevicesSetting, UnlinkReason, UserSetting as _};
 use chrono::{TimeZone as _, Utc};
@@ -253,7 +254,9 @@ impl Devices {
                     .collect();
                 if *overflowed || touches.contains(&Touch::Reload) {
                     this.reload(cx);
-                } else if touches.contains(&Touch::Probe) && this.probe.is_none() {
+                } else if touches.contains(&Touch::Probe) {
+                    // Replaces a running lookup: one that started before
+                    // this change could miss the self group it brings.
                     this.probe_self_chat(cx);
                 }
             }
@@ -598,14 +601,37 @@ pub(super) async fn unlinked(
     }
 }
 
+/// How deleting an unlinked account's data went.
+#[derive(Debug, PartialEq)]
+pub enum TornDown {
+    Deleted,
+    /// Some of it failed. The record decides what happens next: kept, the
+    /// account loads again (and fails again); gone, it never loads again,
+    /// and the next start sweeps up the files left (see
+    /// [`super::account::remove_orphans`]).
+    Failed {
+        record_kept: bool,
+    },
+}
+
 /// Deletes this device's account data after it was unlinked: closes the
 /// database (stopping the core's background work), then removes it and its
-/// record, as upstream's `deleteCurrentDatabase`.
-pub async fn tear_down(user: CoreUser, db_path: String) -> anyhow::Result<()> {
+/// record, as upstream's `deleteCurrentDatabase`. The core removes the
+/// record even when removing a file failed.
+pub async fn tear_down(user: CoreUser, db_path: String) -> TornDown {
     let record = user.client_record_id();
     user.close_local_database().await;
     drop(user);
-    aircoreclient::delete_client_database(&db_path, record).await
+    let Err(err) = aircoreclient::delete_client_database(&db_path, record).await else {
+        return TornDown::Deleted;
+    };
+    error!("failed to delete the unlinked account's data: {err:#}");
+    let record_kept = match ClientRecord::load_all_from_air_db(&db_path).await {
+        Ok(records) => records.iter().any(|r| r.client_record_id == record),
+        // Can't tell: assume the worst (don't load again).
+        Err(_) => true,
+    };
+    TornDown::Failed { record_kept }
 }
 
 #[cfg(test)]

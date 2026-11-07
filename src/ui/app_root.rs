@@ -150,9 +150,11 @@ impl AppRoot {
     /// work), deletes its data and starts over, saying why: with another
     /// account left in the data dir if one loads, else onboarding. As
     /// upstream, a failed deletion still signs out: staying in an account
-    /// the user took this device out of is worse than data left behind. It
-    /// goes to onboarding then, never loading again (that would find the
-    /// same account and fail again, in a loop); the next start retries.
+    /// the user took this device out of is worse than data left behind.
+    /// If its record is gone (the core drops it even when a file stays),
+    /// loading again is safe and the next start sweeps the files; if the
+    /// record is kept, loading would find the same account and fail again
+    /// in a loop, so onboarding shows and the next start retries.
     fn tear_down(
         &mut self,
         user: CoreUser,
@@ -176,19 +178,17 @@ impl AppRoot {
         // runtime shuts down); the next start then skips the bare record.
         let task = Tokio::handle(cx).spawn(devices::tear_down(user, db_path.clone()));
         cx.spawn_in(window, async move |this, cx| {
-            let deleted = task
+            let torn_down = task
                 .await
-                .map_err(anyhow::Error::from)
-                .and_then(|done| done);
+                .unwrap_or(devices::TornDown::Failed { record_kept: true });
             _ = this.update_in(cx, |this, window, cx| {
-                match deleted {
-                    // Another account may be left (an earlier deletion
-                    // failed): that one opens; onboarding only if none does.
-                    Ok(()) => this.load(db_path, Some(notice), window, cx),
-                    Err(err) => {
-                        tracing::error!("failed to delete the unlinked account's data: {err:#}");
-                        this.onboard(db_path, Some(notice), window, cx);
+                match torn_down {
+                    devices::TornDown::Failed { record_kept: true } => {
+                        this.onboard(db_path, Some(notice), window, cx)
                     }
+                    // Another account may be left: that one opens;
+                    // onboarding only if none does.
+                    _ => this.load(db_path, Some(notice), window, cx),
                 }
                 cx.notify();
             });

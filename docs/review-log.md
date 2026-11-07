@@ -897,3 +897,24 @@ Fixed:
 
 Still deferred (account seam): a failed teardown landing on onboarding,
 and the notice surviving another account loading.
+
+## Gate 15c — gate 15b fixes (`67ac71f..edc28b6`): PASS
+
+Fixed:
+- **A failed teardown was routed on the wrong guess (medium).** The core
+  deletes the record even when removing a file failed, so "the next start
+  retries" was false: the database (keys, history) stayed with nothing
+  pointing at it, and onboarding showed even with another account left.
+  `tear_down` now says whether the record survived: gone, the app loads
+  again (no loop possible); kept, onboarding as before. Record-less
+  client databases (`<id>.db`, `-shm`, `-wal`) are removed whenever an
+  account is loaded: `only_client_databases_without_a_record_are_removed`.
+  The e2e test checks a linked account has a finished record (so the
+  sweep never takes one) and that a clean teardown reports `Deleted`.
+- **A chat change during a running self-chat lookup was dropped (low).**
+  A new change replaces the lookup, so the latest one always runs, as
+  upstream's per-notification check. Correction to gate 15b's entry: the
+  test covers the classification only, not the lookup and reload.
+
+Still deferred (account seam): routing a failed teardown by its record,
+and a self-chat lookup outrun by the Welcome, in a `#[gpui::test]`.

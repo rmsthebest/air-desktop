@@ -853,6 +853,18 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
         }
     };
     assert_eq!(desk.user_id(), ada.user_id());
+    // A finished record, so the next start loads it (and the sweep of
+    // record-less databases leaves it alone).
+    let desk_path = desk_dir.to_str().unwrap().to_string();
+    let records = ClientRecord::load_all_from_air_db(&desk_path)
+        .await
+        .unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.client_record_id == desk.client_record_id()
+                && record.client_record_state == ClientRecordState::Finished)
+    );
     let (desk_alerts, desk_attention, _) = alerts();
     let _desk_queue = listen_queue(&desk, desk_alerts).await;
 
@@ -980,8 +992,10 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
         .unwrap();
     assert_eq!(reason, Some(aircoreclient::UnlinkReason::Unlinked));
     drop(_desk_queue);
-    let desk_path = desk_dir.to_str().unwrap().to_string();
-    devices::tear_down(desk, desk_path.clone()).await.unwrap();
+    assert_eq!(
+        devices::tear_down(desk, desk_path.clone()).await,
+        devices::TornDown::Deleted
+    );
     assert!(account::load_default(desk_path).await.unwrap().is_none());
     eventually("Ada's device lists itself alone", async || {
         (listed(&ada).await.len() == 1).then_some(())

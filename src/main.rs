@@ -27,6 +27,10 @@ use crate::ui::AppRoot;
 /// Override with `RUST_LOG` when debugging.
 const DEFAULT_LOG_FILTER: &str = "warn,air_desktop=info";
 
+// A release with the `seam` test feature would ship the core in test mode.
+#[cfg(all(feature = "seam", not(debug_assertions)))]
+compile_error!("the `seam` feature is for tests only; build releases without it");
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(

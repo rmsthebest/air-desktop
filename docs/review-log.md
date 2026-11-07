@@ -1377,3 +1377,9 @@ Fixed (low):
   says so next to the feature.
 - `ui::last_told` panics when more than one toast was shown, so a doubled
   one can't hide behind the last; `take_told` counts them.
+
+## Gate 22c — gate 22b fixes (`d1256f9..76ddcf0`): PASS
+
+Fixed (low): a release built with the `seam` feature only refused to
+start; it now fails to compile (`compile_error!` without
+`debug_assertions`), and the startup exit stays for debug builds.

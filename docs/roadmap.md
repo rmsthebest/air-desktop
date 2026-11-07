@@ -44,7 +44,7 @@ pinned rev). Safety and privacy features come first.
     expired contact requests (both synced by the core). Invitation codes.
 18. **Profile pictures** (done). Set your own and show peers' pictures, decoded
     under the same limits as attachments.
-19. **Polish.** Emoji picker and autocomplete, a full-size image viewer,
+19. **Polish** (done). Emoji picker and autocomplete, a full-size image viewer,
     retrying a failed upload, and adding a contact from a group.
 20. **Account seam tests.** A test `CoreUser` for gpui tests, then the
     deferred teardown, probe and routing tests from the review log.

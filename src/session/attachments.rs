@@ -249,11 +249,17 @@ async fn preview(user: &CoreUser, id: AttachmentId, image: bool) -> Option<Pictu
 /// made by another decoder (libwebp), which could read a crafted file
 /// differently.
 pub(crate) fn decode(bytes: &[u8]) -> Option<Picture> {
+    decode_within(bytes, MAX_PREVIEW_EDGE, MAX_DECODE_ALLOC, MAX_KEPT)
+}
+
+/// Decodes a WebP image no larger than `edge` a side (the decoder taking
+/// at most `alloc`), kept at most `kept`.
+fn decode_within(bytes: &[u8], edge: u32, alloc: u64, kept: (u32, u32)) -> Option<Picture> {
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::WebP);
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_PREVIEW_EDGE);
-    limits.max_image_height = Some(MAX_PREVIEW_EDGE);
-    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits.max_image_width = Some(edge);
+    limits.max_image_height = Some(edge);
+    limits.max_alloc = Some(alloc);
     reader.limits(limits);
     let image = match reader.decode() {
         Ok(image) => image,
@@ -262,8 +268,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Picture> {
             return None;
         }
     };
-    let image = if image.width() > MAX_KEPT.0 || image.height() > MAX_KEPT.1 {
-        image.thumbnail(MAX_KEPT.0, MAX_KEPT.1)
+    let image = if image.width() > kept.0 || image.height() > kept.1 {
+        image.thumbnail(kept.0, kept.1)
     } else {
         image
     };
@@ -273,6 +279,52 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Picture> {
     }
     let frame = image::Frame::new(pixels);
     Some(Picture(Arc::new(gpui::RenderImage::new(vec![frame]))))
+}
+
+/// Longest edge of an image the viewer decodes: Air's clients send images
+/// at most 4096 a side.
+const MAX_FULL_EDGE: u32 = 4096;
+
+/// Memory the viewer's decoder may take: 4096² RGBA is 64 MiB.
+const MAX_FULL_ALLOC: u64 = 80 * 1024 * 1024;
+
+/// The largest original the viewer reads.
+const MAX_FULL_BYTES: usize = 32 * 1024 * 1024;
+
+/// The viewer keeps an image at most this large (16 MiB as BGRA).
+pub(crate) const MAX_FULL_KEPT: u32 = 2048;
+
+/// The image of `message` (in `chat`) as large as the viewer shows it:
+/// decoded from the downloaded original, under limits, one at a time.
+pub(super) async fn full_picture(
+    user: CoreUser,
+    chat: ChatId,
+    message: MessageId,
+) -> Result<Picture, Failure> {
+    let id = attachment_in(&user, chat, message).await?;
+    let bytes = match user.load_attachment(id).await? {
+        AttachmentContent::Ready(bytes)
+        | AttachmentContent::Uploading(bytes)
+        | AttachmentContent::UploadFailed(bytes) => bytes,
+        AttachmentContent::Pending | AttachmentContent::Downloading => {
+            return Err(Failure::Shown("Still downloading".into()));
+        }
+        _ => return Err(Failure::Shown("That image isn't on this device".into())),
+    };
+    if bytes.len() > MAX_FULL_BYTES {
+        return Err(Failure::Shown("That image is too large to show".into()));
+    }
+    let decoded = tokio::task::spawn_blocking(move || {
+        decode_within(
+            &bytes,
+            MAX_FULL_EDGE,
+            MAX_FULL_ALLOC,
+            (MAX_FULL_KEPT, MAX_FULL_KEPT),
+        )
+    })
+    .await
+    .map_err(anyhow::Error::from)?;
+    decoded.ok_or_else(|| Failure::Shown("That image can't be shown".into()))
 }
 
 /// The change a finished download is reported as: the attachment
@@ -448,9 +500,48 @@ pub(super) async fn send(user: CoreUser, chat: ChatId, path: PathBuf) -> Result<
         .upload_chat_attachment(chat, &path, MarkChatAsRead::Yes)
         .await?;
     let (_, _progress, task) = started.map_err(|err| Failure::Shown(refused(err)))?;
-    // As upstream: once uploaded, the message is ours to queue for
-    // sending; a failed send ours to mark failed.
-    tokio::spawn(async move {
+    tokio::spawn(finish_upload(user, task, None));
+    Ok(())
+}
+
+/// Sends again the file of `message` (in `chat`), whose upload failed, as
+/// upstream's `retry_upload_attachment`. Resolves once the upload restarts;
+/// it carries on detached, as a first one does.
+pub(super) async fn retry_upload(
+    user: CoreUser,
+    chat: ChatId,
+    message: MessageId,
+) -> Result<(), Failure> {
+    let id = attachment_in(&user, chat, message).await?;
+    // One upload per attachment: a second retry would start it twice.
+    let claim = Claim::take(id).ok_or_else(|| Failure::Shown("Already sending".into()))?;
+    match user.attachment_status(id).await? {
+        Some(AttachmentStatus::UploadFailed) => {}
+        // Uploaded, only not sent yet: the outbound service's recovery
+        // hands it over (as upstream).
+        Some(AttachmentStatus::Ready) => return Ok(()),
+        _ => return Err(Failure::Shown("That file isn't waiting to be sent".into())),
+    }
+    let Some((_progress, task)) = user.retry_upload_chat_attachment(id).await? else {
+        // Nothing to send from: the core removed the message.
+        return Err(Failure::Shown(
+            "That file is no longer here; the message was removed".into(),
+        ));
+    };
+    tokio::spawn(finish_upload(user, task, Some(claim)));
+    Ok(())
+}
+
+/// Hands an upload's message to the outbound service once uploaded, as
+/// upstream; marks it failed if the upload fails. `claim` is held until
+/// then.
+async fn finish_upload(
+    user: CoreUser,
+    task: impl Future<Output = Result<aircoreclient::ChatMessage, UploadTaskError>>,
+    claim: Option<Claim>,
+) {
+    let _claim = claim;
+    {
         let outbound = user.outbound_service();
         match task.await {
             Ok(message) => {
@@ -466,8 +557,7 @@ pub(super) async fn send(user: CoreUser, chat: ChatId, path: PathBuf) -> Result<
                 }
             }
         }
-    });
-    Ok(())
+    }
 }
 
 fn refused(err: ProvisionAttachmentError) -> String {
@@ -661,6 +751,23 @@ mod tests {
             .unwrap();
         assert!(decode(&png).is_none());
         assert!(decode(b"RIFF\0\0\0\0WEBPjunk").is_none());
+    }
+
+    #[test]
+    fn the_viewer_decodes_larger_but_still_bounded() {
+        let full = |bytes: &[u8]| {
+            decode_within(
+                bytes,
+                MAX_FULL_EDGE,
+                MAX_FULL_ALLOC,
+                (MAX_FULL_KEPT, MAX_FULL_KEPT),
+            )
+        };
+        // Past a preview's bounds, within the viewer's: shown, kept smaller.
+        let wide = webp(MAX_FULL_KEPT + 100, 10);
+        assert!(decode(&wide).is_none());
+        assert_eq!(full(&wide).unwrap().size().0, MAX_FULL_KEPT);
+        assert!(full(&webp(MAX_FULL_EDGE + 1, 1)).is_none());
     }
 
     #[test]

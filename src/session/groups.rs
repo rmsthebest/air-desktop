@@ -151,6 +151,33 @@ pub(super) async fn set_picture(
     Ok(user.set_chat_picture(chat, picture).await?)
 }
 
+/// See [`Members::add_contact`].
+pub(super) async fn add_member_contact(
+    user: &CoreUser,
+    chat: CoreChatId,
+    picked: Picked,
+) -> Result<ChatId, Failure> {
+    active_group(user, chat).await?;
+    let name = &picked.name;
+    // The core refuses these too, but only as internal errors.
+    if user.contact(&picked.id).await.is_some() {
+        return Err(Failure::Shown(format!("{name} is already a contact")));
+    }
+    for id in user.ordered_chat_ids().await? {
+        if let Some(found) = user.chat(&id).await
+            && found.chat_type == ChatType::TargetedMessageConnection(picked.id.clone())
+            && !matches!(found.status(), ChatStatus::Inactive(_))
+        {
+            return Err(Failure::Shown(format!(
+                "You already sent {name} a contact request"
+            )));
+        }
+    }
+    // Upstream's post-quantum choice is an experimental switch, off.
+    let opened = user.add_contact_from_group(chat, picked.id, false).await?;
+    Ok(model_id(&opened))
+}
+
 pub(super) async fn leave(user: &CoreUser, chat: CoreChatId) -> Result<(), Failure> {
     active_group(user, chat).await?;
     Ok(user.leave_chat(chat).await?)
@@ -260,11 +287,12 @@ pub(super) async fn invite(
     Ok(name.clone())
 }
 
-/// A member `:kick` resolved, removed once the user confirms.
-pub struct Removal {
+/// A member a command resolved (`:kick`, `:contact-member`), acted on
+/// once the user confirms.
+pub struct Picked {
     pub name: SharedString,
     pub tag: SharedString,
-    id: CoreUserId,
+    pub(super) id: CoreUserId,
 }
 
 /// The members of one group, kept up to date.
@@ -343,12 +371,36 @@ impl Members {
 
     /// Who `query` names, if the user may remove them (see
     /// [`resolve_removal`]): their name, tag and core id.
-    pub fn resolve(&self, query: &str) -> Result<Removal, String> {
+    pub fn resolve(&self, query: &str) -> Result<Picked, String> {
         let ix = self.index(query, resolve_removal)?;
-        Ok(Removal {
+        Ok(Picked {
             name: self.members[ix].name.clone(),
             tag: self.members[ix].tag.clone(),
             id: self.core_ids[ix].clone(),
+        })
+    }
+
+    /// Who `query` names, other than the user (see [`find_member`]).
+    pub fn pick(&self, query: &str) -> Result<Picked, String> {
+        let ix = self.index(query, find_member)?;
+        Ok(Picked {
+            name: self.members[ix].name.clone(),
+            tag: self.members[ix].tag.clone(),
+            id: self.core_ids[ix].clone(),
+        })
+    }
+
+    /// Sends `picked` a contact request through this group, as upstream's
+    /// `add_contact_from_group`. Resolves to the chat it opens (theirs, if
+    /// they had already asked the user).
+    pub fn add_contact(
+        &self,
+        picked: Picked,
+        cx: &App,
+    ) -> impl Future<Output = Result<ChatId, String>> + use<> {
+        let (user, chat) = (self.user.clone(), self.chat);
+        on_tokio(cx, "send the contact request", async move {
+            add_member_contact(&user, chat, picked).await
         })
     }
 
@@ -393,7 +445,7 @@ impl Members {
     /// Removes the member `resolve` found. Resolves to their name.
     pub fn remove(
         &self,
-        removal: Removal,
+        removal: Picked,
         cx: &App,
     ) -> impl Future<Output = Result<SharedString, String>> + use<> {
         let (user, chat) = (self.user.clone(), self.chat);
@@ -659,7 +711,7 @@ mod tests {
         // Sharing the user's name, the peer is still the one named.
         assert_eq!(found("grace").as_deref(), Ok("1a2b3c4d"));
         assert!(found("#00000000").is_err());
-        // Removal permission plays no part in finding.
+        // Picked permission plays no part in finding.
         assert_eq!(found("#1a2b3c4d").as_deref(), Ok("1a2b3c4d"));
     }
 

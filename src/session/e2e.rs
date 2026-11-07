@@ -1359,6 +1359,123 @@ async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
     }
 }
 
+/// A group member sends another a contact request through the group,
+/// who accepts it; a member who is already a contact is refused. Needs
+/// three unused invitation codes:
+/// `AIR_E2E_CODES=A,B,C cargo test e2e_contact_from_group -- --ignored`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Air server and AIR_E2E_CODES"]
+async fn e2e_contact_from_group() {
+    let codes = std::env::var("AIR_E2E_CODES").expect("set AIR_E2E_CODES to three codes");
+    let [ada_code, bob_code, carol_code] = codes.split(',').collect::<Vec<_>>()[..] else {
+        panic!("AIR_E2E_CODES takes three comma-separated codes");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ada = new_account(dir.path(), "Ada Lovelace", ada_code).await;
+    let bob = new_account(dir.path(), "Bob", bob_code).await;
+    let carol = new_account(dir.path(), "Carol", carol_code).await;
+    let (ada_alerts, _, _) = alerts();
+    let (bob_alerts, _, _) = alerts();
+    let (carol_alerts, _, _) = alerts();
+    let _queues = [
+        listen_queue(&ada, ada_alerts.clone()).await,
+        listen_queue(&bob, bob_alerts).await,
+        listen_queue(&carol, carol_alerts).await,
+    ];
+    let _usernames = Aborting(tokio::spawn(contacts::run(ada.clone(), ada_alerts, |_| {})));
+    let ada_name = format!("ada-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    patiently("Ada gets a username", async || {
+        contacts::add_username(ada.clone(), ada_name.clone()).await
+    })
+    .await;
+    // The open request `user` has from `from`, if any yet.
+    let request_from = async |user: &CoreUser, from: &CoreUserId| {
+        for id in user.ordered_chat_ids().await.unwrap() {
+            if let Some(chat) = user.chat(&id).await
+                && chat.chat_type == ChatType::PendingConnection(from.clone())
+            {
+                return Some(id);
+            }
+        }
+        None
+    };
+    // Bob and Carol each ask Ada, who accepts both.
+    for asker in [&bob, &carol] {
+        patiently("a request to Ada", async || {
+            contacts::add_contact(asker.clone(), ada_name.clone()).await
+        })
+        .await;
+        let request = eventually("Ada gets it", async || {
+            request_from(&ada, asker.user_id()).await
+        })
+        .await;
+        patiently("Ada accepts", async || {
+            contacts::accept_request(ada.clone(), request).await
+        })
+        .await;
+    }
+    // Ada makes a group of the three.
+    let group = groups::create(&ada, "Engines").await.unwrap();
+    for invitee in ["Bob", "Carol"] {
+        patiently("an invitation", async || {
+            groups::invite(ada.clone(), group, invitee.into()).await
+        })
+        .await;
+    }
+    let bob_group = eventually("Bob sees both in the group", async || {
+        for id in bob.ordered_chat_ids().await.unwrap() {
+            let chat = bob.chat(&id).await?;
+            if matches!(chat.chat_type, ChatType::Group(_))
+                && !bob.chat_is_self_group(&chat.group_id).await.unwrap()
+                && groups::load(&bob, id, &mut Default::default()).await?.len() == 3
+            {
+                return Some(id);
+            }
+        }
+        None
+    })
+    .await;
+    let member = async |name: &str| {
+        let members = groups::load(&bob, bob_group, &mut Default::default())
+            .await
+            .unwrap();
+        let (member, id) = members
+            .into_iter()
+            .find(|(member, _)| member.name == name)
+            .unwrap();
+        groups::Picked {
+            name: member.name,
+            tag: member.tag,
+            id,
+        }
+    };
+    // Ada is Bob's contact already: refused, told why.
+    let already = groups::add_member_contact(&bob, bob_group, member("Ada Lovelace").await).await;
+    assert!(matches!(already, Err(Failure::Shown(_))), "{already:?}");
+    // Carol isn't: Bob asks her through the group, and she accepts.
+    let bob_chat = patiently("Bob asks Carol", async || {
+        groups::add_member_contact(&bob, bob_group, member("Carol").await).await
+    })
+    .await;
+    let bob_chat = messages::core_chat_id(&bob_chat);
+    // A second request is refused before the core is asked.
+    let again = groups::add_member_contact(&bob, bob_group, member("Carol").await).await;
+    assert!(matches!(again, Err(Failure::Shown(_))), "{again:?}");
+    let request = eventually("Carol gets Bob's request", async || {
+        request_from(&carol, bob.user_id()).await
+    })
+    .await;
+    patiently("Carol accepts", async || {
+        contacts::accept_request(carol.clone(), request).await
+    })
+    .await;
+    eventually("Bob and Carol are contacts", async || {
+        let chat = bob.chat(&bob_chat).await?;
+        matches!(chat.chat_type, ChatType::Connection(_)).then_some(())
+    })
+    .await;
+}
+
 async fn new_account(dir: &std::path::Path, name: &str, code: &str) -> CoreUser {
     let data = dir.join(name);
     crate::paths::ensure_private_dir(&data).unwrap();

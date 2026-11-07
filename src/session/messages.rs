@@ -338,6 +338,37 @@ impl Messages {
         }))
     }
 
+    /// The message's image, as large as the viewer shows it.
+    pub fn full_picture(
+        &self,
+        id: &MessageId,
+        cx: &App,
+    ) -> Option<impl Future<Output = Result<crate::model::Picture, String>> + use<>> {
+        let live = self.live.as_ref()?;
+        let (user, chat, id) = (live.user.clone(), live.chat, core_message_id(id));
+        Some(on_tokio(cx, "show the image", async move {
+            let id = id.ok_or_else(|| Failure::Shown("That message has no file".into()))?;
+            // Local only: a failure never blames the connection.
+            attachments::full_picture(user, chat, id)
+                .await
+                .map_err(|err| err.local("show the image"))
+        }))
+    }
+
+    /// Sends the message's file again after a failed upload.
+    pub fn retry_upload(
+        &self,
+        id: &MessageId,
+        cx: &App,
+    ) -> Option<impl Future<Output = Result<(), String>> + use<>> {
+        let live = self.live.as_ref()?;
+        let (user, chat, id) = (live.user.clone(), live.chat, core_message_id(id));
+        Some(on_tokio(cx, "send the file again", async move {
+            let id = id.ok_or_else(|| Failure::Shown("That message has no file".into()))?;
+            attachments::retry_upload(user, chat, id).await
+        }))
+    }
+
     /// The account and chat behind the window; `None` for fixed messages.
     pub(super) fn live_chat(&self) -> Option<(CoreUser, CoreChatId)> {
         let live = self.live.as_ref()?;

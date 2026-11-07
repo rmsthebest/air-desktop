@@ -84,6 +84,11 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     The self chat is a group in the core but never one here
     (`is_group` false, operations refuse it). Invites need the contact's
     `encrypted_group_profiles` feature, as upstream.
+    `:contact-member <name|#tag>` sends a member a contact request through
+    the group (`add_contact_from_group`, confirmed with name and tag,
+    post-quantum off as upstream's default); an existing contact or an
+    open request of the user's is refused before the core (which refuses
+    them only as internal errors). The new chat opens once listed.
   - `attachments.rs`: port of upstream's `attachments_repository`. The
     session's `download_all` downloads pending attachments (5 at once,
     resumed after restarts) and makes an image's thumbnail in the core,
@@ -103,7 +108,13 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     directory under `model::file_name` (one component, not hidden,
     bounded), never replacing a file (`create_new`, numbered), 0600.
     Save and download-now (`s` on a failed or waiting file) check the
-    message is in the open chat. Sending: `:attach <path>`, the file
+    message is in the open chat. `shift-r` sends the user's failed upload
+    again (`retry_upload`, as upstream: already uploaded is left to the
+    outbound service's recovery; held by the same `IN_FLIGHT` claim; a
+    gone original removes the message). `v` views an image: the
+    downloaded original decoded once more, under larger limits (4096²
+    edge, 80 MiB, 32 MiB file; kept ≤ 2048²), in a dialog whose closing
+    drops the texture. Sending: `:attach <path>`, the file
     dialog (`AttachFile`) or dropping files on the chat (confirmed
     first); several files go one after another.
   - `alerts.rs`: desktop notifications ("alerts"; database notifications
@@ -235,6 +246,12 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   `cargo test desktop_notify_and_close -- --ignored` uses the real server.
 - The local server rate-limits sign-ups: back-to-back e2e runs fail with
   "Rate limited"/"Too Many Requests" at sign-up or the first requests.
+- `src/emoji.rs`, `src/ui/emoji_picker.rs` — emoji by name (`emojis`
+  crate data, GitHub shortcodes). A closed `:shortcode:` in the composer
+  becomes its emoji as typed (only at a word start, so `10:30:` stays);
+  the picker (gpui-component `Command`, like the palette) inserts one
+  (`secondary-;`, palette "Insert emoji") or reacts with any (`/` in the
+  reaction bar).
 - `src/markdown.rs` — bounded message markdown parse (size/depth caps; only
   http/https/mailto become links; images and HTML stay inert text).
   `ui/markdown_view.rs` renders it; links always open through a confirm
@@ -323,7 +340,7 @@ Clients use domain `localhost`. E2E: `AIR_E2E_CODE=<code> cargo test e2e_sign_up
 --ignored` (and `e2e_account`: synced settings, invite codes, account deletion), and the two-user test with `AIR_E2E_CODES=<code>,<code> cargo test
 e2e_two -- --ignored` (also pictures); linked devices with `AIR_E2E_CODES=<code>,<code> cargo test e2e_linked --
 --ignored`; blocking, reporting, retracting and deleting (contacts and messages, edit history, mute) with three codes, `AIR_E2E_CODES=<code>,<code>,<code>
-cargo test e2e_contacts -- --ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
+cargo test e2e_contacts -- --ignored`; a contact request through a group with three codes, `e2e_contact_from_group`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
 `AIR_DESKTOP_DATA_DIR=<dir> cargo run`. E2E tests use `flavor = "multi_thread"`: the
 core calls `block_in_place`.
 

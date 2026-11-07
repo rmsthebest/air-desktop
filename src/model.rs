@@ -673,6 +673,13 @@ impl Message {
         matches!(self.body, MessageBody::Event(_))
     }
 
+    /// The user's file that failed to upload: it can be sent again.
+    pub fn upload_failed(&self) -> bool {
+        self.own
+            && matches!(&self.body, MessageBody::Attachment(attachment)
+                if attachment.state == AttachmentState::UploadFailed)
+    }
+
     /// What deleting it depends on.
     pub fn deletion_facts(&self) -> MessageFacts {
         MessageFacts {
@@ -1290,6 +1297,29 @@ mod tests {
             false,
         );
         Message::text(MessageId("m".into()), sender, "hi", Utc::now())
+    }
+
+    #[test]
+    fn only_the_users_failed_upload_is_sent_again() {
+        let file = |own, state| {
+            let mut message = message("ada", "Ada");
+            message.own = own;
+            message.body = MessageBody::Attachment(Attachment {
+                id: AttachmentId(uuid::Uuid::nil()),
+                name: "f".into(),
+                description: None,
+                size: 1,
+                state,
+                image: None,
+            });
+            message
+        };
+        assert!(file(true, AttachmentState::UploadFailed).upload_failed());
+        // A peer's (whatever it shows), one still uploading, or text: no.
+        assert!(!file(false, AttachmentState::UploadFailed).upload_failed());
+        assert!(!file(true, AttachmentState::Uploading).upload_failed());
+        assert!(!file(true, AttachmentState::DownloadFailed).upload_failed());
+        assert!(!message("ada", "Ada").upload_failed());
     }
 
     #[test]

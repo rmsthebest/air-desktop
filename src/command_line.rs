@@ -29,6 +29,8 @@ pub enum Command {
     Invite(String),
     /// Remove a member from the open group, by name as typed.
     Kick(String),
+    /// Send a member of the open group a contact request (name or #tag).
+    ContactMember(String),
     /// Rename the open group.
     Rename(String),
     Leave,
@@ -177,6 +179,11 @@ const SPECS: &[Spec] = &[
         names: &["kick", "remove"],
         arg: Arg::Member,
         help: "Remove a member from the open group",
+    },
+    Spec {
+        names: &["contact-member"],
+        arg: Arg::Member,
+        help: "Send a member of the open group a contact request",
     },
     Spec {
         names: &["rename"],
@@ -357,6 +364,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "group" => Command::Group(need("a name")?),
         "invite" => Command::Invite(need("a contact")?),
         "kick" => Command::Kick(need("a member")?),
+        "contact-member" => Command::ContactMember(need("a member")?),
         "rename" => Command::Rename(need("a name")?),
         "leave" => Command::Leave,
         "delete-chat" => Command::DeleteChat,

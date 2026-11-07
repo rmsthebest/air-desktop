@@ -3,6 +3,7 @@ mod chat_list;
 mod command_line;
 mod conversation;
 mod details_pane;
+mod emoji_picker;
 mod link_view;
 mod markdown_view;
 mod nav_rail;

@@ -15,10 +15,10 @@ use std::path::PathBuf;
 use crate::actions::{
     self, AcceptRequest, AddContact, AttachFile, BlockContact, DeclineRequest, DeleteChat,
     FindChat, FocusChatList, FocusComposer, FocusConversation, FocusMessages, FocusNextPane,
-    InviteToGroup, JumpBack, JumpForward, LinkDevice, NewGroup, NextChat, NextUnreadChat,
-    OpenChatAt, OpenCommandLine, OpenPalette, OpenSettings, PickTheme, PrevChat, PrevUnreadChat,
-    ReportSpam, RetractRequest, SelectFirst, SelectLast, ShowSafetyCode, ShowShortcuts,
-    ToggleAppearance, ToggleDetails, ToggleHelixMode, ToggleMute, UnblockContact,
+    InsertEmoji, InviteToGroup, JumpBack, JumpForward, LinkDevice, NewGroup, NextChat,
+    NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette, OpenSettings, PickTheme, PrevChat,
+    PrevUnreadChat, ReportSpam, RetractRequest, SelectFirst, SelectLast, ShowSafetyCode,
+    ShowShortcuts, ToggleAppearance, ToggleDetails, ToggleHelixMode, ToggleMute, UnblockContact,
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{
@@ -1241,6 +1241,21 @@ impl Workspace {
         .detach();
     }
 
+    /// Picks an emoji by name and inserts it into the open chat's composer.
+    fn insert_emoji(&mut self, _: &InsertEmoji, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sendable_chat(window, cx).is_none() {
+            return;
+        }
+        let conversation = self.conversation.downgrade();
+        let on_pick: crate::ui::emoji_picker::OnPick =
+            std::rc::Rc::new(move |emoji, window, cx| {
+                _ = conversation.update(cx, |conversation, cx| {
+                    conversation.insert_emoji(emoji, window, cx)
+                });
+            });
+        crate::ui::emoji_picker::open("Insert", on_pick, window, cx);
+    }
+
     /// The open chat, if files and messages can go to it.
     fn sendable_chat(&self, window: &mut Window, cx: &mut App) -> Option<ChatId> {
         let list = self.chat_list.read(cx);
@@ -1522,6 +1537,43 @@ impl Workspace {
                             cx,
                             move |_, cx| members.read(cx).remove(removal, cx),
                             |name, _, window, cx| show_info(format!("Removing {name}"), window, cx),
+                        );
+                    },
+                    window,
+                    cx,
+                );
+            }
+            Command::ContactMember(query) => {
+                if self.open_group(window, cx).is_none() {
+                    return;
+                }
+                let Some((members, _)) = &self.members else {
+                    show_refusal("That needs an account".into(), window, cx);
+                    return;
+                };
+                let members = members.clone();
+                let picked = match members.read(cx).pick(&query) {
+                    Ok(picked) => picked,
+                    Err(refusal) => return show_refusal(refusal, window, cx),
+                };
+                // Names are peer-chosen: the tag shows who it really is.
+                let title = format!("Send {} (#{}) a contact request?", picked.name, picked.tag);
+                let group = self.open_title(cx);
+                let picked = std::cell::RefCell::new(Some(picked));
+                self.confirm(
+                    title,
+                    format!("Through {group}. They can accept or decline it."),
+                    "Send",
+                    move |this, window, cx| {
+                        let Some(picked) = picked.borrow_mut().take() else {
+                            return;
+                        };
+                        let members = members.clone();
+                        this.contact_op(
+                            window,
+                            cx,
+                            move |_, cx| members.read(cx).add_contact(picked, cx),
+                            |chat, this, window, cx| this.open_when_listed(chat, window, cx),
                         );
                     },
                     window,
@@ -2300,6 +2352,7 @@ impl Render for Workspace {
                 this.mute(MuteChange::Toggle, window, cx)
             }))
             .on_action(cx.listener(Self::attach_file))
+            .on_action(cx.listener(Self::insert_emoji))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::invite_to_group))
             .on_action(cx.listener(Self::accept_request))
@@ -2976,6 +3029,60 @@ mod tests {
         run(":remove-group-picture", cx);
         assert!(asking(cx));
         assert_eq!(told(cx), before);
+    }
+
+    #[gpui::test]
+    fn emoji_come_from_shortcodes_and_the_picker(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.simulate_keystrokes("j enter");
+        // A closed shortcode turns into its emoji, and typing goes on
+        // after it.
+        cx.simulate_input("hi :smile:");
+        cx.simulate_input("!");
+        assert_eq!(composer_text(&workspace, cx), "hi 😄!");
+        // Not after a space: left as typed.
+        cx.simulate_input(" 10:30:");
+        assert_eq!(composer_text(&workspace, cx), "hi 😄! 10:30:");
+        // The picker finds one by shortcode and inserts it at the cursor.
+        cx.simulate_keystrokes(&format!("{MOD}-;"));
+        cx.run_until_parked();
+        assert!(cx.update(|w, cx| w.has_active_dialog(cx)));
+        cx.simulate_input("+1");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(!cx.update(|w, cx| w.has_active_dialog(cx)));
+        assert_eq!(composer_text(&workspace, cx), "hi 😄! 10:30:👍");
+        // Back in the composer, typing goes on.
+        cx.simulate_input("x");
+        assert_eq!(composer_text(&workspace, cx), "hi 😄! 10:30:👍x");
+    }
+
+    #[gpui::test]
+    fn retry_and_view_refuse_what_they_cannot_apply_to(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let told = |cx: &mut VisualTestContext| cx.update(|w, cx| w.notifications(cx).len());
+        cx.simulate_keystrokes(&format!("j enter {MOD}-m home"));
+        assert!(cursor(&workspace, cx).is_some());
+        // A text message: nothing to send again, nothing to view.
+        let before = told(cx);
+        cx.simulate_keystrokes("shift-r");
+        cx.run_until_parked();
+        assert_eq!(told(cx), before + 1);
+        cx.simulate_keystrokes("v");
+        cx.run_until_parked();
+        assert_eq!(told(cx), before + 2);
+        assert!(!cx.update(|w, cx| w.has_active_dialog(cx)));
+        // Any emoji as a reaction: `/` from the reaction bar finds it,
+        // and picking it reacts (refused here: mock messages have no
+        // account, which shows the pick reached the reaction).
+        cx.simulate_keystrokes("+ /");
+        cx.run_until_parked();
+        assert!(cx.update(|w, cx| w.has_active_dialog(cx)));
+        cx.simulate_input("+1");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(!cx.update(|w, cx| w.has_active_dialog(cx)));
+        assert_eq!(told(cx), before + 3);
     }
 
     #[gpui::test]

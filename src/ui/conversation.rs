@@ -20,7 +20,7 @@ use gpui::{
 };
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, Position, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, IconName, Selectable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -32,7 +32,8 @@ use crate::actions::{
     AcceptRequest, BlockContact, CancelCompose, ClearCursor, CursorDown, CursorFirst, CursorLast,
     CursorUp, DeclineRequest, DeleteChat, DeleteMessage, DeleteMessageForEveryone, EditLastMessage,
     EditMessage, HalfPageDown, HalfPageUp, OpenLinks, PickReaction, React, ReplyToMessage,
-    RetractRequest, SaveAttachment, ShowMessageDetails, ToggleDetails, UnblockContact, YankMessage,
+    RetractRequest, RetryUpload, SaveAttachment, SearchReaction, ShowMessageDetails, ToggleDetails,
+    UnblockContact, ViewImage, YankMessage,
 };
 use crate::markdown::Block;
 use crate::model::{
@@ -82,7 +83,7 @@ pub struct Conversation {
     _messages_subscription: Option<Subscription>,
     _compose_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
-    /// The message details being loaded; replaced by the next request,
+    /// The message details or image being loaded; replaced by the next request,
     /// dropped (never shown) when the chat changes.
     details: Option<gpui::Task<()>>,
 }
@@ -163,7 +164,19 @@ impl Conversation {
                 |this, composer, event: &InputEvent, window, cx| match event {
                     InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
                     InputEvent::Change => {
-                        let text = composer.read(cx).value().to_string();
+                        let state = composer.read(cx);
+                        let mut text = state.value().to_string();
+                        // A closed `:shortcode:` becomes its emoji as typed.
+                        if let Some((expanded, at)) =
+                            crate::emoji::expand_shortcode(&text, state.cursor())
+                        {
+                            let at = position_of(&expanded, at);
+                            composer.update(cx, |composer, cx| {
+                                composer.replace_all(expanded.clone(), window, cx);
+                                composer.set_cursor_position(at, window, cx);
+                            });
+                            text = expanded;
+                        }
                         if let Some(compose) = &this.compose {
                             compose.update(cx, |compose, cx| compose.typed(text, cx));
                         }
@@ -586,14 +599,55 @@ impl Conversation {
     fn react(&mut self, action: &React, window: &mut Window, cx: &mut Context<Self>) {
         self.reacting = false;
         cx.notify();
-        let (Some(emoji), Some(messages)) = (QUICK_REACTIONS.get(action.index), &self.messages)
-        else {
+        let Some(emoji) = QUICK_REACTIONS.get(action.index) else {
             return;
         };
-        let Some(message) = self.reactable(cx) else {
+        let Some(id) = self.reactable(cx).map(|message| message.id.clone()) else {
             return;
         };
-        let id = message.id.clone();
+        self.toggle_reaction(id, emoji, window, cx);
+    }
+
+    /// Reacts with any emoji, found by name, to the message under the
+    /// cursor (from the reaction bar).
+    fn search_reaction(&mut self, _: &SearchReaction, window: &mut Window, cx: &mut Context<Self>) {
+        self.reacting = false;
+        cx.notify();
+        let Some(id) = self.reactable(cx).map(|message| message.id.clone()) else {
+            return;
+        };
+        let this = cx.weak_entity();
+        let on_pick: crate::ui::emoji_picker::OnPick = Rc::new(move |emoji, window, cx| {
+            _ = this.update(cx, |this, cx| {
+                this.toggle_reaction(id.clone(), emoji, window, cx)
+            });
+        });
+        crate::ui::emoji_picker::open("React", on_pick, window, cx);
+    }
+
+    /// Inserts `emoji` at the composer's cursor and focuses it.
+    pub fn insert_emoji(&mut self, emoji: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.insert(emoji.to_string(), window, cx);
+            composer.focus(window, cx);
+        });
+    }
+
+    /// Adds `emoji` to message `id`, or takes the user's back if given (if
+    /// the message is still in the window).
+    fn toggle_reaction(
+        &mut self,
+        id: crate::model::MessageId,
+        emoji: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(messages) = &self.messages else {
+            return;
+        };
+        let Some(message) = messages.read(cx).messages().iter().find(|m| m.id == id) else {
+            return;
+        };
         let given = crate::model::gave(&message.reactions, emoji);
         let Some(toggle) = messages.read(cx).set_reaction(&id, emoji, !given, cx) else {
             crate::ui::show_refusal("Reactions need an account".into(), window, cx);
@@ -781,6 +835,59 @@ impl Conversation {
                 this.details = None;
                 match history {
                     Ok(history) => show_details(message, history, window, cx),
+                    Err(refusal) => crate::ui::show_refusal(refusal, window, cx),
+                }
+            });
+        }));
+    }
+
+    /// Sends the file under the cursor again, if its upload failed.
+    fn retry_upload(&mut self, _: &RetryUpload, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(message), Some(messages)) = (self.cursor_message(cx), &self.messages) else {
+            return;
+        };
+        if !message.upload_failed() {
+            let refusal = "Only a file that failed to send can be sent again";
+            return crate::ui::show_refusal(refusal.into(), window, cx);
+        }
+        let Some(retry) = messages.read(cx).retry_upload(&message.id, cx) else {
+            return crate::ui::show_refusal("Files need an account".into(), window, cx);
+        };
+        crate::ui::show_info("Sending again".into(), window, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(refusal) = retry.await {
+                _ = cx.update(|window, cx| crate::ui::show_refusal(refusal, window, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Shows the image under the cursor as large as the window allows.
+    fn view_image(&mut self, _: &ViewImage, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(message), Some(messages)) = (self.cursor_message(cx), &self.messages) else {
+            return;
+        };
+        let MessageBody::Attachment(attachment) = &message.body else {
+            return crate::ui::show_refusal("That message has no image".into(), window, cx);
+        };
+        if attachment.image.is_none() {
+            let refusal = if attachment.state.is_local() {
+                "That file isn't an image Air can show"
+            } else {
+                "Download it first: s"
+            };
+            return crate::ui::show_refusal(refusal.into(), window, cx);
+        }
+        let name = attachment.name.clone();
+        let Some(load) = messages.read(cx).full_picture(&message.id, cx) else {
+            return crate::ui::show_refusal("Images need an account".into(), window, cx);
+        };
+        self.details = Some(cx.spawn_in(window, async move |this, cx| {
+            let picture = load.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                this.details = None;
+                match picture {
+                    Ok(picture) => show_image(name, picture, window, cx),
                     Err(refusal) => crate::ui::show_refusal(refusal, window, cx),
                 }
             });
@@ -1226,6 +1333,9 @@ impl Render for Conversation {
                         }),
                     )
                     .on_action(cx.listener(Self::message_details))
+                    .on_action(cx.listener(Self::retry_upload))
+                    .on_action(cx.listener(Self::view_image))
+                    .on_action(cx.listener(Self::search_reaction))
                     .flex_1()
                     .min_h_0()
                     .children(status)
@@ -1427,6 +1537,54 @@ fn full_time(at: chrono::DateTime<chrono::Utc>) -> String {
 /// The message details: who sent it and when, how far it got (the user's
 /// own), and its edit history, newest first. Peer text is rendered as in
 /// the chat (bounded markdown, links confirmed).
+/// The image viewer: the picture fit to the window, its name above.
+/// Closing it drops the picture's texture.
+/// The composer's position (line, character) of byte `offset` in `text`.
+fn position_of(text: &str, offset: usize) -> Position {
+    let before = &text[..offset];
+    let line_start = before.rfind('\n').map_or(0, |ix| ix + 1);
+    Position::new(
+        before.matches('\n').count() as u32,
+        before[line_start..].chars().count() as u32,
+    )
+}
+
+fn show_image(
+    name: SharedString,
+    picture: crate::model::Picture,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let previous_focus = window.focused(cx);
+    let viewport = window.viewport_size();
+    // Room for the dialog's frame and title.
+    let room = (
+        (f32::from(viewport.width) - 96.).max(160.) as u32,
+        (f32::from(viewport.height) - 200.).max(120.) as u32,
+    );
+    let (width, height) = crate::model::fit(picture.size(), room);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let image = picture.clone();
+        let previous_focus = previous_focus.clone();
+        dialog
+            .title(div().truncate().child(name.clone()))
+            .width(px(width as f32 + 48.))
+            .child(
+                h_flex().justify_center().child(
+                    img(ImageSource::Render(picture.0.clone()))
+                        .w(px(width as f32))
+                        .h(px(height as f32)),
+                ),
+            )
+            .on_close(move |_, window, cx| {
+                cx.drop_image(image.0.clone(), Some(window));
+                if let Some(focus) = &previous_focus {
+                    focus.focus(window, cx);
+                }
+            })
+    });
+}
+
 fn show_details(message: Message, history: EditHistory, window: &mut Window, cx: &mut App) {
     let previous_focus = window.focused(cx);
     window.open_alert_dialog(cx, move |alert, _, cx| {

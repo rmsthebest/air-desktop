@@ -8,6 +8,7 @@
     "context": "Workspace",
     "bindings": {
       "secondary-k": "air::OpenPalette",
+      "secondary-;": "air::InsertEmoji",
       "secondary-/": "air::ShowShortcuts",
       "alt-down": "air::NextChat",
       "alt-up": "air::PrevChat",
@@ -97,7 +98,9 @@
       "d": "air::DeleteMessage",
       "delete": "air::DeleteMessage",
       "shift-d": "air::DeleteMessageForEveryone",
-      "i": "air::ShowMessageDetails"
+      "i": "air::ShowMessageDetails",
+      "shift-r": "air::RetryUpload",
+      "v": "air::ViewImage"
     }
   },
   {
@@ -109,6 +112,7 @@
       "4": ["air::React", { "index": 3 }],
       "5": ["air::React", { "index": 4 }],
       "6": ["air::React", { "index": 5 }],
+      "/": "air::SearchReaction",
       "escape": "air::PickReaction"
     }
   },

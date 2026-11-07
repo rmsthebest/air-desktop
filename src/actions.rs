@@ -74,6 +74,10 @@ gpui_kit::actions!(
         DeleteMessageForEveryone,
         ShowMessageDetails,
         ToggleMute,
+        RetryUpload,
+        ViewImage,
+        InsertEmoji,
+        SearchReaction,
     ]
 );
 
@@ -126,6 +130,7 @@ pub fn commands() -> Vec<Command> {
         cmd("New group", NewGroup, "Workspace"),
         cmd("Invite to the open group", InviteToGroup, "Workspace"),
         cmd("Attach a file", AttachFile, "Workspace"),
+        cmd("Insert emoji", InsertEmoji, "Workspace"),
         cmd("Settings", OpenSettings, "Workspace"),
         cmd("Link a device", LinkDevice, "Workspace"),
         cmd("Compare safety code", ShowSafetyCode, "Workspace"),
@@ -214,6 +219,10 @@ pub fn label(action: &dyn Action) -> String {
         "DeleteMessageForEveryone" => "delete message for everyone",
         "ShowMessageDetails" => "message details",
         "ToggleMute" => "mute or unmute",
+        "RetryUpload" => "send file again",
+        "ViewImage" => "view image",
+        "InsertEmoji" => "insert emoji",
+        "SearchReaction" => "search emoji",
         "CancelCompose" => "cancel reply or edit",
         "ClearCursor" => "clear selection",
         "OpenChatAt" => "open chat n",

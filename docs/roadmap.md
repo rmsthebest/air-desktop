@@ -27,3 +27,24 @@ milestones. Each one ends with a review gate (see CLAUDE.md).
     device of the same user, cover sibling notification suppression in
     the e2e tests (deferred since gate 9).
 14. **Safety codes** (done). Show and compare a contact's safety code.
+
+Milestones 15 and on cover upstream features the core already supports
+and the desktop app doesn't show yet (compared with upstream's app at the
+pinned rev). Safety and privacy features come first.
+
+15. **Contact safety.** Block and unblock a contact, report spam, delete
+    a one-to-one chat, and retract an outgoing contact request. Each is
+    confirmed and has a `:` command.
+16. **Message deletion and mute.** Delete a message for yourself or for
+    everyone from the message cursor (confirmed). Mute and unmute a chat
+    (`:mute [duration]`; alerts already skip muted chats). Add message
+    details.
+17. **Account management.** Delete the account, including upstream's
+    abort handling. Settings rows for read receipts and for deleting
+    expired contact requests (both synced by the core). Invitation codes.
+18. **Profile pictures.** Set your own and show peers' pictures, decoded
+    under the same limits as attachments.
+19. **Polish.** Emoji picker and autocomplete, a full-size image viewer,
+    retrying a failed upload, and adding a contact from a group.
+20. **Account seam tests.** A test `CoreUser` for gpui tests, then the
+    deferred teardown, probe and routing tests from the review log.

@@ -13,6 +13,7 @@ use aircoreclient::SafetyCode;
 use aircoreclient::clients::CoreUser;
 use gpui::SharedString;
 use gpui_kit::App;
+use tracing::warn;
 
 use super::Session;
 use super::contacts::{Failure, on_tokio};
@@ -48,7 +49,12 @@ fn lines(a: SafetyCode, b: SafetyCode) -> SafetyLines {
 /// The safety code the user shares with `peer`.
 pub(super) async fn with(user: &CoreUser, peer: &CoreUserId) -> Result<SafetyLines, Failure> {
     let own = user.safety_code(user.user_id()).await?;
-    let theirs = user.safety_code(peer).await?;
+    // A local lookup: the connection is no reason it fails. The credential
+    // arrives with the peer's first message or a group's member list.
+    let theirs = user.safety_code(peer).await.map_err(|err| {
+        warn!("no safety code for a peer: {err:#}");
+        Failure::Shown("Their credential isn't on this device yet; try again later".into())
+    })?;
     Ok(lines(own, theirs))
 }
 

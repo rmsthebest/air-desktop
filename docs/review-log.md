@@ -975,3 +975,23 @@ Accepted (low): a failed unmark task (panic, runtime shutdown) is not
 logged; the mark it leaves is dropped by the next load's sweep, which
 finds nothing to remove. Windows doesn't sync the mark's directory, so a
 power loss there may lose a mark (the app targets Linux).
+
+## Gate 16 — milestone 14 (`5691cd7..f69b847`): PASS
+
+Fixed (low):
+- A name after `:safety-code` in a one-to-one chat was ignored, and the
+  contact's code was shown under it. It is refused now. The checks made
+  before the session is asked are the pure `safety_target`;
+  `a_safety_code_is_asked_for_only_from_someone_to_compare_with` (fails
+  without the fix) also covers the self-chat refusal, which the mock
+  data couldn't reach.
+- A code that resolved after the user opened another chat was still
+  shown. It is dropped now, and a new request replaces a pending one.
+- A missing peer credential (a local lookup) said to check the
+  connection. It says the credential isn't on this device yet.
+- `Members::find` and `resolve` duplicated their load checks; they share
+  `index`. `a_safety_code_is_never_the_users_own` (fails without the
+  own-entry filter) pins that `find` skips the user, whatever the policy.
+- The e2e `assert_ne!` compared the user's code with itself against a
+  pair: it couldn't fail for a plausible regression, so it is dropped.
+- CLAUDE.md now says one-to-one codes need an accepted request.

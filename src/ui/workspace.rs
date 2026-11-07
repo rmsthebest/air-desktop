@@ -69,6 +69,8 @@ pub struct Workspace {
     devices: Option<Entity<Devices>>,
     /// Linking a new device from this one.
     linking: Option<Linking>,
+    /// The safety code being looked up; a new request replaces it.
+    safety_code: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -85,6 +87,38 @@ struct Linking {
 
 /// Focuses the open chat one way or another.
 type FocusChat = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
+
+/// Whose safety code `:safety-code <query>` asks for in the open `chat`.
+#[derive(Debug, PartialEq)]
+enum SafetyTarget {
+    /// The one-to-one chat's contact (accepted or not: the session checks).
+    Contact,
+    /// The group member `query` names.
+    Member,
+    /// A group, but no member named: ask on the command line.
+    AskMember,
+}
+
+fn safety_target(chat: Option<&ChatSummary>, query: &str) -> Result<SafetyTarget, &'static str> {
+    let Some(chat) = chat else {
+        return Err("Open a chat first");
+    };
+    let named = !query.trim().is_empty();
+    if chat.is_self_chat {
+        Err("That's your own devices: there's nobody to compare with")
+    } else if chat.is_group {
+        Ok(if named {
+            SafetyTarget::Member
+        } else {
+            SafetyTarget::AskMember
+        })
+    } else if named {
+        // Never silently show the contact's code for another name.
+        Err("Only a group's members are named: here it's the contact's code")
+    } else {
+        Ok(SafetyTarget::Contact)
+    }
+}
 
 impl Workspace {
     pub fn new(
@@ -226,6 +260,7 @@ impl Workspace {
             focus_when_opened: None,
             devices,
             linking: None,
+            safety_code: None,
             _subscriptions: subscriptions,
         };
         this.report_attention(window, cx);
@@ -749,45 +784,47 @@ impl Workspace {
     /// the open group's member `query` names (asked for if empty).
     fn safety_code(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
         let list = self.chat_list.read(cx);
-        let Some(chat) = list.selected_index().map(|ix| list.chats()[ix].clone()) else {
-            return show_refusal("Open a chat first".into(), window, cx);
+        let chat = list.selected_index().map(|ix| list.chats()[ix].clone());
+        let (chat, target) = match safety_target(chat.as_ref(), query) {
+            Ok(SafetyTarget::AskMember) => return self.prompt("safety-code ", window, cx),
+            Ok(target) => (chat.expect("a target needs a chat"), target),
+            Err(refusal) => return show_refusal(refusal.into(), window, cx),
         };
-        if chat.is_self_chat {
-            return show_refusal(
-                "That's your own devices: there's nobody to compare with".into(),
-                window,
-                cx,
-            );
-        }
-        if chat.is_group && query.trim().is_empty() {
-            return self.prompt("safety-code ", window, cx);
-        }
         let Some(session) = &self.session else {
             return show_refusal("That needs an account".into(), window, cx);
         };
-        let (name, code) = if chat.is_group {
-            let Some((members, _)) = &self.members else {
-                return show_refusal("Still loading the members".into(), window, cx);
-            };
-            match members.read(cx).safety_code(query, cx) {
-                Ok((name, code)) => (name, futures_util::FutureExt::boxed_local(code)),
-                Err(refusal) => return show_refusal(refusal, window, cx),
+        let (name, code) = match target {
+            SafetyTarget::Member => {
+                let Some((members, _)) = &self.members else {
+                    return show_refusal("Still loading the members".into(), window, cx);
+                };
+                match members.read(cx).safety_code(query, cx) {
+                    Ok((name, code)) => (name, futures_util::FutureExt::boxed_local(code)),
+                    Err(refusal) => return show_refusal(refusal, window, cx),
+                }
             }
-        } else {
-            let code = session.read(cx).contact_safety_code(&chat.id, cx);
-            (
-                chat.title.clone(),
-                futures_util::FutureExt::boxed_local(code),
-            )
+            _ => {
+                let code = session.read(cx).contact_safety_code(&chat.id, cx);
+                (
+                    chat.title.clone(),
+                    futures_util::FutureExt::boxed_local(code),
+                )
+            }
         };
-        cx.spawn_in(window, async move |this, cx| {
+        self.safety_code = Some(cx.spawn_in(window, async move |this, cx| {
             let code = code.await;
-            _ = this.update_in(cx, |this, window, cx| match code {
-                Ok(lines) => this.show_safety_code(name, lines, window, cx),
-                Err(refusal) => show_refusal(refusal, window, cx),
+            _ = this.update_in(cx, |this, window, cx| {
+                this.safety_code = None;
+                // The user moved on: a code for another chat would mislead.
+                if this.chat_list.read(cx).selected() != Some(&chat.id) {
+                    return;
+                }
+                match code {
+                    Ok(lines) => this.show_safety_code(name, lines, window, cx),
+                    Err(refusal) => show_refusal(refusal, window, cx),
+                }
             });
-        })
-        .detach();
+        }));
     }
 
     fn show_safety_code(
@@ -1723,6 +1760,32 @@ mod tests {
 
     use super::*;
     use crate::keymap;
+
+    #[test]
+    fn a_safety_code_is_asked_for_only_from_someone_to_compare_with() {
+        let chat = |is_group, is_self_chat| ChatSummary {
+            id: ChatId("c".into()),
+            title: "chat".into(),
+            is_group,
+            request: None,
+            is_self_chat,
+            preview: None,
+            last_activity: None,
+            unread: 0,
+        };
+        let (contact, group, own) = (chat(false, false), chat(true, false), chat(false, true));
+        assert!(safety_target(None, "").is_err());
+        assert!(safety_target(Some(&own), "").is_err());
+        assert!(safety_target(Some(&own), "ada").is_err());
+        assert_eq!(
+            safety_target(Some(&contact), " "),
+            Ok(SafetyTarget::Contact)
+        );
+        // A name in a one-to-one chat is refused, not ignored.
+        assert!(safety_target(Some(&contact), "grace").is_err());
+        assert_eq!(safety_target(Some(&group), ""), Ok(SafetyTarget::AskMember));
+        assert_eq!(safety_target(Some(&group), "#ab"), Ok(SafetyTarget::Member));
+    }
     use crate::settings::Settings;
 
     /// The platform's primary modifier, as `secondary-` resolves to.

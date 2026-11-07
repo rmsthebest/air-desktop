@@ -136,8 +136,11 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     The core hashes each user's credential; the pair is ordered so both
     sides see the same 12 zero-padded five-digit blocks (3 lines of 4).
     `:safety-code` (`secondary-shift-s`) for the open contact, or
-    `:safety-code <member>` (name or `#tag`) in a group; only for accepted
-    contacts. Shown in a dialog: Enter copies, Escape closes.
+    `:safety-code <member>` (name or `#tag`) in a group; in a one-to-one
+    chat only once its request is accepted (a name there is refused).
+    A late code for a chat the user left is dropped; a missing peer
+    credential is a local lookup, reported as such. Shown in a dialog:
+    Enter copies, Escape closes.
 - `src/notifier.rs` — shows alerts via `org.freedesktop.Notifications`
   (zbus 5 on async-io, gpui's own copy). Replaces a chat's notification
   instead of stacking, closes it on dismissal, escapes bodies when the

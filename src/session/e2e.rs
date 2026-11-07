@@ -944,7 +944,7 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
     eventually("the desk has the chat", async || desk.chat(&chat).await).await;
 
     // Ada and Bob see the same safety code, and so does Ada's other
-    // device (one credential per user); someone else's code differs.
+    // device (one credential per user).
     let ada_sees = safety::with(&ada, bob.user_id()).await.ok().unwrap();
     let bob_sees = safety::with(&bob, ada.user_id()).await.ok().unwrap();
     assert_eq!(ada_sees, bob_sees);
@@ -953,10 +953,6 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
     })
     .await;
     assert_eq!(desk_sees, ada_sees);
-    assert_ne!(
-        safety::with(&ada, ada.user_id()).await.ok().unwrap(),
-        ada_sees
-    );
 
     // Bob writes until Ada's first device's next notice for the chat is a
     // `quiet` one (dismissed, the desk shows it) or not.

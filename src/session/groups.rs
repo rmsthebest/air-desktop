@@ -290,13 +290,7 @@ impl Members {
     /// Who `query` names, if the user may remove them (see
     /// [`resolve_removal`]): their name, tag and core id.
     pub fn resolve(&self, query: &str) -> Result<Removal, String> {
-        if self.failed {
-            return Err("Couldn't load the members; reopen the group".into());
-        }
-        if !self.loaded {
-            return Err("Still loading the members".into());
-        }
-        let ix = resolve_removal(&self.members, query)?;
+        let ix = self.index(query, resolve_removal)?;
         Ok(Removal {
             name: self.members[ix].name.clone(),
             tag: self.members[ix].tag.clone(),
@@ -310,18 +304,27 @@ impl Members {
         &self,
         query: &str,
     ) -> Result<(SharedString, SharedString, CoreUserId), String> {
+        let ix = self.index(query, find_member)?;
+        Ok((
+            self.members[ix].name.clone(),
+            self.members[ix].tag.clone(),
+            self.core_ids[ix].clone(),
+        ))
+    }
+
+    /// The member `query` names by `pick`, once the members are loaded.
+    fn index(
+        &self,
+        query: &str,
+        pick: fn(&[Member], &str) -> Result<usize, String>,
+    ) -> Result<usize, String> {
         if self.failed {
             return Err("Couldn't load the members; reopen the group".into());
         }
         if !self.loaded {
             return Err("Still loading the members".into());
         }
-        let ix = find_member(&self.members, query)?;
-        Ok((
-            self.members[ix].name.clone(),
-            self.members[ix].tag.clone(),
-            self.core_ids[ix].clone(),
-        ))
+        pick(&self.members, query)
     }
 
     pub(super) fn user(&self) -> &CoreUser {
@@ -562,6 +565,21 @@ mod tests {
         let mut twins = members.clone();
         twins[2].tag = twins[1].tag.clone();
         assert!(resolve_removal(&twins, "#1a2b3c4d").is_err());
+    }
+
+    #[test]
+    fn a_safety_code_is_never_the_users_own() {
+        // Whatever the policy says: the user's own entry is never found.
+        let members = [
+            member("Grace", "00000000", true, true),
+            member("Grace", "1a2b3c4d", false, false),
+        ];
+        let found = |query| find_member(&members, query).map(|ix| members[ix].tag.to_string());
+        // Sharing the user's name, the peer is still the one named.
+        assert_eq!(found("grace").as_deref(), Ok("1a2b3c4d"));
+        assert!(found("#00000000").is_err());
+        // Removal permission plays no part in finding.
+        assert_eq!(found("#1a2b3c4d").as_deref(), Ok("1a2b3c4d"));
     }
 
     #[test]

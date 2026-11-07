@@ -963,3 +963,8 @@ mark. A failed mark is logged as possibly needing manual cleanup.
 Accepted: a mark beside a record that was kept does nothing until the
 record goes (its meaning); that account loading again is the deferred
 teardown-routing item.
+
+## Gate 15g — gate 15f fixes (`e798019..c694e33`): PASS
+
+Fixed (low): marking and unmarking run in `spawn_blocking` (they fsync);
+the directory sync is Unix-only (Windows can't open a directory so).

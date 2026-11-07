@@ -654,15 +654,24 @@ pub async fn tear_down(user: CoreUser, db_path: String) -> TornDown {
     // Marked first: a quit (or a failed read below) between the core
     // dropping the record and marking would leave the files unmarked for
     // good. A mark on an id that keeps its record is skipped.
-    let dir = std::path::Path::new(&db_path);
-    if let Err(err) = super::account::mark_deleted(dir, record) {
+    // Blocking (synced) file work, off the tokio workers.
+    let dir = std::path::PathBuf::from(&db_path);
+    let marking = {
+        let dir = dir.clone();
+        tokio::task::spawn_blocking(move || super::account::mark_deleted(&dir, record))
+    };
+    if let Err(err) = marking
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|done| done)
+    {
         error!(
             "failed to mark the unlinked account's data for removal \
              (if the deletion is cut short, files may need removing by hand): {err}"
         );
     }
     let Err(err) = aircoreclient::delete_client_database(&db_path, record).await else {
-        super::account::unmark_deleted(dir, record);
+        _ = tokio::task::spawn_blocking(move || super::account::unmark_deleted(&dir, record)).await;
         return TornDown::Deleted;
     };
     error!("failed to delete the unlinked account's data: {err:#}");

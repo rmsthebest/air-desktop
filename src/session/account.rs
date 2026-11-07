@@ -57,7 +57,10 @@ pub async fn load_default(db_path: String) -> anyhow::Result<Option<CoreUser>> {
 /// whatever cuts the deletion short. Synced, as the record's removal is.
 pub fn mark_deleted(dir: &std::path::Path, id: Uuid) -> std::io::Result<()> {
     std::fs::File::create(dir.join(format!("{id}.deleted")))?.sync_all()?;
-    std::fs::File::open(dir)?.sync_all()
+    // Directories open (and sync) this way on Unix only.
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Drops `id`'s mark once its files are gone.

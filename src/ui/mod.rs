@@ -70,12 +70,19 @@ thread_local! {
     static TOLD: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The latest refusal or info shown on this thread since the last call
+/// The latest refusal or info shown on this thread since the last take
 /// (tests only): taking it clears the record, so no check passes on what
 /// an earlier step was told.
 #[cfg(test)]
 pub fn last_told() -> Option<String> {
-    TOLD.with(|told| told.borrow_mut().drain(..).next_back())
+    take_told().pop()
+}
+
+/// Everything shown on this thread since the last take, in order (tests
+/// only).
+#[cfg(test)]
+pub fn take_told() -> Vec<String> {
+    TOLD.with(|told| std::mem::take(&mut *told.borrow_mut()))
 }
 
 /// Asks before running `run`: `ok` confirms (looking like `variant`),

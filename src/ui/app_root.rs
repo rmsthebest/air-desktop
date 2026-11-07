@@ -197,7 +197,7 @@ impl AppRoot {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "seam"))]
 impl AppRoot {
     /// Opens `user`'s workspace at once (the user's databases in
     /// `data_dir`): a loaded test account wouldn't find the test server.
@@ -327,12 +327,24 @@ mod tests {
     }
 
     /// The app root on a real account (see `session::seam`).
+    #[cfg(feature = "seam")]
     mod seam {
         use std::time::{Duration, Instant};
 
         use airserver_test_harness::utils::setup::TestBackend;
 
         use super::*;
+
+        /// Shuts the backend down inside the runtime, also when a test
+        /// fails early.
+        struct Backend(Option<TestBackend>, tokio::runtime::Handle);
+
+        impl Drop for Backend {
+            fn drop(&mut self) {
+                let _entered = self.1.enter();
+                drop(self.0.take());
+            }
+        }
 
         /// Deleting the account runs once at a time; done, the device is
         /// reset and onboarding says why (`tear_down`'s routing).
@@ -353,6 +365,7 @@ mod tests {
                 (backend, user)
             });
             let dir = backend.temp_dir().to_path_buf();
+            let _backend = Backend(Some(backend), tokio.clone());
             let (_, root) = cx.update(|cx| {
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
                     cx.new(|cx| AppRoot::with_account(dir.clone(), user, window, cx))
@@ -402,8 +415,6 @@ mod tests {
                 )
                 .unwrap();
             assert!(records.is_empty(), "{records:?}");
-            let _entered = tokio.enter();
-            drop(backend);
         }
     }
 }

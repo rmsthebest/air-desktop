@@ -13,6 +13,10 @@ use crate::runtime::Tokio;
 
 /// A backend and a workspace signed in as its first user.
 struct Seam<'a> {
+    /// The runtime the core and the backend run on: a test's own steps
+    /// (the peer's side) are `block_on` it. Kept, so `drop` never needs
+    /// the app (it may run while a panic unwinds out of an update).
+    tokio: tokio::runtime::Handle,
     /// Taken in `drop`: the backend shuts down on tokio.
     backend: Option<TestBackend>,
     user: CoreUser,
@@ -54,6 +58,7 @@ fn start_after(
     let cx = VisualTestContext::from_window(window, cx).into_mut();
     cx.run_until_parked();
     Seam {
+        tokio,
         backend: Some(backend),
         user,
         workspace,
@@ -63,8 +68,7 @@ fn start_after(
 
 impl Drop for Seam<'_> {
     fn drop(&mut self) {
-        let tokio = self.tokio();
-        let _entered = tokio.enter();
+        let _entered = self.tokio.enter();
         drop(self.backend.take());
     }
 }
@@ -76,10 +80,8 @@ impl Seam<'_> {
             .expect("the backend lives as long as the test")
     }
 
-    /// The runtime the core and the backend run on: a test's own steps
-    /// (the peer's side) are `block_on` it.
-    fn tokio(&mut self) -> tokio::runtime::Handle {
-        self.cx.update(|_, cx| Tokio::handle(cx))
+    fn tokio(&self) -> tokio::runtime::Handle {
+        self.tokio.clone()
     }
 
     /// Lets the app run until `done` holds (real time: the core works on
@@ -195,7 +197,11 @@ fn seam_an_image_opening_stays_with_its_chat(cx: &mut TestAppContext) {
     seam.open(&bob_name);
     seam.until_picture_shown();
     // `v`, then another chat before the image arrives.
-    seam.act_then_open(Box::new(crate::actions::ViewImage), &carol_name);
+    seam.act_then_open(
+        Box::new(crate::actions::ViewImage),
+        |workspace, cx| workspace.conversation.read(cx).is_viewing(),
+        &carol_name,
+    );
     // Long enough for the load to have finished.
     seam.settle();
     assert!(!seam.has_dialog(), "Bob's image showed over Carol's chat");
@@ -212,7 +218,7 @@ fn seam_an_image_opening_stays_with_its_chat(cx: &mut TestAppContext) {
 fn told_until(seam: &mut Seam<'_>, what: &str, done: impl Fn(&[String]) -> bool) -> Vec<String> {
     let told = std::cell::RefCell::new(Vec::new());
     seam.until(what, |_, _| {
-        told.borrow_mut().extend(crate::ui::last_told());
+        told.borrow_mut().extend(crate::ui::take_told());
         done(&told.borrow())
     });
     told.into_inner()
@@ -229,7 +235,10 @@ fn seam_a_background_deletion_abort_is_told_once(cx: &mut TestAppContext) {
         // As upstream's test: with a sibling, a failing deletion is
         // retried in the background until it's given up.
         let _sibling = user.add_synced_device().await;
+        let mut attempts = 0;
         while !user.account_deletion_is_aborted().await.unwrap() {
+            attempts += 1;
+            assert!(attempts <= 20, "the deletion must be given up");
             user.delete_account().await.unwrap();
             backend.listener_control_handle().set_fail_next_request();
             user.outbound_service().run_once().await;
@@ -264,7 +273,11 @@ fn seam_a_background_deletion_abort_is_told_once(cx: &mut TestAppContext) {
     let settled = Instant::now() + Duration::from_millis(500);
     while Instant::now() < settled {
         seam.cx.run_until_parked();
-        assert_ne!(crate::ui::last_told().as_deref(), Some(TOLD));
+        let told = crate::ui::take_told();
+        assert!(
+            !told.iter().any(|told| told == TOLD),
+            "told again: {told:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -284,10 +297,22 @@ impl Seam<'_> {
     /// Asks for `action` in the open chat, then opens `next` before any
     /// result can arrive: the action (deferred) runs as the first update
     /// ends, and the app's tasks run only once the test lets them.
-    fn act_then_open(&mut self, action: Box<dyn gpui::Action>, next: &str) {
+    /// `started` tells that the action is under way (so a refusal or a
+    /// missed dispatch can't pass for "dropped").
+    fn act_then_open(
+        &mut self,
+        action: Box<dyn gpui::Action>,
+        started: impl Fn(&Workspace, &App) -> bool,
+        next: &str,
+    ) {
         let next = self.listed(next);
         self.cx
             .update(|window, cx| window.dispatch_action(action, cx));
+        assert!(
+            self.workspace
+                .read_with(self.cx, |workspace, cx| started(workspace, cx)),
+            "the action didn't start"
+        );
         self.workspace.update(self.cx, |workspace, cx| {
             workspace
                 .chat_list
@@ -314,7 +339,11 @@ fn seam_a_late_safety_code_is_dropped(cx: &mut TestAppContext) {
     let (_bob, _, bob_name) = seam.contact();
     let (_carol, _, carol_name) = seam.contact();
     seam.open(&bob_name);
-    seam.act_then_open(Box::new(crate::actions::ShowSafetyCode), &carol_name);
+    seam.act_then_open(
+        Box::new(crate::actions::ShowSafetyCode),
+        |workspace, _| workspace.safety_code.is_some(),
+        &carol_name,
+    );
     seam.settle();
     assert!(!seam.has_dialog(), "Bob's code showed in Carol's chat");
 

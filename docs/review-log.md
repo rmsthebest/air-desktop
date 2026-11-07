@@ -1345,3 +1345,24 @@ Not closed:
   `retry` of a stale download (gate 12e). Needing a file-dialog or atlas
   seam (not the account): `pick_picture` after the chat changed, a
   confirmed drop's chat, `Members` releasing textures.
+
+## Gate 22 — milestone 20, account seam (`dd8f3fb..1f04923`): PASS
+
+Fixed:
+- (medium) The harness, a dev-dependency, turned on the core's
+  `test_utils` in every test build, which changes its behaviour (5
+  connection packages, 15 s link codes, 1 s retries): the e2e tests ran
+  a test-mode core. It is an optional dependency behind the `seam`
+  feature now (`just seam`; `just check` lints with it); the default
+  test build has no `test_utils` (checked with `cargo tree`).
+- (medium) `last_told` returned only the last toast of a poll, so a
+  double tell within one could pass "told once". `ui::take_told`
+  returns all; the abort test counts them (a doubled emit fails it).
+- (low) The "dropped" halves now assert first that the action started
+  (the view's pending load, the workspace's pending code).
+- (low) The seam keeps the runtime handle, so its `Drop` never reaches
+  into the app while a panic unwinds; the app-root test's backend drops
+  inside the runtime through a guard.
+- (low) The abort setup loop is bounded.
+- (low) `Claim` stays private; the tests hold one through a seam-only
+  `attachments::hold`.

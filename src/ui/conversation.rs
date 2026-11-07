@@ -388,6 +388,12 @@ impl Conversation {
         self.messages.as_ref()
     }
 
+    /// Whether an image is being opened (seam tests).
+    #[cfg(all(test, feature = "seam"))]
+    pub fn is_viewing(&self) -> bool {
+        self.viewing.is_some()
+    }
+
     #[cfg(test)]
     pub fn is_reacting(&self) -> bool {
         self.reacting

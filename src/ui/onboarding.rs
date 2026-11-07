@@ -80,7 +80,7 @@ impl Focusable for Onboarding {
 }
 
 impl Onboarding {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "seam"))]
     pub fn notice(&self) -> Option<&SharedString> {
         self.notice.as_ref()
     }

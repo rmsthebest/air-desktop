@@ -71,10 +71,10 @@ pub(super) const MAX_PICTURES: usize = 64;
 static IN_FLIGHT: LazyLock<Mutex<HashSet<AttachmentId>>> = LazyLock::new(Default::default);
 
 /// Holds an attachment in [`IN_FLIGHT`] until dropped.
-pub(super) struct Claim(AttachmentId);
+struct Claim(AttachmentId);
 
 impl Claim {
-    pub(super) fn take(id: AttachmentId) -> Option<Self> {
+    fn take(id: AttachmentId) -> Option<Self> {
         let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
         // Not `then_some`: that would make (and drop, relocking) a claim
         // for a taken id while the lock is held.
@@ -84,6 +84,12 @@ impl Claim {
             None
         }
     }
+}
+
+/// Holds `id` as a transfer would, until dropped (seam tests).
+#[cfg(all(test, feature = "seam"))]
+pub(super) fn hold(id: AttachmentId) -> Option<impl Drop> {
+    Claim::take(id)
 }
 
 impl Drop for Claim {

@@ -22,7 +22,7 @@ mod pending;
 mod preview;
 pub mod queue;
 pub mod safety;
-#[cfg(test)]
+#[cfg(all(test, feature = "seam"))]
 mod seam;
 
 use std::sync::Arc;

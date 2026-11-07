@@ -194,7 +194,7 @@ async fn seam_a_failed_upload_is_sent_again() {
     .await;
 
     // Not while another transfer holds it.
-    let held = attachments::Claim::take(id).unwrap();
+    let held = attachments::hold(id).unwrap();
     let err = refusal(attachments::retry_upload(alice.clone(), chat, message).await);
     assert_eq!(err, "Already sending");
     drop(held);

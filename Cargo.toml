@@ -6,7 +6,17 @@ license = "AGPL-3.0-or-later"
 description = "Keyboard-first desktop client for the Air messenger, built with GPUI"
 publish = false
 
+[features]
+# Account seam tests (`just seam`). Off by default: the harness turns on the
+# core's `test_utils` feature, which changes its behaviour (5 connection
+# packages, 15 s link codes, 1 s retries), and the e2e tests must run the
+# production core.
+seam = ["dep:airserver_test_harness"]
+
 [dependencies]
+# Air's in-process test server (Postgres + MinIO from its compose file), for
+# the seam tests only (cfg(all(test, feature = "seam"))).
+airserver_test_harness = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c56fba102d4554ec01c86e79311", optional = true }
 # UI: gpui-kit pins the matching gpui-pre snapshot; never mix in other gpui lineages.
 gpui-kit = "=0.9.0"
 
@@ -72,9 +82,6 @@ gpui-pre = { version = "=0.3.11", features = ["test-support"] }
 gpui-pre-platform = { version = "=0.3.11", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
-# Air's in-process test server (Postgres + MinIO from its compose file):
-# account seam tests run a real core against it, no codes, no rate limits.
-airserver_test_harness = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c56fba102d4554ec01c86e79311" }
 
 # Mirrors the [patch] sections of the pinned Air workspace (patches do not
 # propagate to dependents). Keep in sync when bumping the Air rev.

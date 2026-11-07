@@ -2430,7 +2430,7 @@ impl Render for Workspace {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "seam"))]
 impl Workspace {
     pub fn session(&self) -> Option<&Entity<Session>> {
         self.session.as_ref()
@@ -3952,5 +3952,6 @@ mod tests {
     }
 
     /// Workspace tests against a real session (the account seam).
+    #[cfg(feature = "seam")]
     mod seam;
 }

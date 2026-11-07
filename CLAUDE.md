@@ -11,8 +11,10 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   - copy Air's `Cargo.lock` as a starting point (newer transitive versions
     break the build, e.g. `rsa` for `blind-rsa-signatures`), then re-resolve;
   - re-sync the `[patch]` sections in `Cargo.toml` with Air's root `Cargo.toml`;
-  - bump the `airserver_test_harness` dev-dependency to the same rev (it
-    turns on the core's `test_utils` feature, in test builds only).
+  - bump the optional `airserver_test_harness` dependency to the same rev
+    (only the `seam` feature pulls it in: it turns on the core's
+    `test_utils`, which changes behaviour, so other builds, the e2e tests
+    included, keep the production core).
 - `.cargo/config.toml` sets `SQLX_OFFLINE=true` (Air compiles sqlx queries from
   checked-in metadata).
 - Async: Air's core needs tokio. Run it via `runtime::Tokio::spawn`, which
@@ -361,7 +363,7 @@ a local server, security regression tests. Every test must fail for a
 plausible regression; don't test upstream crypto/MLS or gpui-component
 internals.
 
-Account seam tests (`just seam`, ignored by default) run the real core
+Account seam tests (`just seam`: the `seam` feature, ignored tests) run the real core
 against Air's in-process test server (`airserver_test_harness`): no
 invitation codes, no rate limits, fault injection through
 `listener_control_handle()`, and helpers to connect users, send files and
@@ -370,7 +372,11 @@ build groups. They need only Postgres and MinIO from Air's compose file (not
 workspace ones (`src/ui/workspace/tests/seam.rs`) run a real `Session` in a
 `#[gpui::test]` with parking allowed, polling in real time (`Seam::until`),
 and app-root ones are in `ui/app_root.rs`. The backend is dropped inside
-the tokio runtime. `window.dispatch_action` is deferred to the end of the
+the tokio runtime (a kept handle, never through the app: a drop may run while
+a panic unwinds). Test-only accessors they need are
+`cfg(all(test, feature = "seam"))`; `just check` lints with the feature.
+Count toasts with `ui::take_told` (all of them), and before asserting that
+something was dropped, assert it started (`act_then_open`'s `started`). `window.dispatch_action` is deferred to the end of the
 update while `ChatList::open` selects at once: to act, then switch chats
 before a result lands, use separate updates (`Seam::act_then_open`). A
 loaded (not freshly made) account would look for its server by domain, so

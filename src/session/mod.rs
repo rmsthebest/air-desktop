@@ -22,6 +22,8 @@ mod pending;
 mod preview;
 pub mod queue;
 pub mod safety;
+#[cfg(test)]
+mod seam;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

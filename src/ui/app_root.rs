@@ -197,6 +197,28 @@ impl AppRoot {
     }
 }
 
+#[cfg(test)]
+impl AppRoot {
+    /// Opens `user`'s workspace at once (the user's databases in
+    /// `data_dir`): a loaded test account wouldn't find the test server.
+    pub fn with_account(
+        data_dir: PathBuf,
+        user: CoreUser,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let db_path = prepare_data_dir(&data_dir).unwrap();
+        let mut this = Self {
+            data_dir,
+            db_path,
+            screen: Screen::Loading,
+            _subscriptions: Vec::new(),
+        };
+        this.start(user, None, window, cx);
+        this
+    }
+}
+
 impl AppRoot {
     /// The directory is 0700 already; this keeps the files 0600 as well.
     fn restrict_files(&self) {
@@ -302,5 +324,86 @@ mod tests {
             assert!(app.read_with(cx, |app, _| matches!(app.screen, Screen::Failed(_))));
         }
         assert!(!bad.exists());
+    }
+
+    /// The app root on a real account (see `session::seam`).
+    mod seam {
+        use std::time::{Duration, Instant};
+
+        use airserver_test_harness::utils::setup::TestBackend;
+
+        use super::*;
+
+        /// Deleting the account runs once at a time; done, the device is
+        /// reset and onboarding says why (`tear_down`'s routing).
+        #[gpui::test]
+        #[ignore = "needs Postgres and MinIO (Air's compose file)"]
+        fn seam_a_deleted_account_lands_on_onboarding(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            cx.update(|cx| {
+                gpui_kit::init(cx);
+                crate::runtime::init(cx).unwrap();
+                crate::settings::SettingsStore::init(None, Default::default(), cx);
+                theme::init(None, cx).unwrap();
+            });
+            let tokio = cx.update(|cx| Tokio::handle(cx));
+            let (backend, user) = tokio.block_on(async {
+                let mut backend = TestBackend::single().await;
+                let user = backend.add_persisted_user().await;
+                (backend, user)
+            });
+            let dir = backend.temp_dir().to_path_buf();
+            let (_, root) = cx.update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| AppRoot::with_account(dir.clone(), user, window, cx))
+                })
+                .unwrap()
+            });
+            let session = root.read_with(cx, |root, cx| match &root.screen {
+                Screen::Ready { workspace, .. } => workspace.read(cx).session().cloned().unwrap(),
+                _ => panic!("the workspace shows"),
+            });
+            let (first, second) = session.update(cx, |session, cx| {
+                (session.delete_account(cx), session.delete_account(cx))
+            });
+            // Refused at once, while the first runs.
+            assert_eq!(
+                futures_util::FutureExt::now_or_never(second),
+                Some(Err("Your account is being deleted already".to_string()))
+            );
+            drop(first);
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let notice = loop {
+                cx.run_until_parked();
+                let notice = root.read_with(cx, |root, cx| match &root.screen {
+                    Screen::Onboarding { view, .. } => Some(view.read(cx).notice().cloned()),
+                    _ => None,
+                });
+                if let Some(notice) = notice {
+                    break notice;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for onboarding"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(
+                notice.as_deref(),
+                Some("Your Air account was deleted. This device has been reset.")
+            );
+            // Its data went with it.
+            let records = tokio
+                .block_on(
+                    aircoreclient::clients::store::ClientRecord::load_all_from_air_db(
+                        dir.to_str().unwrap(),
+                    ),
+                )
+                .unwrap();
+            assert!(records.is_empty(), "{records:?}");
+            let _entered = tokio.enter();
+            drop(backend);
+        }
     }
 }

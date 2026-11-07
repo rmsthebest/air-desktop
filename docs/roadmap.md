@@ -46,5 +46,6 @@ pinned rev). Safety and privacy features come first.
     under the same limits as attachments.
 19. **Polish** (done). Emoji picker and autocomplete, a full-size image viewer,
     retrying a failed upload, and adding a contact from a group.
-20. **Account seam tests.** A test `CoreUser` for gpui tests, then the
-    deferred teardown, probe and routing tests from the review log.
+20. **Account seam tests** (done). The real core against Air's in-process test
+    server, in session, workspace and app-root tests, covering the
+    deferred teardown, routing and late-result tests from the review log.

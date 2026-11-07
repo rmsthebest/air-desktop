@@ -2431,6 +2431,13 @@ impl Render for Workspace {
 }
 
 #[cfg(test)]
+impl Workspace {
+    pub fn session(&self) -> Option<&Entity<Session>> {
+        self.session.as_ref()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, VisualTestContext};
 
@@ -3943,4 +3950,7 @@ mod tests {
         assert_eq!(safety_target(Some(&group), ""), Ok(SafetyTarget::AskMember));
         assert_eq!(safety_target(Some(&group), "#ab"), Ok(SafetyTarget::Member));
     }
+
+    /// Workspace tests against a real session (the account seam).
+    mod seam;
 }

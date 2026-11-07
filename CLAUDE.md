@@ -10,7 +10,9 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   rev. When bumping the rev:
   - copy Air's `Cargo.lock` as a starting point (newer transitive versions
     break the build, e.g. `rsa` for `blind-rsa-signatures`), then re-resolve;
-  - re-sync the `[patch]` sections in `Cargo.toml` with Air's root `Cargo.toml`.
+  - re-sync the `[patch]` sections in `Cargo.toml` with Air's root `Cargo.toml`;
+  - bump the `airserver_test_harness` dev-dependency to the same rev (it
+    turns on the core's `test_utils` feature, in test builds only).
 - `.cargo/config.toml` sets `SQLX_OFFLINE=true` (Air compiles sqlx queries from
   checked-in metadata).
 - Async: Air's core needs tokio. Run it via `runtime::Tokio::spawn`, which
@@ -322,6 +324,7 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 
 ## Commands
 - `just check` — fmt check, clippy `-D warnings`, tests.
+- `just seam` — the account seam tests (ignored by default): see Testing.
 - `cargo run` — run the app.
 - `gpui` is an alias for `gpui_kit` (`extern crate` in main.rs) so GPUI
   derive macros resolve; tests use `#[gpui::test]`.
@@ -353,6 +356,22 @@ record accepted/deferred findings in `docs/review-log.md`.
 
 ## Testing principles
 Few layers, each with a purpose: model unit tests, `#[gpui::test]` behaviour
-tests for keyboard/focus flows, ignored e2e tests against a local server,
-security regression tests. Every test must fail for a plausible regression;
-don't test upstream crypto/MLS or gpui-component internals.
+tests for keyboard/focus flows, account seam tests, ignored e2e tests against
+a local server, security regression tests. Every test must fail for a
+plausible regression; don't test upstream crypto/MLS or gpui-component
+internals.
+
+Account seam tests (`just seam`, ignored by default) run the real core
+against Air's in-process test server (`airserver_test_harness`): no
+invitation codes, no rate limits, fault injection through
+`listener_control_handle()`, and helpers to connect users, send files and
+build groups. They need only Postgres and MinIO from Air's compose file (not
+`run-server`). Session-level ones are tokio tests in `src/session/seam.rs`;
+workspace ones (`src/ui/workspace/tests/seam.rs`) run a real `Session` in a
+`#[gpui::test]` with parking allowed, polling in real time (`Seam::until`),
+and app-root ones are in `ui/app_root.rs`. The backend is dropped inside
+the tokio runtime. `window.dispatch_action` is deferred to the end of the
+update while `ChatList::open` selects at once: to act, then switch chats
+before a result lands, use separate updates (`Seam::act_then_open`). A
+loaded (not freshly made) account would look for its server by domain, so
+`AppRoot::with_account` starts on a harness user directly.

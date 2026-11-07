@@ -1304,3 +1304,44 @@ one in the new chat; it says another image is still opening now.
 Accepted (low, as at gate 21): the viewer loads the whole attachment
 before its size check (bounded by what the core stores). Checking the
 size first waits for the account seam.
+
+## Milestone 20 — account seam tests: deferrals closed and left
+
+The seam (`just seam`) runs the real core against Air's in-process test
+server. Closed with a test that fails on the regression (each checked by
+breaking the code):
+- gate 21b: `:contact-member` after an expired request (the chat-scan
+  over-refusal fails it).
+- gate 21: the viewer refuses a file with no thumbnail without decoding
+  it; `retry_upload` refuses while the attachment is claimed, only
+  retries a failed upload, and a message without a file.
+- gates 21c/21d: an image still opening never shows over the next chat,
+  and `v` there opens its own.
+- gate 16: a late safety code for another chat is dropped; the open
+  chat's own shows.
+- gates 18/19b: a background deletion abort is told once and recorded
+  (not told again on a later check); a second deletion is refused while
+  one runs.
+- gate 15 (routing): a deleted account tears down to onboarding with the
+  deletion notice, and its records are gone.
+
+Not closed:
+- Gate 21d's abort of an abandoned load isn't told apart from a detached
+  one: a small image's load ends before `v` in the next chat either way.
+  A large decode would make it timing-dependent; accepted.
+- A declared image whose thumbnail failed: an honest sender's core can't
+  send one (it decodes images while uploading); the no-thumbnail case
+  takes the same branch.
+- Failed-teardown routing, and the notice surviving another account
+  loading: a loaded account looks for its server by domain, not the test
+  server, and the core's teardown has no fault to inject.
+- `invitations::load` filtering and `request`'s unusual code: the real
+  server never sends one. Covered by reading.
+- Still open from earlier gates, now testable on the seam when touched:
+  the `Session` batching and message worker paging tests (gates 4–7),
+  drafts filling only an empty composer (gate 7), a new safety-code
+  request replacing a pending one (gate 16), attention with the
+  settings open (gates 13–14), the devices "look again" probe (gate 15e),
+  `retry` of a stale download (gate 12e). Needing a file-dialog or atlas
+  seam (not the account): `pick_picture` after the chat changed, a
+  confirmed drop's chat, `Members` releasing textures.

@@ -72,6 +72,9 @@ gpui-pre = { version = "=0.3.11", features = ["test-support"] }
 gpui-pre-platform = { version = "=0.3.11", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+# Air's in-process test server (Postgres + MinIO from its compose file):
+# account seam tests run a real core against it, no codes, no rate limits.
+airserver_test_harness = { git = "https://github.com/phnx-im/air", rev = "fcac222a41010c56fba102d4554ec01c86e79311" }
 
 # Mirrors the [patch] sections of the pinned Air workspace (patches do not
 # propagate to dependents). Keep in sync when bumping the Air rev.

@@ -80,6 +80,11 @@ impl Focusable for Onboarding {
 }
 
 impl Onboarding {
+    #[cfg(test)]
+    pub fn notice(&self) -> Option<&SharedString> {
+        self.notice.as_ref()
+    }
+
     pub fn new(
         db_path: String,
         notice: Option<SharedString>,

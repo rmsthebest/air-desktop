@@ -60,6 +60,13 @@ impl Chats {
                 overflowed,
             } => this.pending.add(notifications, *overflowed),
         });
+        // Drawn pictures live on the GPU until dropped.
+        cx.on_release(|this: &mut Self, cx| {
+            for picture in this.chats.iter().filter_map(|chat| chat.picture.as_ref()) {
+                cx.drop_image(picture.0.clone(), None);
+            }
+        })
+        .detach();
         Self {
             chats: Vec::new(),
             state: LoadState::Loading,
@@ -373,9 +380,8 @@ async fn load_chat(
         .unwrap_or(false);
 
     let one_to_one = one_to_one(&chat.chat_type, chat.status());
-    let shows_picture = model::shows_picture(one_to_one, is_self_chat);
     let mut users = Vec::new();
-    let (title, is_group, picture) = match &chat.chat_type {
+    let (title, is_group, peer_picture) = match &chat.chat_type {
         ChatType::HandleConnection(username) => (username.plaintext().to_string(), false, None),
         ChatType::Connection(peer)
         | ChatType::TargetedMessageConnection(peer)
@@ -386,15 +392,10 @@ async fn load_chat(
             (profile.display_name.to_string(), false, picture)
         }
         // The self chat is a group of the user's devices, not one to manage.
-        ChatType::Group(attributes) => (
-            attributes.title.clone(),
-            !is_self_chat,
-            attributes.picture.clone(),
-        ),
+        ChatType::Group(attributes) => (attributes.title.clone(), !is_self_chat, None),
     };
-    let picture = avatars
-        .get(&chat.id, picture.filter(|_| shows_picture))
-        .await;
+    let shown = picture_shown(&chat.chat_type, chat.status(), is_self_chat, peer_picture);
+    let picture = avatars.get(&chat.id, shown).await;
     let title = if is_self_chat {
         "Notes to self".to_string()
     } else {
@@ -435,6 +436,23 @@ async fn load_chat(
         users,
     };
     (summary, keys)
+}
+
+/// The picture bytes a chat shows (see [`model::shows_picture`]): the
+/// group's own, or the peer's profile picture (`peer_picture`).
+fn picture_shown(
+    chat_type: &ChatType,
+    status: &ChatStatus,
+    self_chat: bool,
+    peer_picture: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    if !model::shows_picture(one_to_one(chat_type, status), self_chat) {
+        return None;
+    }
+    match chat_type {
+        ChatType::Group(attributes) => attributes.picture.clone(),
+        _ => peer_picture,
+    }
 }
 
 /// A one-to-one chat's facts, for contact operations and its request
@@ -581,6 +599,41 @@ mod tests {
         assert_eq!(mute(&stored), Mute::Forever);
         let until = chrono::Utc::now() + chrono::Duration::hours(1);
         assert_eq!(mute(&ChatMuted::Until(until)), Mute::Until(until));
+    }
+
+    #[test]
+    fn only_groups_and_established_contacts_show_a_picture() {
+        let user = aircommon::identifiers::UserId::random("localhost".parse().unwrap());
+        let bytes = || Some(vec![1, 2, 3]);
+        let shown = |chat_type: ChatType, status: ChatStatus, self_chat| {
+            picture_shown(&chat_type, &status, self_chat, bytes()).is_some()
+        };
+        let group = || {
+            ChatType::Group(aircoreclient::ChatAttributes {
+                title: "Engines".into(),
+                picture: Some(vec![4]),
+            })
+        };
+        // A group's own picture, not the peer's (there is none).
+        assert_eq!(
+            picture_shown(&group(), &ChatStatus::Active, false, None),
+            Some(vec![4])
+        );
+        assert!(!shown(group(), ChatStatus::Active, true), "the self chat");
+        let contact = ChatType::Connection(user.clone());
+        assert!(shown(contact.clone(), ChatStatus::Active, false));
+        // Their picture waits for acceptance, and goes when blocked.
+        assert!(!shown(
+            ChatType::PendingConnection(user.clone()),
+            ChatStatus::Active,
+            false
+        ));
+        assert!(!shown(
+            ChatType::TargetedMessageConnection(user),
+            ChatStatus::Pending,
+            false
+        ));
+        assert!(!shown(contact, ChatStatus::Blocked, false));
     }
 
     #[test]

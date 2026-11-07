@@ -156,13 +156,7 @@ const MAX_SOURCE_ALLOC: u64 = 80 * 1024 * 1024;
 /// Errors are for the user.
 pub(super) async fn read_source(path: PathBuf) -> Result<Vec<u8>, Failure> {
     let read = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let size = std::fs::metadata(&path)
-            .map_err(|_| "Couldn't read that file".to_string())?
-            .len();
-        if size > MAX_SOURCE_BYTES {
-            return Err("That picture is too large (16 MB at most)".into());
-        }
-        let bytes = std::fs::read(&path).map_err(|_| "Couldn't read that file".to_string())?;
+        let bytes = read_bounded(&path)?;
         check_source(&bytes)?;
         Ok(bytes)
     });
@@ -173,6 +167,26 @@ pub(super) async fn read_source(path: PathBuf) -> Result<Vec<u8>, Failure> {
             Err(Failure::Shown("Couldn't read that picture".into()))
         }
     }
+}
+
+/// The file at `path`, if a regular one of at most [`MAX_SOURCE_BYTES`]:
+/// checked on the open file and bounded while read (a device or a pipe
+/// reports no size; a file can grow after its size is read).
+fn read_bounded(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let unreadable = || "Couldn't read that file".to_string();
+    let file = std::fs::File::open(path).map_err(|_| unreadable())?;
+    if !file.metadata().map_err(|_| unreadable())?.is_file() {
+        return Err("That isn't a file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unreadable())?;
+    if bytes.len() as u64 > MAX_SOURCE_BYTES {
+        return Err("That picture is too large (16 MB at most)".into());
+    }
+    Ok(bytes)
 }
 
 fn check_source(bytes: &[u8]) -> Result<(), String> {
@@ -267,6 +281,29 @@ mod tests {
         avatars.get(&3, Some(jpeg(2, 2))).await;
         avatars.retain(|key| *key == 3);
         assert_eq!(avatars.len(), 1);
+    }
+
+    #[test]
+    fn only_a_bounded_regular_file_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let fits = dir.path().join("fits");
+        std::fs::write(&fits, b"abc").unwrap();
+        assert_eq!(read_bounded(&fits).unwrap(), b"abc");
+        // A device reports no size and never ends; a directory isn't one.
+        assert_eq!(
+            read_bounded(std::path::Path::new("/dev/zero")),
+            Err("That isn't a file".into())
+        );
+        assert!(read_bounded(dir.path()).is_err());
+        let big = dir.path().join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_SOURCE_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            read_bounded(&big),
+            Err("That picture is too large (16 MB at most)".into())
+        );
     }
 
     #[test]

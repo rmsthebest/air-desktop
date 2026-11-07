@@ -307,6 +307,17 @@ impl Members {
                 }
             }
         });
+        // Drawn pictures live on the GPU until dropped.
+        cx.on_release(|this: &mut Self, cx| {
+            for picture in this
+                .members
+                .iter()
+                .filter_map(|member| member.picture.as_ref())
+            {
+                cx.drop_image(picture.0.clone(), None);
+            }
+        })
+        .detach();
         let mut members = Self {
             user: session.read(cx).user().clone(),
             chat,

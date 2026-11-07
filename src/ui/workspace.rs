@@ -805,14 +805,7 @@ impl Workspace {
             }
             SettingsEvent::AddUsername => self.prompt("username ", window, cx),
             SettingsEvent::SetPicture => self.pick_picture(PictureOf::Own, window, cx),
-            SettingsEvent::RemovePicture => self.confirm(
-                "Remove your picture?".into(),
-                "Your contacts see your initials instead.".into(),
-                "Remove",
-                |this, window, cx| this.change_picture(PictureOf::Own, None, window, cx),
-                window,
-                cx,
-            ),
+            SettingsEvent::RemovePicture => self.remove_picture(PictureOf::Own, window, cx),
             SettingsEvent::RemoveUsername(username) => {
                 let name = username.to_string();
                 self.confirm(
@@ -1547,7 +1540,7 @@ impl Workspace {
             Command::Picture(path) => {
                 self.change_picture(PictureOf::Own, Some(expand_home(&path)), window, cx)
             }
-            Command::RemovePicture => self.change_picture(PictureOf::Own, None, window, cx),
+            Command::RemovePicture => self.remove_picture(PictureOf::Own, window, cx),
             Command::GroupPicture(path) => {
                 let Some(chat) = self.open_group(window, cx) else {
                     return;
@@ -1563,7 +1556,7 @@ impl Workspace {
                 let Some(chat) = self.open_group(window, cx) else {
                     return;
                 };
-                self.change_picture(PictureOf::Group(chat), None, window, cx)
+                self.remove_picture(PictureOf::Group(chat), window, cx)
             }
             Command::Rename(title) => {
                 let Some(chat) = self.open_group(window, cx) else {
@@ -1961,6 +1954,28 @@ impl Workspace {
         }
     }
 
+    /// Removes a picture once confirmed, however asked (command or row).
+    fn remove_picture(&mut self, of: PictureOf, window: &mut Window, cx: &mut Context<Self>) {
+        let (title, description) = match of {
+            PictureOf::Own => (
+                "Remove your picture?",
+                "Your contacts see your initials instead.",
+            ),
+            PictureOf::Group(_) => (
+                "Remove the group's picture?",
+                "It goes for everyone in the group.",
+            ),
+        };
+        self.confirm(
+            title.into(),
+            description.into(),
+            "Remove",
+            move |this, window, cx| this.change_picture(of.clone(), None, window, cx),
+            window,
+            cx,
+        )
+    }
+
     /// Picks a picture with the system's file dialog, then sets it. A
     /// group's goes to the group open when the dialog was, if still open.
     fn pick_picture(&mut self, of: PictureOf, window: &mut Window, cx: &mut Context<Self>) {
@@ -2145,13 +2160,14 @@ impl Workspace {
     }
 }
 
-/// A typed path with a leading `~` meaning the home directory.
 /// Whose picture a command changes.
+#[derive(Clone)]
 enum PictureOf {
     Own,
     Group(ChatId),
 }
 
+/// A typed path with a leading `~` meaning the home directory.
 fn expand_home(path: &str) -> PathBuf {
     let home = || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
     match path.strip_prefix('~') {
@@ -2938,6 +2954,13 @@ mod tests {
             assert!(!asking(cx));
             assert_eq!(told(cx), before + 1, "{event:?}");
         }
+        // Typed, the same: it asks.
+        let command = command_line::parse(":remove-picture").unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run(command, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(asking(cx));
     }
 
     #[gpui::test]

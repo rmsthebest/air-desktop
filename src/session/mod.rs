@@ -259,6 +259,13 @@ impl Session {
                 }),
             ];
             let (drafts, drafts_task) = composer::DraftQueue::start(user.clone(), cx);
+            // The drawn picture lives on the GPU until dropped.
+            cx.on_release(|this: &mut Self, cx| {
+                if let Some(picture) = &this.picture {
+                    cx.drop_image(picture.0.clone(), None);
+                }
+            })
+            .detach();
             let mut session = Self {
                 drafts,
                 _drafts: drafts_task,

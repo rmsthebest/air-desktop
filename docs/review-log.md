@@ -1167,3 +1167,28 @@ Fixed (low):
 
 Deferred to milestone 20 (account seam): `Invitations::request` turning
 an unusual server code into `Failure::Shown`.
+
+## Gate 20 — milestone 18, profile pictures (`f6ca347..dd713ad`): PASS
+
+Fixed:
+- (medium) A `Members` entity, made each time a group opens, never
+  dropped its pictures' GPU textures: every reopen left them uploaded.
+  `Members`, `Chats` and the `Session` (own picture) now drop them on
+  release, as `Messages` does.
+- `read_source` read a path by its reported size: `/dev/zero` or a pipe
+  would read forever or block. It now checks the open file is a regular
+  one and reads at most the cap (`read_bounded`, tested with
+  `/dev/zero`, a directory and a sparse oversized file).
+- The rule keeping a requester's or blocked contact's picture off screen
+  was applied inline in `load_chat`, untested there: the bytes shown are
+  now chosen by `chats::picture_shown`, which the test exercises.
+- `PictureOf` had taken `expand_home`'s doc comment.
+- `:remove-picture` and `:remove-group-picture` now ask first, as the
+  settings row does (`Workspace::remove_picture`); the test covers the
+  typed command too.
+
+Deferred to milestone 20 (account seam): a test that `Members` releases
+its textures (needs a session), and one for `pick_picture` refusing when
+another chat was opened during the file dialog (needs a test file
+dialog). Reopening a group decodes its members' pictures again (the
+cache lives with the entity): bounded by the members, accepted.

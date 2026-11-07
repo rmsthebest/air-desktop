@@ -995,3 +995,17 @@ Fixed (low):
 - The e2e `assert_ne!` compared the user's code with itself against a
   pair: it couldn't fail for a plausible regression, so it is dropped.
 - CLAUDE.md now says one-to-one codes need an accepted request.
+
+## Gate 16b — gate 16 fixes (`f69b847..9265ad7`): PASS
+
+Fixed (low): every failed peer lookup claimed the credential was
+missing, though the core also fails on a database error, and the own
+lookup still blamed the connection. Both lookups now say the code
+couldn't be computed on this device (try again if the contact is new)
+and log the cause; the core's error can't tell a missing credential
+apart. The new workspace test split the test module's imports.
+
+Accepted: a code that resolves while another dialog is open opens over
+it (it is still the open chat's code). Deferred (account seam): a
+`#[gpui::test]` that a late code for another chat is dropped and a new
+request replaces a pending one; mock data stops before the lookup.

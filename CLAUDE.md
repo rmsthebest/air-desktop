@@ -138,8 +138,8 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     `:safety-code` (`secondary-shift-s`) for the open contact, or
     `:safety-code <member>` (name or `#tag`) in a group; in a one-to-one
     chat only once its request is accepted (a name there is refused).
-    A late code for a chat the user left is dropped; a missing peer
-    credential is a local lookup, reported as such. Shown in a dialog:
+    A late code for a chat the user left is dropped; a failed lookup (often a
+    peer credential not here yet) never blames the connection. Shown in a dialog:
     Enter copies, Escape closes.
 - `src/notifier.rs` — shows alerts via `org.freedesktop.Notifications`
   (zbus 5 on async-io, gpui's own copy). Replaces a chat's notification

@@ -13,7 +13,7 @@ use aircoreclient::SafetyCode;
 use aircoreclient::clients::CoreUser;
 use gpui::SharedString;
 use gpui_kit::App;
-use tracing::warn;
+use tracing::error;
 
 use super::Session;
 use super::contacts::{Failure, on_tokio};
@@ -48,13 +48,20 @@ fn lines(a: SafetyCode, b: SafetyCode) -> SafetyLines {
 
 /// The safety code the user shares with `peer`.
 pub(super) async fn with(user: &CoreUser, peer: &CoreUserId) -> Result<SafetyLines, Failure> {
-    let own = user.safety_code(user.user_id()).await?;
-    // A local lookup: the connection is no reason it fails. The credential
-    // arrives with the peer's first message or a group's member list.
-    let theirs = user.safety_code(peer).await.map_err(|err| {
-        warn!("no safety code for a peer: {err:#}");
-        Failure::Shown("Their credential isn't on this device yet; try again later".into())
-    })?;
+    // Local lookups: the connection is no reason they fail. A peer's
+    // credential may simply not be here yet (it arrives with their first
+    // message or a group's member list); the core can't tell us apart from
+    // a database error, so the message covers both and the log has which.
+    let local = |err: anyhow::Error| {
+        error!("failed to compute a safety code: {err:#}");
+        Failure::Shown(
+            "Couldn't compute the safety code on this device. If you just \
+             became contacts, try again in a moment."
+                .into(),
+        )
+    };
+    let own = user.safety_code(user.user_id()).await.map_err(local)?;
+    let theirs = user.safety_code(peer).await.map_err(local)?;
     Ok(lines(own, theirs))
 }
 

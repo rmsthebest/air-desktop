@@ -1760,32 +1760,6 @@ mod tests {
 
     use super::*;
     use crate::keymap;
-
-    #[test]
-    fn a_safety_code_is_asked_for_only_from_someone_to_compare_with() {
-        let chat = |is_group, is_self_chat| ChatSummary {
-            id: ChatId("c".into()),
-            title: "chat".into(),
-            is_group,
-            request: None,
-            is_self_chat,
-            preview: None,
-            last_activity: None,
-            unread: 0,
-        };
-        let (contact, group, own) = (chat(false, false), chat(true, false), chat(false, true));
-        assert!(safety_target(None, "").is_err());
-        assert!(safety_target(Some(&own), "").is_err());
-        assert!(safety_target(Some(&own), "ada").is_err());
-        assert_eq!(
-            safety_target(Some(&contact), " "),
-            Ok(SafetyTarget::Contact)
-        );
-        // A name in a one-to-one chat is refused, not ignored.
-        assert!(safety_target(Some(&contact), "grace").is_err());
-        assert_eq!(safety_target(Some(&group), ""), Ok(SafetyTarget::AskMember));
-        assert_eq!(safety_target(Some(&group), "#ab"), Ok(SafetyTarget::Member));
-    }
     use crate::settings::Settings;
 
     /// The platform's primary modifier, as `secondary-` resolves to.
@@ -2888,5 +2862,31 @@ mod tests {
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
         assert_eq!(read_state(&workspace, cx).0, newest);
+    }
+
+    #[test]
+    fn a_safety_code_is_asked_for_only_from_someone_to_compare_with() {
+        let chat = |is_group, is_self_chat| ChatSummary {
+            id: ChatId("c".into()),
+            title: "chat".into(),
+            is_group,
+            request: None,
+            is_self_chat,
+            preview: None,
+            last_activity: None,
+            unread: 0,
+        };
+        let (contact, group, own) = (chat(false, false), chat(true, false), chat(false, true));
+        assert!(safety_target(None, "").is_err());
+        assert!(safety_target(Some(&own), "").is_err());
+        assert!(safety_target(Some(&own), "ada").is_err());
+        assert_eq!(
+            safety_target(Some(&contact), " "),
+            Ok(SafetyTarget::Contact)
+        );
+        // A name in a one-to-one chat is refused, not ignored.
+        assert!(safety_target(Some(&contact), "grace").is_err());
+        assert_eq!(safety_target(Some(&group), ""), Ok(SafetyTarget::AskMember));
+        assert_eq!(safety_target(Some(&group), "#ab"), Ok(SafetyTarget::Member));
     }
 }

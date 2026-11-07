@@ -56,17 +56,3 @@ pub fn qr_code(modules: Rc<QrModules>, side: Pixels) -> impl IntoElement {
         .size_full(),
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encodes_a_linking_url_into_a_square() {
-        let modules =
-            QrModules::encode("air://air.ms/multiDeviceLinkingCode?code=12345678901").unwrap();
-        assert_eq!(modules.dark.len(), modules.width * modules.width);
-        // Finder pattern: the top-left corner module is dark.
-        assert!(modules.dark[0]);
-    }
-}

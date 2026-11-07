@@ -158,6 +158,8 @@ impl Onboarding {
         }
         self.linking = Some(Linking::Idle);
         self.info_task = None;
+        // The name field isn't shown while linking: focus stays in the card.
+        self.domain.focus_handle(cx).focus(window, cx);
         self.start_linking(window, cx);
     }
 
@@ -484,6 +486,13 @@ mod tests {
     use super::*;
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Onboarding>, &mut VisualTestContext) {
+        setup_in(String::new(), cx)
+    }
+
+    fn setup_in(
+        db_path: String,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Onboarding>, &mut VisualTestContext) {
         cx.executor().allow_parking();
         let (window, onboarding) = cx.update(|cx| {
             gpui_kit::init(cx);
@@ -492,7 +501,7 @@ mod tests {
             assert_eq!(crate::keymap::load(None, cx), Vec::<String>::new());
             // Nothing is looked up until the server field is edited.
             gpui_kit::open_window(Default::default(), cx, |window, cx| {
-                cx.new(|cx| Onboarding::new(String::new(), None, window, cx))
+                cx.new(|cx| Onboarding::new(db_path, None, window, cx))
             })
             .unwrap()
         });
@@ -585,6 +594,20 @@ mod tests {
         cx.simulate_keystrokes("escape");
         assert!(!linking(cx));
         assert_eq!(error(&onboarding, cx), None);
+    }
+
+    #[gpui::test]
+    fn escape_leaves_a_link_that_is_under_way(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (onboarding, cx) = setup_in(dir.path().to_str().unwrap().into(), cx);
+        // A valid server (on a reserved name, so it is never reached).
+        cx.simulate_keystrokes(&format!("tab {MOD}-a"));
+        cx.simulate_input("air.invalid");
+        cx.simulate_keystrokes(&format!("shift-tab {MOD}-l"));
+        assert!(onboarding.read_with(cx, |this, _| this.provision.is_some()));
+        cx.simulate_keystrokes("escape");
+        assert!(onboarding.read_with(cx, |this, _| this.linking.is_none()
+            && this.provision.is_none()));
     }
 
     const MOD: &str = if cfg!(target_os = "macos") {

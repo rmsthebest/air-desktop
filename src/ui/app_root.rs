@@ -62,14 +62,20 @@ impl AppRoot {
         {
             Ok(db_path) => {
                 this.db_path = db_path.clone();
-                this.load(db_path, window, cx)
+                this.load(db_path, None, window, cx)
             }
             Err(err) => this.screen = Screen::Failed(err.into()),
         }
         this
     }
 
-    fn load(&mut self, db_path: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn load(
+        &mut self,
+        db_path: String,
+        notice: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let task = Tokio::spawn(cx, account::load_default(db_path.clone()));
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await.and_then(|loaded| loaded);
@@ -78,7 +84,7 @@ impl AppRoot {
                 this.restrict_files();
                 match result {
                     Ok(Some(user)) => this.start(user, window, cx),
-                    Ok(None) => this.onboard(db_path, None, window, cx),
+                    Ok(None) => this.onboard(db_path, notice, window, cx),
                     Err(err) => {
                         tracing::error!("failed to load account: {err:#}");
                         this.screen =
@@ -152,13 +158,21 @@ impl AppRoot {
         self.screen = Screen::TearingDown;
         cx.notify();
         let db_path = self.db_path.clone();
-        let task = Tokio::spawn(cx, devices::tear_down(user, db_path.clone()));
+        // Detached: closing the window mustn't stop the deletion between
+        // removing the database and its record.
+        let task = Tokio::handle(cx).spawn(devices::tear_down(user, db_path.clone()));
         cx.spawn_in(window, async move |this, cx| {
-            if let Err(err) = task.await.and_then(|done| done) {
+            if let Err(err) = task
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|done| done)
+            {
                 tracing::error!("failed to delete the unlinked account's data: {err:#}");
             }
             _ = this.update_in(cx, |this, window, cx| {
-                this.onboard(db_path, Some(notice), window, cx);
+                // Another account may be left (an earlier deletion failed):
+                // that one opens; onboarding only if none does.
+                this.load(db_path, Some(notice), window, cx);
                 cx.notify();
             });
         })

@@ -364,7 +364,10 @@ impl Workspace {
         self.conversation
             .update(cx, |conversation, _| conversation.set_hidden(true));
         self.report_attention(window, cx);
-        self.settings_view.focus_handle(cx).focus(window, cx);
+        match self.link_pane() {
+            Some(view) => view.focus_handle(cx).focus(window, cx),
+            None => self.settings_view.focus_handle(cx).focus(window, cx),
+        }
         cx.notify();
     }
 
@@ -2321,6 +2324,26 @@ mod tests {
             |cx: &mut VisualTestContext| cx.update(|window, cx| window.notifications(cx).len());
         let before = told(cx);
         events.send(LinkEvent::Linked).unwrap();
+        cx.run_until_parked();
+        assert_eq!(told(cx), before + 1);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.linking.is_none()));
+
+        // A confirmed link that fails after the pane closed is told too.
+        let (_confirm_rx, events) = start(cx);
+        events.send(LinkEvent::AwaitingConfirmation).unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        // Settings reopened over the pane: it keeps focus, so Escape closes it.
+        cx.simulate_keystrokes(&format!("{MOD}-,"));
+        cx.run_until_parked();
+        assert!(pane_focused(cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let before = told(cx);
+        events.send(LinkEvent::Failed("no".into())).unwrap();
         cx.run_until_parked();
         assert_eq!(told(cx), before + 1);
         assert!(workspace.read_with(cx, |workspace, _| workspace.linking.is_none()));

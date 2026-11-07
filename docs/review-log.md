@@ -845,3 +845,31 @@ Fixed (low):
   on the old handling) replaces `opening_another_chat_ends_the_wait`,
   which no `Workspace` regression could fail.
 - A `private` test comment no longer claims a check made elsewhere.
+
+## Gate 15 — milestone 13 (`3f4bf40..3e15766`): PASS
+
+Fixed:
+- **Escape couldn't leave link mode at onboarding (medium).** Entering it
+  left focus on the hidden name field, outside the card's key context.
+  The server field takes focus now.
+  `escape_leaves_a_link_that_is_under_way` (fails without the fix).
+- **Opening the settings over the link pane lost focus (low).** It goes to
+  the pane. Covered in `a_link_goes_ahead_only_once_confirmed_…`, which
+  also checks a confirmed link that fails after its pane closed.
+- **Teardown could be aborted between deleting the database and its
+  record (low).** It runs detached.
+- **After teardown, onboarding even with another account left (low).** The
+  app loads again; onboarding (with the notice) only if nothing loads.
+- **Every chat change reloaded the device list without a self chat
+  (low).** Only before the first load. `the_list_reloads_for_…`.
+- Tests: the QR test (it tested the crate) is gone; the link-failure
+  test no longer checks constant messages for secrets.
+
+Accepted: `:device-name #beef desk` reads `#beef` as a tag (a leading
+`#hex` word is one, as documented); refused, never misapplied.
+
+Deferred:
+- **Alerts from an unlinked account stay on screen (low).** The notifier
+  is dropped without closing them; closing every tracked id before the
+  session goes needs a teardown path in the notifier.
+- **No test that teardown releases the session (account seam).**

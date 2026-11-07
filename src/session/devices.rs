@@ -207,11 +207,13 @@ pub(super) async fn load(user: CoreUser) -> anyhow::Result<Loaded> {
 }
 
 /// Whether `notification` can change the device list: the synced entries,
-/// or the self chat (its members). Before the self chat is known, any chat.
-fn touches(notification: &DbNotification, self_chat: Option<CoreChatId>) -> bool {
+/// or the self chat (its members). Before the first load, any chat. An
+/// account without a self chat has only this device; linking one stores
+/// the entries, so the setting reloads it.
+fn touches(notification: &DbNotification, loaded: bool, self_chat: Option<CoreChatId>) -> bool {
     notification.ops.keys().any(|entity| match entity {
         DbEntityId::UserSetting(key) => key == LinkedDevicesSetting::KEY,
-        DbEntityId::Chat(id) => self_chat.is_none_or(|chat| chat == *id),
+        DbEntityId::Chat(id) => !loaded || self_chat == Some(*id),
         _ => false,
     })
 }
@@ -226,7 +228,7 @@ impl Devices {
                 if *overflowed
                     || notifications
                         .iter()
-                        .any(|notification| touches(notification, this.self_chat))
+                        .any(|notification| touches(notification, this.loaded, this.self_chat))
                 {
                     this.reload(cx);
                 }
@@ -666,19 +668,39 @@ mod tests {
     }
 
     #[test]
-    fn link_failures_are_told_without_internals() {
+    fn every_link_error_is_a_failure() {
         use MultiDeviceLinkClientError::*;
         for result in [
             Ok(Err(SessionNotFound)),
+            Ok(Err(InvalidCode)),
             Ok(Err(DeviceLimitReached { max_devices: 3 })),
-            Err(anyhow::anyhow!("secret internal detail")),
+            Err(anyhow::anyhow!("internal")),
         ] {
-            let LinkEvent::Failed(message) = link_outcome(result) else {
-                panic!("not a failure");
-            };
-            assert!(!message.contains("secret"));
+            assert!(matches!(link_outcome(result), LinkEvent::Failed(_)));
         }
         assert_eq!(link_outcome(Ok(Ok(()))), LinkEvent::Linked);
+    }
+
+    #[test]
+    fn the_list_reloads_for_its_setting_and_the_self_chat_only() {
+        let chat = |n: u128| CoreChatId::new(Uuid::from_u128(n));
+        let changed = |entity: DbEntityId| DbNotification {
+            ops: [(entity, Default::default())].into(),
+        };
+        let setting = changed(DbEntityId::UserSetting(LinkedDevicesSetting::KEY.into()));
+        let other_setting = changed(DbEntityId::UserSetting("read_receipts".into()));
+        let self_chat = changed(DbEntityId::Chat(chat(1)));
+        let other_chat = changed(DbEntityId::Chat(chat(2)));
+        for (loaded, known) in [(false, None), (true, None), (true, Some(chat(1)))] {
+            assert!(touches(&setting, loaded, known));
+            assert!(!touches(&other_setting, loaded, known));
+        }
+        // Before the first load, any chat might be the self chat.
+        assert!(touches(&other_chat, false, None));
+        assert!(touches(&self_chat, true, Some(chat(1))));
+        assert!(!touches(&other_chat, true, Some(chat(1))));
+        // Without a self chat, messages elsewhere never reload it.
+        assert!(!touches(&other_chat, true, None));
     }
 
     #[test]

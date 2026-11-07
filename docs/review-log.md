@@ -1040,3 +1040,29 @@ Fixed:
   blocked chats. Deleting a contact's chat says their chat ends too.
   Tests: the blocked-chat gpui test (each fails without its fix), the
   `next_unread` test, `contact_dialogs_say_what_really_happens`.
+
+## Gate 17b — gate 17 fixes (`be28733..38cd8ad`): PASS
+
+Fixed (low):
+- The delete dialog's wording went by side alone: a contact's chat they
+  ended said "their chat with you ends", and a request to a blocked
+  peer (maybe open on their side) said it had ended. It goes by side
+  and stage now; such a request is deleted, not retracted (`check`
+  says so instead of "ended already").
+- A contact's chat the peer deleted (inactive) still had a composer.
+  It has a footer with Delete now; `composes` allows only open stages,
+  so focus moves off a composer that goes this way too.
+  `only_a_live_chat_is_written_to` and the blocked-chat gpui test fail
+  without it.
+- The e2e check that a blocked sender's next request never shows slept
+  5 s, so a slow listener passed it wrongly. A third account asks on the
+  same username after him; once Ada has that request, hers has been
+  past his. The test takes three codes now.
+- Tests: the chats test pins only the core-to-facts mapping (adding an
+  outgoing request to a blocked peer and a contact's ended chat); the
+  request mapping is the model's. The dialog test no longer repeats a
+  rule.
+
+Kept on purpose: the Unblock footer on a blocked request's chat. The
+core erases such a chat when blocking, so it shows only if one is left,
+but it follows `check` and costs nothing.

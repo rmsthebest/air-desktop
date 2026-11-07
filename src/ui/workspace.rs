@@ -22,7 +22,8 @@ use crate::actions::{
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{
-    ChatId, ChatSummary, ContactOp, JumpList, Message, MessageId, Request, Side, UserId, mock,
+    ChatId, ChatSummary, ContactOp, JumpList, Message, MessageId, Request, Side, Stage, UserId,
+    mock,
 };
 use crate::session::chats::{Chats, LoadState};
 use crate::session::composer::Composer;
@@ -147,6 +148,11 @@ fn contact_confirmation(
             ),
             "Retract",
         ),
+        ContactOp::Delete if facts.side == Side::Contact && facts.stage == Stage::Ended => (
+            format!("Delete {name}?"),
+            "They ended this chat. It and its history are erased from all your devices.".into(),
+            "Delete",
+        ),
         ContactOp::Delete if facts.side == Side::Contact => (
             format!("Delete {name}?"),
             format!(
@@ -156,9 +162,11 @@ fn contact_confirmation(
             ),
             "Delete",
         ),
+        // A request that ended, or one to or from someone blocked (which
+        // may still be open on their side: it is erased all the same).
         ContactOp::Delete => (
             "Delete this request?".into(),
-            "The ended request is erased from all your devices.".into(),
+            "The request and its chat are erased from all your devices.".into(),
             "Delete",
         ),
     })
@@ -1026,6 +1034,10 @@ impl Workspace {
             Some(chat) if chat.composes() => Some(chat.id.clone()),
             Some(chat) if chat.blocked() => {
                 show_refusal("Unblock them first: :unblock".into(), window, cx);
+                None
+            }
+            Some(chat) if chat.ended() => {
+                show_refusal("They ended this chat".into(), window, cx);
                 None
             }
             Some(_) => {
@@ -2418,6 +2430,18 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert_eq!(told(cx), before + 3);
+        // A contact who deleted the chat can't be written to either.
+        set_first(None, OneToOne::CONTACT, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_composer(&FocusComposer, window, cx)
+        });
+        assert_eq!(focused(cx), Focus::Composer);
+        let ended = OneToOne {
+            stage: Stage::Ended,
+            ..OneToOne::CONTACT
+        };
+        set_first(None, ended, cx);
+        assert_eq!(focused(cx), Focus::Messages);
     }
 
     #[gpui::test]
@@ -3161,7 +3185,7 @@ mod tests {
 
     #[test]
     fn contact_dialogs_say_what_really_happens() {
-        use crate::model::{OneToOne, Side, Stage};
+        use crate::model::OneToOne;
         let chat = |one_to_one| ChatSummary {
             id: ChatId("c".into()),
             title: "Ada".into(),
@@ -3182,12 +3206,13 @@ mod tests {
         assert!(said(ContactOp::Block, incoming).contains("decline"));
         // Deleting a contact ends their chat too, not only the user's.
         assert!(said(ContactOp::Delete, OneToOne::CONTACT).contains("their chat with you ends"));
-        // The rules are `ContactOp::check`'s: refused where it refuses.
+        // Unless they ended it already.
         let ended = OneToOne {
             stage: Stage::Ended,
-            ..incoming
+            ..OneToOne::CONTACT
         };
-        assert!(contact_confirmation(ContactOp::Retract, &chat(Some(ended))).is_err());
+        assert!(said(ContactOp::Delete, ended).contains("They ended"));
+        // Groups and the self chat have no contact to act on.
         assert!(contact_confirmation(ContactOp::Block, &chat(None)).is_err());
     }
 

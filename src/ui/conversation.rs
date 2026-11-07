@@ -1153,6 +1153,7 @@ impl Render for Conversation {
                 // A blocked request's sender too: the block outlives it.
                 _ if chat.blocked() => render_blocked(&chat.title, cx),
                 Some(request) => render_request(request, &chat.title, cx),
+                None if chat.ended() => render_ended(&chat.title, cx),
                 None => self
                     .render_composer(composer_context, composer_focused, compose_bar, cx)
                     .into_any_element(),
@@ -1290,6 +1291,25 @@ fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElemen
                 DeleteChat,
             )),
     };
+    in_composer_place(card)
+}
+
+/// Takes the composer's place in a contact's chat they deleted: nothing
+/// reaches them any more.
+fn render_ended(title: &SharedString, cx: &App) -> AnyElement {
+    let card = card(cx)
+        .child(
+            card_text(format!(
+                "{title} ended this chat. To talk again, send a new contact request."
+            ))
+            .text_color(cx.theme().muted_foreground),
+        )
+        .child(card_button(
+            "delete-ended",
+            "Delete",
+            "Delete this chat",
+            DeleteChat,
+        ));
     in_composer_place(card)
 }
 

@@ -96,9 +96,22 @@ impl ChatSummary {
             .is_some_and(|chat| chat.stage == Stage::Blocked)
     }
 
-    /// Messages and files can be sent: no request open, not blocked.
+    /// Messages and files can be sent: no request, not blocked, and not
+    /// a contact's chat that ended (they deleted it).
     pub fn composes(&self) -> bool {
-        self.request.is_none() && !self.blocked()
+        self.request.is_none()
+            && self
+                .one_to_one
+                .is_none_or(|chat| matches!(chat.stage, Stage::Open | Stage::Sending))
+    }
+
+    /// A contact's chat that ended: they deleted it.
+    pub fn ended(&self) -> bool {
+        self.one_to_one
+            == Some(OneToOne {
+                stage: Stage::Ended,
+                ..OneToOne::CONTACT
+            })
     }
 }
 
@@ -189,6 +202,7 @@ impl ContactOp {
             ContactOp::Retract if chat.stage == Stage::Sending => {
                 Err("The request is still being sent; try again in a moment")
             }
+            ContactOp::Retract if blocked => Err("You blocked them: delete the request instead"),
             ContactOp::Retract if !open => Err("That request has ended already"),
             ContactOp::Retract => Ok(()),
             ContactOp::Delete if open && chat.side == Side::Outgoing => {
@@ -1028,6 +1042,40 @@ mod tests {
             assert_eq!(ended.request(), Some(Request::Closed));
         }
         assert_eq!(contact.request(), None);
+        // A request to someone blocked is deleted, not retracted.
+        let blocked_outgoing = chat(Side::Outgoing, Stage::Blocked);
+        assert!(!allowed(Retract, blocked_outgoing) && allowed(Delete, blocked_outgoing));
+    }
+
+    #[test]
+    fn only_a_live_chat_is_written_to() {
+        let chat = |one_to_one: Option<OneToOne>, request| ChatSummary {
+            id: ChatId("c".into()),
+            title: "chat".into(),
+            is_group: one_to_one.is_none(),
+            request,
+            is_self_chat: false,
+            one_to_one,
+            preview: None,
+            last_activity: None,
+            unread: 0,
+        };
+        let stage = |stage| {
+            Some(OneToOne {
+                stage,
+                ..OneToOne::CONTACT
+            })
+        };
+        assert!(chat(None, None).composes(), "a group");
+        assert!(chat(stage(Stage::Open), None).composes());
+        let ended = chat(stage(Stage::Ended), None);
+        assert!(!ended.composes() && ended.ended());
+        assert!(!chat(stage(Stage::Blocked), None).composes());
+        let incoming = OneToOne {
+            side: Side::Incoming,
+            ..OneToOne::CONTACT
+        };
+        assert!(!chat(Some(incoming), Some(Request::Incoming)).composes());
     }
 
     #[test]

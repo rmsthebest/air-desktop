@@ -146,7 +146,8 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     upstream), that can't be undone, and the dialog says so. In a
     group, `:report <member>` (name or `#tag`, like `:kick`), and
     `:delete-chat` deletes the group. Deleting a contact ends their
-    chat too (the dialog says so).
+    chat too (the dialog says so); a contact's ended chat has no
+    composer, only a footer to delete it.
   - `safety.rs`: safety codes, port of upstream `UserCubit::safety_codes`.
     The core hashes each user's credential; the pair is ordered so both
     sides see the same 12 zero-padded five-digit blocks (3 lines of 4).
@@ -266,7 +267,7 @@ From an Air checkout:
 Clients use domain `localhost`. E2E: `AIR_E2E_CODE=<code> cargo test e2e_sign_up --
 --ignored`, and the two-user test with `AIR_E2E_CODES=<code>,<code> cargo test
 e2e_two -- --ignored`; linked devices with `AIR_E2E_CODES=<code>,<code> cargo test e2e_linked --
---ignored`; blocking, reporting, retracting and deleting with `AIR_E2E_CODES=<code>,<code>
+--ignored`; blocking, reporting, retracting and deleting with three codes, `AIR_E2E_CODES=<code>,<code>,<code>
 cargo test e2e_contacts -- --ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
 `AIR_DESKTOP_DATA_DIR=<dir> cargo run`. E2E tests use `flavor = "multi_thread"`: the
 core calls `block_in_place`.

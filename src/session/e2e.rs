@@ -22,6 +22,7 @@ use super::queue::{self, ConnectionStatus, QueueEvent};
 use super::{attachments, composer, devices, groups, messages, safety};
 use crate::model::{AttachmentState, Message, MessageBody, MessageStatus, Quote};
 use crate::settings::Notifications;
+use aircommon::identifiers::UserId as CoreUserId;
 use aircoreclient::clients::CoreUser;
 use aircoreclient::clients::store::{ClientRecord, ClientRecordState};
 use aircoreclient::{ChatStatus, ChatType};
@@ -1021,13 +1022,14 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
 async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
     use super::contact_safety::run as contact_op;
     use crate::model::ContactOp;
-    let codes = std::env::var("AIR_E2E_CODES").expect("set AIR_E2E_CODES to two codes");
-    let [ada_code, bob_code] = codes.split(',').collect::<Vec<_>>()[..] else {
-        panic!("AIR_E2E_CODES takes two comma-separated codes");
+    let codes = std::env::var("AIR_E2E_CODES").expect("set AIR_E2E_CODES to three codes");
+    let [ada_code, bob_code, carol_code] = codes.split(',').collect::<Vec<_>>()[..] else {
+        panic!("AIR_E2E_CODES takes three comma-separated codes");
     };
     let dir = tempfile::tempdir().unwrap();
     let ada = new_account(dir.path(), "Ada Lovelace", ada_code).await;
     let bob = new_account(dir.path(), "Bob", bob_code).await;
+    let carol = new_account(dir.path(), "Carol", carol_code).await;
     let (ada_alerts, _, _) = alerts();
     let (bob_alerts, _, _) = alerts();
     let _queues = [
@@ -1050,17 +1052,21 @@ async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
         })
         .await
     };
-    let pending_request = async |user: &CoreUser| {
-        eventually("the request arrives", async || {
-            for id in user.ordered_chat_ids().await.unwrap() {
-                if let Some(chat) = user.chat(&id).await
-                    && matches!(chat.chat_type, ChatType::PendingConnection(_))
-                    && matches!(chat.status(), ChatStatus::Active)
-                {
-                    return Some(id);
-                }
+    // The open request `user` has from `from`, if any yet.
+    let request_from = async |user: &CoreUser, from: &CoreUserId| {
+        for id in user.ordered_chat_ids().await.unwrap() {
+            if let Some(chat) = user.chat(&id).await
+                && chat.chat_type == ChatType::PendingConnection(from.clone())
+                && matches!(chat.status(), ChatStatus::Active)
+            {
+                return Some(id);
             }
-            None
+        }
+        None
+    };
+    let pending_request = async |user: &CoreUser, from: &CoreUser| {
+        eventually("the request arrives", async || {
+            request_from(user, from.user_id()).await
         })
         .await
     };
@@ -1076,7 +1082,7 @@ async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
     })
     .await;
     let asked = messages::core_chat_id(&asked);
-    let bobs_request = pending_request(&bob).await;
+    let bobs_request = pending_request(&bob, &ada).await;
     assert!(refused(
         contact_op(ada.clone(), ContactOp::Block, asked).await
     ));
@@ -1102,7 +1108,7 @@ async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
             .ok()
     })
     .await;
-    let request = pending_request(&ada).await;
+    let request = pending_request(&ada, &bob).await;
     let chat = contacts::accept_request(ada.clone(), request)
         .await
         .unwrap();
@@ -1175,7 +1181,7 @@ async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
     })
     .await;
     let asked = messages::core_chat_id(&asked);
-    let request = pending_request(&ada).await;
+    let request = pending_request(&ada, &bob).await;
     contact_op(ada.clone(), ContactOp::Block, request)
         .await
         .unwrap();
@@ -1192,16 +1198,20 @@ async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
             .ok()
     })
     .await;
-    // Nothing tells when Ada's listener dropped it: give it time. Too
-    // little could pass wrongly here, so it is generous.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    for id in ada.ordered_chat_ids().await.unwrap() {
-        let chat = ada.chat(&id).await.unwrap();
-        assert!(
-            !matches!(chat.chat_type, ChatType::PendingConnection(_)),
-            "a blocked sender's request reached Ada"
-        );
-    }
+    // Carol asks after him, on the same username: once Ada has Carol's
+    // request, her listener has been past Bob's.
+    eventually("Carol asks", async || {
+        contacts::add_contact(carol.clone(), ada_name.clone())
+            .await
+            .ok()
+    })
+    .await;
+    pending_request(&ada, &carol).await;
+    assert_eq!(
+        request_from(&ada, bob.user_id()).await,
+        None,
+        "a blocked sender's request reached Ada"
+    );
 }
 
 async fn new_account(dir: &std::path::Path, name: &str, code: &str) -> CoreUser {

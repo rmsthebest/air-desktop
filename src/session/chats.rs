@@ -493,48 +493,60 @@ impl LocalState {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn an_ended_contact_request_is_closed_not_open() {
-        use crate::model::Request;
+    fn the_cores_chats_map_to_one_to_one_facts() {
         use aircoreclient::ChatStatus;
         let user = aircommon::identifiers::UserId::random("localhost".parse().unwrap());
+        let facts = |chat_type: &ChatType, status: &ChatStatus| {
+            one_to_one(chat_type, status).map(|chat| (chat.side, chat.stage, chat.peer_known))
+        };
+        let ended = ChatStatus::inactive(vec![user.clone()]);
+        let contact = ChatType::Connection(user.clone());
         let incoming = ChatType::PendingConnection(user.clone());
         let outgoing = ChatType::TargetedMessageConnection(user.clone());
-        let ended = ChatStatus::inactive(vec![user.clone()]);
-        let request = |chat_type: &ChatType, status: &ChatStatus| {
-            one_to_one(chat_type, status).and_then(OneToOne::request)
-        };
-        assert_eq!(
-            request(&incoming, &ChatStatus::Active),
-            Some(Request::Incoming)
-        );
-        assert_eq!(
-            request(&outgoing, &ChatStatus::Pending),
-            Some(Request::Outgoing)
-        );
-        // Neither side can act on an ended request: no Accept, no waiting.
-        assert_eq!(request(&incoming, &ended), Some(Request::Closed));
-        assert_eq!(request(&outgoing, &ended), Some(Request::Closed));
-        assert_eq!(
-            request(&incoming, &ChatStatus::Blocked),
-            Some(Request::Closed)
-        );
-        assert_eq!(request(&ChatType::Connection(user.clone()), &ended), None);
-        // A blocked request's sender stays blocked, so it can be undone.
-        let stage = |chat_type, status| one_to_one(chat_type, status).map(|chat| chat.stage);
-        assert_eq!(stage(&incoming, &ChatStatus::Blocked), Some(Stage::Blocked));
-        let contact = ChatType::Connection(user);
-        assert_eq!(stage(&contact, &ChatStatus::Blocked), Some(Stage::Blocked));
-        assert_eq!(stage(&contact, &ChatStatus::Pending), Some(Stage::Sending));
         let by_name = ChatType::HandleConnection(
             aircommon::identifiers::Username::new("ada-lovelace".into()).unwrap(),
         );
-        let facts = one_to_one(&by_name, &ChatStatus::Active).unwrap();
-        assert_eq!((facts.side, facts.peer_known), (Side::Outgoing, false));
         let group = ChatType::Group(aircoreclient::ChatAttributes {
             title: "Engines".into(),
             picture: None,
         });
-        assert_eq!(one_to_one(&group, &ChatStatus::Active), None);
+        assert_eq!(
+            facts(&contact, &ChatStatus::Active),
+            Some((Side::Contact, Stage::Open, true))
+        );
+        // The peer deleted the contact: ended, no longer written to.
+        assert_eq!(
+            facts(&contact, &ended),
+            Some((Side::Contact, Stage::Ended, true))
+        );
+        assert_eq!(
+            facts(&contact, &ChatStatus::Blocked),
+            Some((Side::Contact, Stage::Blocked, true))
+        );
+        assert_eq!(
+            facts(&incoming, &ChatStatus::Active),
+            Some((Side::Incoming, Stage::Open, true))
+        );
+        assert_eq!(
+            facts(&incoming, &ChatStatus::Blocked),
+            Some((Side::Incoming, Stage::Blocked, true))
+        );
+        assert_eq!(
+            facts(&outgoing, &ChatStatus::Pending),
+            Some((Side::Outgoing, Stage::Sending, true))
+        );
+        // A request to someone blocked before (a group member, say).
+        assert_eq!(
+            facts(&outgoing, &ChatStatus::Blocked),
+            Some((Side::Outgoing, Stage::Blocked, true))
+        );
+        // Sent to a username: whom isn't known until they answer.
+        assert_eq!(
+            facts(&by_name, &ended),
+            Some((Side::Outgoing, Stage::Ended, false))
+        );
+        // Groups, and so the self chat, have none.
+        assert_eq!(facts(&group, &ChatStatus::Active), None);
     }
 
     use uuid::Uuid;

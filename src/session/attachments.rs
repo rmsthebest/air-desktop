@@ -327,8 +327,7 @@ pub(super) async fn full_picture(
     chat: ChatId,
     message: MessageId,
 ) -> Result<Picture, Failure> {
-    let _viewing =
-        Viewing::take().ok_or_else(|| Failure::Shown("Still opening an image".into()))?;
+    let viewing = Viewing::take().ok_or_else(|| Failure::Shown("Still opening an image".into()))?;
     let id = attachment_in(&user, chat, message).await?;
     match user.attachment_thumbnail(id).await? {
         Some(AttachmentThumbnail::Ready { .. } | AttachmentThumbnail::OriginalFits) => {}
@@ -350,7 +349,10 @@ pub(super) async fn full_picture(
     if bytes.len() > MAX_FULL_BYTES {
         return Err(Failure::Shown("That image is too large to show".into()));
     }
+    // The claim goes with the decode: the load may be aborted (the view
+    // dropped it), a blocking decode can't be, and two may not run at once.
     let decoded = tokio::task::spawn_blocking(move || {
+        let _viewing = viewing;
         decode_within(
             &bytes,
             MAX_FULL_EDGE,

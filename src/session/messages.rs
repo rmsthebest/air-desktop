@@ -346,13 +346,24 @@ impl Messages {
     ) -> Option<impl Future<Output = Result<crate::model::Picture, String>> + use<>> {
         let live = self.live.as_ref()?;
         let (user, chat, id) = (live.user.clone(), live.chat, core_message_id(id));
-        Some(on_tokio(cx, "show the image", async move {
+        // Read only, nothing to clean up: unlike other operations it stops
+        // when the view drops it (a chat change), so an abandoned load
+        // doesn't run on.
+        let task = Tokio::spawn(cx, async move {
             let id = id.ok_or_else(|| Failure::Shown("That message has no file".into()))?;
+            attachments::full_picture(user, chat, id).await
+        });
+        Some(async move {
             // Local only: a failure never blames the connection.
-            attachments::full_picture(user, chat, id)
-                .await
-                .map_err(|err| err.local("show the image"))
-        }))
+            match task.await.map_err(Failure::Internal).and_then(|r| r) {
+                Ok(picture) => Ok(picture),
+                Err(Failure::Shown(message)) => Err(message),
+                Err(Failure::Internal(err)) => {
+                    error!("failed to show the image: {err:#}");
+                    Err("Couldn't show the image".into())
+                }
+            }
+        })
     }
 
     /// Sends the message's file again after a failed upload.

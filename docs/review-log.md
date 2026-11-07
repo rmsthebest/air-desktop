@@ -1272,9 +1272,25 @@ the session test is deferred with the account seam.
 
 Fixed (medium): the viewer's own pending slot wasn't dropped when the
 chat changed (the shared `details` slot had been), so an image still
-opening could show over the next chat, and `v` there was refused until
-it ended. Opening or leaving a chat drops it now.
+opening could show over the next chat. Opening or leaving a chat drops
+it now. (That alone left the load running, and `v` in the next chat
+refused until it ended: fixed at gate 21d.)
 
 Deferred to milestone 20 (account seam): a gpui test that a pending view
 is dropped on a chat change (mock chats have no account, so no load
 ever starts).
+
+## Gate 21d — gate 21c fix (`f440395..e4c8b18`): PASS
+
+Fixed (medium): dropping the view's task didn't stop the image load,
+which ran detached (`on_tokio`) and held the session's single-flight
+claim, so `v` in the next chat was still refused until the abandoned
+read and decode ended. The viewer's load now runs on an aborting
+`Tokio::spawn` (read only, nothing to clean up), and the claim moves
+into the blocking decode, which can't be aborted: an aborted load frees
+it at once unless its decode already runs, and two decodes never do.
+The gate 21c entry is corrected.
+
+Deferred to milestone 20 (account seam): a test that a chat change
+drops a pending view and that `v` in the next chat then starts a load
+(the session claim released, not only the view's slot).

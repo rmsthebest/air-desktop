@@ -1207,11 +1207,16 @@ async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
     })
     .await;
     pending_request(&ada, &carol).await;
-    assert_eq!(
-        request_from(&ada, bob.user_id()).await,
-        None,
-        "a blocked sender's request reached Ada"
-    );
+    // His was erased with the block: any chat of his request, in any
+    // status, means it got through.
+    for id in ada.ordered_chat_ids().await.unwrap() {
+        let chat = ada.chat(&id).await.unwrap();
+        assert_ne!(
+            chat.chat_type,
+            ChatType::PendingConnection(bob.user_id().clone()),
+            "a blocked sender's request reached Ada"
+        );
+    }
 }
 
 async fn new_account(dir: &std::path::Path, name: &str, code: &str) -> CoreUser {

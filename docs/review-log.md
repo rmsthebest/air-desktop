@@ -1066,3 +1066,10 @@ Fixed (low):
 Kept on purpose: the Unblock footer on a blocked request's chat. The
 core erases such a chat when blocking, so it shows only if one is left,
 but it follows `check` and costs nothing.
+
+## Gate 17c — gate 17b fixes (`38cd8ad..ded1b28`): PASS
+
+Fixed (low): the e2e check that a blocked sender's next request never
+shows matched only open requests, so one stored blocked or ended would
+pass. It now fails on any chat of a request from him, whatever its
+status (his earlier one was erased with the block).

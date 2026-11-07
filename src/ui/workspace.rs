@@ -17,7 +17,7 @@ use crate::actions::{
     FocusComposer, FocusConversation, FocusMessages, FocusNextPane, InviteToGroup, JumpBack,
     JumpForward, LinkDevice, NewGroup, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine,
     OpenPalette, OpenSettings, PickTheme, PrevChat, PrevUnreadChat, SelectFirst, SelectLast,
-    ShowShortcuts, ToggleAppearance, ToggleDetails, ToggleHelixMode,
+    ShowSafetyCode, ShowShortcuts, ToggleAppearance, ToggleDetails, ToggleHelixMode,
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, Request, UserId, mock};
@@ -26,6 +26,7 @@ use crate::session::composer::Composer;
 use crate::session::devices::{self, Devices, Link, LinkEvent};
 use crate::session::groups::Members;
 use crate::session::messages::Messages;
+use crate::session::safety::SafetyLines;
 use crate::session::{OpenFromAlert, Session};
 use crate::settings::{Appearance, KeymapMode, Notifications, SettingsStore};
 use crate::theme;
@@ -744,6 +745,100 @@ impl Workspace {
         self.prompt("contact ", window, cx);
     }
 
+    /// Shows the safety code shared with the open chat's contact, or with
+    /// the open group's member `query` names (asked for if empty).
+    fn safety_code(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let list = self.chat_list.read(cx);
+        let Some(chat) = list.selected_index().map(|ix| list.chats()[ix].clone()) else {
+            return show_refusal("Open a chat first".into(), window, cx);
+        };
+        if chat.is_self_chat {
+            return show_refusal(
+                "That's your own devices: there's nobody to compare with".into(),
+                window,
+                cx,
+            );
+        }
+        if chat.is_group && query.trim().is_empty() {
+            return self.prompt("safety-code ", window, cx);
+        }
+        let Some(session) = &self.session else {
+            return show_refusal("That needs an account".into(), window, cx);
+        };
+        let (name, code) = if chat.is_group {
+            let Some((members, _)) = &self.members else {
+                return show_refusal("Still loading the members".into(), window, cx);
+            };
+            match members.read(cx).safety_code(query, cx) {
+                Ok((name, code)) => (name, futures_util::FutureExt::boxed_local(code)),
+                Err(refusal) => return show_refusal(refusal, window, cx),
+            }
+        } else {
+            let code = session.read(cx).contact_safety_code(&chat.id, cx);
+            (
+                chat.title.clone(),
+                futures_util::FutureExt::boxed_local(code),
+            )
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let code = code.await;
+            _ = this.update_in(cx, |this, window, cx| match code {
+                Ok(lines) => this.show_safety_code(name, lines, window, cx),
+                Err(refusal) => show_refusal(refusal, window, cx),
+            });
+        })
+        .detach();
+    }
+
+    fn show_safety_code(
+        &self,
+        name: gpui::SharedString,
+        lines: SafetyLines,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_focus = window.focused(cx);
+        let text = lines.text();
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let theme = cx.theme();
+            let (text, previous_focus) = (text.clone(), previous_focus.clone());
+            let code = v_flex()
+                .gap_1()
+                .py_2()
+                .font_family(theme.mono_font_family.clone())
+                .text_lg()
+                .children(lines.0.iter().map(|line| div().child(line.clone())));
+            alert
+                .confirm()
+                .title(format!("Safety code with {name}"))
+                .description(
+                    v_flex().gap_2().child(code).child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "Compare these digits with what {name} sees in Air, in \
+                             person or on a call. If they match, your messages are \
+                             end-to-end encrypted with them and nobody in between."
+                            )),
+                    ),
+                )
+                .ok_text("Copy")
+                .ok_variant(ButtonVariant::Primary)
+                .cancel_text("Close")
+                .on_ok(move |_, window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                    // Closed by hand, as in `confirm`: focus goes back.
+                    window.close_dialog(cx);
+                    if let Some(focus) = &previous_focus {
+                        focus.focus(window, cx);
+                    }
+                    show_info("Safety code copied".into(), window, cx);
+                    false
+                })
+        });
+    }
+
     fn link_device_prompt(&mut self, _: &LinkDevice, window: &mut Window, cx: &mut Context<Self>) {
         self.prompt("link ", window, cx);
     }
@@ -1127,6 +1222,7 @@ impl Workspace {
             Command::Link(code) => self.start_link(&code, window, cx),
             Command::DeviceName(input) => self.rename_device(&input, window, cx),
             Command::Unlink(query) => self.unlink_device(&query, window, cx),
+            Command::SafetyCode(query) => self.safety_code(&query, window, cx),
             Command::DeleteChat => {
                 let Some(chat) = self.open_group(window, cx) else {
                     return;
@@ -1538,6 +1634,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::add_contact))
             .on_action(cx.listener(Self::new_group))
             .on_action(cx.listener(Self::link_device_prompt))
+            .on_action(
+                cx.listener(|this, _: &ShowSafetyCode, window, cx| {
+                    this.safety_code("", window, cx)
+                }),
+            )
             .on_action(cx.listener(Self::attach_file))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::invite_to_group))
@@ -2347,6 +2448,78 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(told(cx), before + 1);
         assert!(workspace.read_with(cx, |workspace, _| workspace.linking.is_none()));
+    }
+
+    #[gpui::test]
+    fn the_safety_code_is_copied_as_shown_and_focus_comes_back(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let focus = focus_probe(&workspace, cx);
+        let lines = SafetyLines([
+            "00001 00002 00003 00004".into(),
+            "00005 00006 00007 00008".into(),
+            "00009 00010 00011 00012".into(),
+        ]);
+        let asking =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| window.has_active_dialog(cx));
+        let shown = |lines: &SafetyLines, cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.show_safety_code("Grace".into(), lines.clone(), window, cx)
+            });
+            cx.run_until_parked();
+            assert!(asking(cx));
+        };
+        let before = focus(cx);
+        // Escape closes without copying.
+        shown(&lines, cx);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert_eq!(cx.read_from_clipboard(), None);
+        // Enter copies the digits as shown, a line each.
+        shown(&lines, cx);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("00001 00002 00003 00004\n00005 00006 00007 00008\n00009 00010 00011 00012")
+        );
+        assert_eq!(focus(cx), before);
+    }
+
+    #[gpui::test]
+    fn the_safety_code_is_refused_where_there_is_nobody_to_compare_with(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        enable_helix(cx);
+        let told =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| window.notifications(cx).len());
+        let run = |line: &str, cx: &mut VisualTestContext| {
+            cx.simulate_keystrokes(":");
+            cx.run_until_parked();
+            cx.simulate_input(line);
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+        };
+        // No chat open.
+        let before = told(cx);
+        run("safety-code", cx);
+        assert_eq!(told(cx), before + 1);
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        // In a group, the member is asked for on the command line.
+        run("o design", cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.safety_code("", window, cx)
+        });
+        cx.run_until_parked();
+        let prompt = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .command_line
+                .as_ref()
+                .map(|(line, _)| line.read(cx).value(cx))
+        });
+        assert_eq!(prompt.as_deref(), Some("safety-code "));
     }
 
     #[gpui::test]

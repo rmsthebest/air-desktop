@@ -44,6 +44,18 @@ pub fn details_pane(
                         "Contact"
                     },
                 ))
+                .when(
+                    !chat.is_group && !chat.is_self_chat && chat.request.is_none(),
+                    |pane| {
+                        pane.child(
+                            div()
+                                .pt_4()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(":safety-code to check this is really them"),
+                        )
+                    },
+                )
         })
         .when_some(members, |pane, members| {
             pane.child(

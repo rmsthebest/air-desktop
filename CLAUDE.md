@@ -132,6 +132,12 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     the own user for the core's unlink reason; the app root then drops the
     workspace, closes and deletes this client's database (as upstream's
     `deleteCurrentDatabase`) and shows onboarding with a notice.
+  - `safety.rs`: safety codes, port of upstream `UserCubit::safety_codes`.
+    The core hashes each user's credential; the pair is ordered so both
+    sides see the same 12 zero-padded five-digit blocks (3 lines of 4).
+    `:safety-code` (`secondary-shift-s`) for the open contact, or
+    `:safety-code <member>` (name or `#tag`) in a group; only for accepted
+    contacts. Shown in a dialog: Enter copies, Escape closes.
 - `src/notifier.rs` — shows alerts via `org.freedesktop.Notifications`
   (zbus 5 on async-io, gpui's own copy). Replaces a chat's notification
   instead of stacking, closes it on dismissal, escapes bodies when the

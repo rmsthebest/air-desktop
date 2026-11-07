@@ -25,6 +25,7 @@
       "secondary-enter": "air::AcceptRequest",
       "secondary-shift-backspace": "air::DeclineRequest",
       "secondary-shift-t": "air::ToggleAppearance",
+      "secondary-shift-s": "air::ShowSafetyCode",
       "secondary-1": ["air::OpenChatAt", { "index": 0 }],
       "secondary-2": ["air::OpenChatAt", { "index": 1 }],
       "secondary-3": ["air::OpenChatAt", { "index": 2 }],

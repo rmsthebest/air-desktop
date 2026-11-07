@@ -26,4 +26,4 @@ milestones. Each one ends with a review gate (see CLAUDE.md).
 13. **Multi-device linking** (done). Link and unlink devices. With a second
     device of the same user, cover sibling notification suppression in
     the e2e tests (deferred since gate 9).
-14. **Safety codes.** Show and compare a contact's safety code.
+14. **Safety codes** (done). Show and compare a contact's safety code.

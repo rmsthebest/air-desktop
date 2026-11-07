@@ -304,6 +304,30 @@ impl Members {
         })
     }
 
+    /// The member other than the user that `query` names (see
+    /// [`find_member`]): their name, tag and core id.
+    pub(super) fn find(
+        &self,
+        query: &str,
+    ) -> Result<(SharedString, SharedString, CoreUserId), String> {
+        if self.failed {
+            return Err("Couldn't load the members; reopen the group".into());
+        }
+        if !self.loaded {
+            return Err("Still loading the members".into());
+        }
+        let ix = find_member(&self.members, query)?;
+        Ok((
+            self.members[ix].name.clone(),
+            self.members[ix].tag.clone(),
+            self.core_ids[ix].clone(),
+        ))
+    }
+
+    pub(super) fn user(&self) -> &CoreUser {
+        &self.user
+    }
+
     /// What `:kick` completes (see [`removal_candidates`]).
     pub fn candidates(&self) -> Vec<(String, String)> {
         removal_candidates(&self.members)

@@ -19,7 +19,7 @@ use super::chats::{self, Update};
 use super::contacts::{self, Failure};
 use super::pending::Pending;
 use super::queue::{self, ConnectionStatus, QueueEvent};
-use super::{attachments, composer, devices, groups, messages};
+use super::{attachments, composer, devices, groups, messages, safety};
 use crate::model::{AttachmentState, Message, MessageBody, MessageStatus, Quote};
 use crate::settings::Notifications;
 use aircoreclient::clients::CoreUser;
@@ -942,6 +942,21 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
     })
     .await;
     eventually("the desk has the chat", async || desk.chat(&chat).await).await;
+
+    // Ada and Bob see the same safety code, and so does Ada's other
+    // device (one credential per user); someone else's code differs.
+    let ada_sees = safety::with(&ada, bob.user_id()).await.ok().unwrap();
+    let bob_sees = safety::with(&bob, ada.user_id()).await.ok().unwrap();
+    assert_eq!(ada_sees, bob_sees);
+    let desk_sees = eventually("the desk has Bob's credential", async || {
+        safety::with(&desk, bob.user_id()).await.ok()
+    })
+    .await;
+    assert_eq!(desk_sees, ada_sees);
+    assert_ne!(
+        safety::with(&ada, ada.user_id()).await.ok().unwrap(),
+        ada_sees
+    );
 
     // Bob writes until Ada's first device's next notice for the chat is a
     // `quiet` one (dismissed, the desk shows it) or not.

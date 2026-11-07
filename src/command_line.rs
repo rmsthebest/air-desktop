@@ -44,6 +44,9 @@ pub enum Command {
     DeviceName(String),
     /// Unlink a device, by `#tag` or name as typed (after confirming).
     Unlink(String),
+    /// Show the safety code shared with the open chat's contact, or with
+    /// the open group's member named (as typed).
+    SafetyCode(String),
 }
 
 /// What arguments complete from.
@@ -199,6 +202,11 @@ const SPECS: &[Spec] = &[
         help: "Unlink one of your other devices",
     },
     Spec {
+        names: &["safety-code"],
+        arg: Arg::Member,
+        help: "Compare safety codes with the contact (or a group member)",
+    },
+    Spec {
         names: &["help", "shortcuts"],
         arg: Arg::None,
         help: "Show keyboard shortcuts",
@@ -265,6 +273,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "link" => Command::Link(need("the code the new device shows")?),
         "device-name" => Command::DeviceName(need("a name")?),
         "unlink" => Command::Unlink(need("a device")?),
+        "safety-code" => Command::SafetyCode(arg.to_string()),
         other => unreachable!("spec {other} has no parser"),
     })
 }

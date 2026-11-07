@@ -64,6 +64,7 @@ gpui_kit::actions!(
         LinkDevice,
         LinkExistingAccount,
         CancelLink,
+        ShowSafetyCode,
     ]
 );
 
@@ -118,6 +119,7 @@ pub fn commands() -> Vec<Command> {
         cmd("Attach a file", AttachFile, "Workspace"),
         cmd("Settings", OpenSettings, "Workspace"),
         cmd("Link a device", LinkDevice, "Workspace"),
+        cmd("Compare safety code", ShowSafetyCode, "Workspace"),
         cmd("Accept contact request", AcceptRequest, "Workspace"),
         cmd("Decline contact request", DeclineRequest, "Workspace"),
         cmd("Toggle details pane", ToggleDetails, "Workspace"),
@@ -182,6 +184,7 @@ pub fn label(action: &dyn Action) -> String {
         "LinkDevice" => "link a device",
         "LinkExistingAccount" => "link to an existing account",
         "CancelLink" => "cancel linking",
+        "ShowSafetyCode" => "safety code",
         "AddContact" => "add contact",
         "NewGroup" => "new group",
         "InviteToGroup" => "invite to group",

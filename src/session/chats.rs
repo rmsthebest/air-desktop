@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::error;
 
-use crate::model::{ChatId, ChatSummary, Request, name_line};
+use crate::model::{ChatId, ChatSummary, OneToOne, Side, Stage, name_line};
 use crate::runtime::{Tokio, TokioTask};
 use crate::session::pending::Pending;
 use crate::session::preview;
@@ -308,22 +308,19 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         .unwrap_or(false);
 
     let mut users = Vec::new();
-    let (title, request, is_group) = match &chat.chat_type {
-        ChatType::HandleConnection(username) => (
-            username.plaintext().to_string(),
-            request(&chat.chat_type, chat.status()),
-            false,
-        ),
+    let (title, is_group) = match &chat.chat_type {
+        ChatType::HandleConnection(username) => (username.plaintext().to_string(), false),
         ChatType::Connection(peer)
         | ChatType::TargetedMessageConnection(peer)
         | ChatType::PendingConnection(peer) => {
             users.push(peer.clone());
             let name = user.user_profile(peer).await.display_name.to_string();
-            (name, request(&chat.chat_type, chat.status()), false)
+            (name, false)
         }
         // The self chat is a group of the user's devices, not one to manage.
-        ChatType::Group(attributes) => (attributes.title.clone(), None, !is_self_chat),
+        ChatType::Group(attributes) => (attributes.title.clone(), !is_self_chat),
     };
+    let one_to_one = one_to_one(&chat.chat_type, chat.status());
     let title = if is_self_chat {
         "Notes to self".to_string()
     } else {
@@ -342,9 +339,9 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         // Peer-controlled: titles and names arrive unvalidated.
         title: name_line(&title),
         is_group,
-        request,
+        request: one_to_one.and_then(OneToOne::request),
         is_self_chat,
-        blocked: blocked(&chat.chat_type, chat.status()),
+        one_to_one,
         preview: preview::preview(
             draft.as_ref().map(|draft| draft.message.as_str()),
             last_message,
@@ -363,25 +360,28 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
     (summary, keys)
 }
 
-/// A contact the user blocked. Blocking is the connection user's; a
-/// request's chat shows it as ended instead (see [`request`]).
-fn blocked(chat_type: &ChatType, status: &ChatStatus) -> bool {
-    matches!(chat_type, ChatType::Connection(_)) && matches!(status, ChatStatus::Blocked)
-}
-
-/// A connection chat's request state. The core closes a request that
-/// expired or was withdrawn by making the chat inactive (as upstream reads
-/// it).
-fn request(chat_type: &ChatType, status: &ChatStatus) -> Option<Request> {
-    let open = match chat_type {
-        ChatType::Connection(_) | ChatType::Group(_) => return None,
-        ChatType::PendingConnection(_) => Request::Incoming,
-        ChatType::HandleConnection(_) | ChatType::TargetedMessageConnection(_) => Request::Outgoing,
+/// A one-to-one chat's facts, for contact operations and its request
+/// state; `None` for groups (the self chat is one). The core ends a
+/// request that expired or was withdrawn by making the chat inactive (as
+/// upstream reads it).
+pub(super) fn one_to_one(chat_type: &ChatType, status: &ChatStatus) -> Option<OneToOne> {
+    let (side, peer_known) = match chat_type {
+        ChatType::Group(_) => return None,
+        ChatType::Connection(_) => (Side::Contact, true),
+        ChatType::PendingConnection(_) => (Side::Incoming, true),
+        ChatType::TargetedMessageConnection(_) => (Side::Outgoing, true),
+        ChatType::HandleConnection(_) => (Side::Outgoing, false),
     };
-    Some(match status {
-        // A blocked peer's request can't be acted on either.
-        ChatStatus::Inactive(_) | ChatStatus::Blocked => Request::Closed,
-        _ => open,
+    let stage = match status {
+        ChatStatus::Pending => Stage::Sending,
+        ChatStatus::Active => Stage::Open,
+        ChatStatus::Inactive(_) => Stage::Ended,
+        ChatStatus::Blocked => Stage::Blocked,
+    };
+    Some(OneToOne {
+        side,
+        stage,
+        peer_known,
     })
 }
 
@@ -494,11 +494,15 @@ impl LocalState {
 mod tests {
     #[test]
     fn an_ended_contact_request_is_closed_not_open() {
+        use crate::model::Request;
         use aircoreclient::ChatStatus;
         let user = aircommon::identifiers::UserId::random("localhost".parse().unwrap());
         let incoming = ChatType::PendingConnection(user.clone());
         let outgoing = ChatType::TargetedMessageConnection(user.clone());
         let ended = ChatStatus::inactive(vec![user.clone()]);
+        let request = |chat_type: &ChatType, status: &ChatStatus| {
+            one_to_one(chat_type, status).and_then(OneToOne::request)
+        };
         assert_eq!(
             request(&incoming, &ChatStatus::Active),
             Some(Request::Incoming)
@@ -515,11 +519,22 @@ mod tests {
             Some(Request::Closed)
         );
         assert_eq!(request(&ChatType::Connection(user.clone()), &ended), None);
-        // Only a contact is shown blocked; a blocked request has ended.
+        // A blocked request's sender stays blocked, so it can be undone.
+        let stage = |chat_type, status| one_to_one(chat_type, status).map(|chat| chat.stage);
+        assert_eq!(stage(&incoming, &ChatStatus::Blocked), Some(Stage::Blocked));
         let contact = ChatType::Connection(user);
-        assert!(blocked(&contact, &ChatStatus::Blocked));
-        assert!(!blocked(&contact, &ChatStatus::Active));
-        assert!(!blocked(&incoming, &ChatStatus::Blocked));
+        assert_eq!(stage(&contact, &ChatStatus::Blocked), Some(Stage::Blocked));
+        assert_eq!(stage(&contact, &ChatStatus::Pending), Some(Stage::Sending));
+        let by_name = ChatType::HandleConnection(
+            aircommon::identifiers::Username::new("ada-lovelace".into()).unwrap(),
+        );
+        let facts = one_to_one(&by_name, &ChatStatus::Active).unwrap();
+        assert_eq!((facts.side, facts.peer_known), (Side::Outgoing, false));
+        let group = ChatType::Group(aircoreclient::ChatAttributes {
+            title: "Engines".into(),
+            picture: None,
+        });
+        assert_eq!(one_to_one(&group, &ChatStatus::Active), None);
     }
 
     use uuid::Uuid;
@@ -533,7 +548,7 @@ mod tests {
             is_group: false,
             request: None,
             is_self_chat: false,
-            blocked: false,
+            one_to_one: None,
             preview: None,
             last_activity: None,
             unread: 0,

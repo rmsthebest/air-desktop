@@ -281,9 +281,20 @@ impl Conversation {
     }
 
     /// The open chat's summary changed; its messages stay as they are.
-    pub fn update_chat(&mut self, chat: ChatSummary, cx: &mut Context<Self>) {
+    /// If it can no longer be written to (say another device blocked the
+    /// contact), the keyboard moves from the composer to the messages.
+    pub fn update_chat(&mut self, chat: ChatSummary, window: &mut Window, cx: &mut Context<Self>) {
+        if !chat.composes() && self.composer_focus(cx).contains_focused(window, cx) {
+            self.focus_handle.focus(window, cx);
+        }
         self.chat = Some(chat);
         cx.notify();
+    }
+
+    /// Whether the open chat has a composer: nothing is replied to or
+    /// edited in one that hasn't (a request, a blocked contact).
+    fn composes(&self) -> bool {
+        self.chat.as_ref().is_some_and(ChatSummary::composes)
     }
 
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -411,6 +422,9 @@ impl Conversation {
     }
 
     fn edit_message(&mut self, _: &EditMessage, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.composes() {
+            return;
+        }
         let Some(id) = self
             .cursor_message(cx)
             // Only text is edited; a file is sent anew.
@@ -440,6 +454,9 @@ impl Conversation {
     }
 
     fn reply(&mut self, _: &ReplyToMessage, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.composes() {
+            return;
+        }
         let Some(id) = self
             .cursor_message(cx)
             .filter(|m| !m.is_event())
@@ -1133,8 +1150,9 @@ impl Render for Conversation {
                     .child(self.probe_results(cx)),
             )
             .child(match chat.request {
+                // A blocked request's sender too: the block outlives it.
+                _ if chat.blocked() => render_blocked(&chat.title, cx),
                 Some(request) => render_request(request, &chat.title, cx),
-                None if chat.blocked => render_blocked(&chat.title, cx),
                 None => self
                     .render_composer(composer_context, composer_focused, compose_bar, cx)
                     .into_any_element(),
@@ -1281,7 +1299,8 @@ fn render_blocked(title: &SharedString, cx: &App) -> AnyElement {
     let card = card(cx)
         .child(
             card_text(format!(
-                "You won't receive messages from {title} unless you unblock them."
+                "You won't receive messages or contact requests from {title} \
+                 unless you unblock them."
             ))
             .text_color(cx.theme().muted_foreground),
         )

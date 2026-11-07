@@ -134,16 +134,19 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     `deleteCurrentDatabase`) and shows onboarding with a notice.
   - `contact_safety.rs`: block / unblock, report spam, retract an
     outgoing request, delete a one-to-one chat (upstream `UserCubit`).
-    The pure `check` decides from the chat's type and status what may
-    run and on whom (a request sent to a username has no known peer);
-    the workspace's `contact_confirmation` words the dialog and refuses
-    early, but the session's check is the one that counts. Blocking is
-    local and synced to the user's devices: an incoming request is
-    declined, a contact's chat shows `blocked` (no composer, an Unblock
-    footer, no preview or badge in the list) and the core drops their
-    messages. In a group, `:report <member>` (name or `#tag`, like
-    `:kick`) and `:delete-chat` deletes the group. `:delete-chat` refuses
-    open requests (decline or retract them).
+    One rule table, `model::ContactOp::check`, on a chat's `OneToOne`
+    facts (side, stage, whether the peer is known; derived by
+    `chats::one_to_one`): the workspace asks it before the dialog (and
+    only picks the wording), the session again on the core's state.
+    Blocking is local and synced to the user's devices: a contact's
+    chat shows blocked (no composer, an Unblock footer; no preview,
+    badge or unread stop in the list) and the core drops their
+    messages. Blocking an incoming request declines and erases it: with
+    no blocked-contacts list (the core has none public, nor has
+    upstream), that can't be undone, and the dialog says so. In a
+    group, `:report <member>` (name or `#tag`, like `:kick`), and
+    `:delete-chat` deletes the group. Deleting a contact ends their
+    chat too (the dialog says so).
   - `safety.rs`: safety codes, port of upstream `UserCubit::safety_codes`.
     The core hashes each user's credential; the pair is ordered so both
     sides see the same 12 zero-padded five-digit blocks (3 lines of 4).

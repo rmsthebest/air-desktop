@@ -1019,7 +1019,8 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a local Air server and AIR_E2E_CODES"]
 async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
-    use super::contact_safety::{ContactOp, run as contact_op};
+    use super::contact_safety::run as contact_op;
+    use crate::model::ContactOp;
     let codes = std::env::var("AIR_E2E_CODES").expect("set AIR_E2E_CODES to two codes");
     let [ada_code, bob_code] = codes.split(',').collect::<Vec<_>>()[..] else {
         panic!("AIR_E2E_CODES takes two comma-separated codes");
@@ -1164,6 +1165,43 @@ async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
         matches!(status(&bob, bob_chat).await, ChatStatus::Inactive(_)).then_some(())
     })
     .await;
+
+    // Bob asks again; Ada blocks the request. The core declines it and
+    // erases its chat, and Bob's next request never reaches her.
+    let asked = eventually("Bob asks again", async || {
+        contacts::add_contact(bob.clone(), ada_name.clone())
+            .await
+            .ok()
+    })
+    .await;
+    let asked = messages::core_chat_id(&asked);
+    let request = pending_request(&ada).await;
+    contact_op(ada.clone(), ContactOp::Block, request)
+        .await
+        .unwrap();
+    assert!(ada.chat(&request).await.is_none());
+    eventually("Bob retracts the declined request", async || {
+        contact_op(bob.clone(), ContactOp::Retract, asked)
+            .await
+            .ok()
+    })
+    .await;
+    eventually("Bob asks once more", async || {
+        contacts::add_contact(bob.clone(), ada_name.clone())
+            .await
+            .ok()
+    })
+    .await;
+    // Nothing tells when Ada's listener dropped it: give it time. Too
+    // little could pass wrongly here, so it is generous.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    for id in ada.ordered_chat_ids().await.unwrap() {
+        let chat = ada.chat(&id).await.unwrap();
+        assert!(
+            !matches!(chat.chat_type, ChatType::PendingConnection(_)),
+            "a blocked sender's request reached Ada"
+        );
+    }
 }
 
 async fn new_account(dir: &std::path::Path, name: &str, code: &str) -> CoreUser {

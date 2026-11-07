@@ -21,10 +21,11 @@ use crate::actions::{
     ToggleAppearance, ToggleDetails, ToggleHelixMode, UnblockContact,
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
-use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, Request, UserId, mock};
+use crate::model::{
+    ChatId, ChatSummary, ContactOp, JumpList, Message, MessageId, Request, Side, UserId, mock,
+};
 use crate::session::chats::{Chats, LoadState};
 use crate::session::composer::Composer;
-use crate::session::contact_safety::ContactOp;
 use crate::session::devices::{self, Devices, Link, LinkEvent};
 use crate::session::groups::Members;
 use crate::session::messages::Messages;
@@ -95,28 +96,28 @@ const REPORT_SPAM: &str = "Air will be notified that this person may be sending 
                            Air is never able to see the contents of any chats.";
 
 /// The confirmation `op` asks for in the one-to-one `chat` (title,
-/// description, button), or why it doesn't apply there. Upstream's wording.
-/// The session checks again against the core's state.
+/// description, button), or why it doesn't apply there
+/// ([`ContactOp::check`], which the session asks again). Upstream's
+/// wording.
 fn contact_confirmation(
     op: ContactOp,
     chat: &ChatSummary,
 ) -> Result<(String, String, &'static str), &'static str> {
+    let facts = chat.one_to_one.ok_or("That's for a contact's chat")?;
+    op.check(facts)?;
     let name = &chat.title;
-    Ok(match (op, chat.request) {
-        (ContactOp::Block, _) if chat.blocked => return Err("They're blocked already"),
-        (ContactOp::Block, Some(Request::Outgoing)) => {
-            return Err("Retract your request instead: :retract");
-        }
-        (ContactOp::Block, Some(Request::Incoming)) => (
+    Ok(match op {
+        ContactOp::Block if facts.side == Side::Incoming => (
             format!("Block {name}?"),
             format!(
                 "You'll decline {name}'s contact request and won't receive contact \
                  requests or messages from them anymore. They won't be able to see \
-                 that you blocked them."
+                 that you blocked them. The request goes away, and with it the only \
+                 place to unblock them."
             ),
             "Block",
         ),
-        (ContactOp::Block, _) => (
+        ContactOp::Block => (
             format!("Block {name}?"),
             format!(
                 "You won't receive messages from {name} and they won't be able to view \
@@ -125,8 +126,7 @@ fn contact_confirmation(
             ),
             "Block",
         ),
-        (ContactOp::Unblock, _) if !chat.blocked => return Err("They aren't blocked"),
-        (ContactOp::Unblock, _) => (
+        ContactOp::Unblock => (
             format!("Unblock {name}?"),
             format!(
                 "You'll be able to send and receive messages from {name} and they'll be \
@@ -134,35 +134,31 @@ fn contact_confirmation(
             ),
             "Unblock",
         ),
-        (ContactOp::Report, _) => (
+        ContactOp::Report => (
             format!("Report {name} for spam?"),
             REPORT_SPAM.into(),
             "Report spam",
         ),
-        (ContactOp::Retract, Some(Request::Outgoing)) => (
+        ContactOp::Retract => (
             "Retract contact request?".into(),
             format!(
-                "If you retract your contact request, {name} will no longer be able to accept it."
+                "If you retract your contact request, {name} will no longer be able to \
+                 accept it."
             ),
             "Retract",
         ),
-        (ContactOp::Retract, _) => return Err("Only a contact request you sent can be retracted"),
-        (ContactOp::Delete, Some(Request::Incoming)) => {
-            return Err("Decline the request instead: :decline");
-        }
-        (ContactOp::Delete, Some(Request::Outgoing)) => {
-            return Err("Retract the request instead: :retract");
-        }
-        (ContactOp::Delete, Some(Request::Closed)) => (
-            "Delete this request?".into(),
-            "The ended request is erased from all your devices.".into(),
+        ContactOp::Delete if facts.side == Side::Contact => (
+            format!("Delete {name}?"),
+            format!(
+                "{name} is removed from your contacts and their chat with you ends. \
+                 The chat and its history are erased from all your devices. To talk \
+                 again, one of you sends a new contact request."
+            ),
             "Delete",
         ),
-        (ContactOp::Delete, None) => (
-            format!("Delete {name}?"),
-            "The chat and its message history are erased from all your devices. \
-             This can't be undone."
-                .into(),
+        ContactOp::Delete => (
+            "Delete this request?".into(),
+            "The ended request is erased from all your devices.".into(),
             "Delete",
         ),
     })
@@ -270,8 +266,9 @@ impl Workspace {
                     }
                     ChatListEvent::Updated(chat) => {
                         let chat = chat.clone();
-                        this.conversation
-                            .update(cx, |conversation, cx| conversation.update_chat(chat, cx));
+                        this.conversation.update(cx, |conversation, cx| {
+                            conversation.update_chat(chat, window, cx)
+                        });
                         cx.notify();
                     }
                     ChatListEvent::Closed => {
@@ -1027,7 +1024,7 @@ impl Workspace {
         let chat = list.selected_index().map(|ix| &list.chats()[ix]);
         match chat {
             Some(chat) if chat.composes() => Some(chat.id.clone()),
-            Some(chat) if chat.blocked => {
+            Some(chat) if chat.blocked() => {
                 show_refusal("Unblock them first: :unblock".into(), window, cx);
                 None
             }
@@ -1404,16 +1401,12 @@ impl Workspace {
                     window,
                     cx,
                     move |session, cx| session.contact_op(op, &id, cx),
-                    move |(), this, window, cx| match op {
-                        ContactOp::Report => show_info("Spam reported".into(), window, cx),
-                        // The composer goes: keep the keyboard in the chat.
-                        ContactOp::Block => {
-                            let conversation = this.conversation.read(cx);
-                            if conversation.composer_focus(cx).contains_focused(window, cx) {
-                                conversation.focus_handle(cx).focus(window, cx);
-                            }
+                    // A block's lost composer is handled with the
+                    // chat's update (`Conversation::update_chat`).
+                    move |(), _, window, cx| {
+                        if op == ContactOp::Report {
+                            show_info("Spam reported".into(), window, cx)
                         }
-                        _ => {}
                     },
                 );
             },
@@ -2359,19 +2352,34 @@ mod tests {
 
     #[gpui::test]
     fn a_blocked_contact_takes_no_typing_and_nothing_runs_unasked(cx: &mut TestAppContext) {
+        use crate::model::{OneToOne, Stage};
         let (workspace, cx) = setup(cx);
         let focused = focus_probe(&workspace, cx);
         let chat_list = workspace.read_with(cx, |workspace, _| workspace.chat_list.clone());
-        chat_list.update(cx, |list, cx| {
-            let mut chats = list.chats().to_vec();
-            assert!(!chats[0].is_group);
-            chats[0].blocked = true;
-            list.set_chats(chats, LoadState::Loaded, cx);
-        });
+        let set_first = |request, facts, cx: &mut VisualTestContext| {
+            chat_list.update(cx, |list, cx| {
+                let mut chats = list.chats().to_vec();
+                assert!(!chats[0].is_group);
+                chats[0].request = request;
+                chats[0].one_to_one = Some(facts);
+                list.set_chats(chats, LoadState::Loaded, cx);
+            });
+            cx.run_until_parked();
+        };
+        let blocked = OneToOne {
+            stage: Stage::Blocked,
+            ..OneToOne::CONTACT
+        };
+        // Blocked (say from another device) while writing: the keyboard
+        // moves to the messages, not into a composer that is gone.
         cx.simulate_keystrokes("j enter");
-        // Nothing reaches a blocked contact: no composer to type into.
+        assert_eq!(focused(cx), Focus::Composer);
+        set_first(None, blocked, cx);
         assert_eq!(focused(cx), Focus::Messages);
+        // Nothing reaches a blocked contact: no typing, replying or editing.
         cx.simulate_input("hi");
+        cx.simulate_keystrokes("up r");
+        assert_eq!(focused(cx), Focus::Messages);
         assert_eq!(composer_text(&workspace, cx), "");
 
         let asking = |cx: &mut VisualTestContext| cx.update(|w, cx| w.has_active_dialog(cx));
@@ -2397,6 +2405,19 @@ mod tests {
         assert!(!asking(cx));
         assert_eq!(told(cx), before + 3);
         assert_eq!(focused(cx), Focus::Messages);
+
+        // Should a blocked request's chat be left (the core erases it when
+        // blocking), its sender can be unblocked there too.
+        let blocked_request = OneToOne {
+            side: crate::model::Side::Incoming,
+            ..blocked
+        };
+        set_first(Some(Request::Closed), blocked_request, cx);
+        ask(ContactOp::Unblock, "", cx);
+        assert!(asking(cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(told(cx), before + 3);
     }
 
     #[gpui::test]
@@ -3139,47 +3160,35 @@ mod tests {
     }
 
     #[test]
-    fn contact_operations_are_asked_about_only_where_they_apply() {
-        use ContactOp::*;
-        let chat = |request, blocked| ChatSummary {
+    fn contact_dialogs_say_what_really_happens() {
+        use crate::model::{OneToOne, Side, Stage};
+        let chat = |one_to_one| ChatSummary {
             id: ChatId("c".into()),
             title: "Ada".into(),
             is_group: false,
-            request,
+            request: None,
             is_self_chat: false,
-            blocked,
+            one_to_one,
             preview: None,
             last_activity: None,
             unread: 0,
         };
-        let asks = |op, chat: &ChatSummary| contact_confirmation(op, chat).map(|(_, _, ok)| ok);
-        let contact = chat(None, false);
-        let blocked = chat(None, true);
-        let (incoming, outgoing, ended) = (
-            chat(Some(Request::Incoming), false),
-            chat(Some(Request::Outgoing), false),
-            chat(Some(Request::Closed), false),
-        );
-        assert_eq!(asks(Block, &contact), Ok("Block"));
-        assert!(asks(Block, &blocked).is_err());
-        assert!(asks(Unblock, &contact).is_err());
-        assert_eq!(asks(Unblock, &blocked), Ok("Unblock"));
-        // Blocking a request's sender says it declines the request.
-        let (_, said, _) = contact_confirmation(Block, &incoming).unwrap();
-        assert!(said.contains("decline"), "{said}");
-        assert!(asks(Block, &outgoing).is_err());
-        // Only an open request the user sent is retracted.
-        assert_eq!(asks(Retract, &outgoing), Ok("Retract"));
-        for chat in [&contact, &incoming, &ended] {
-            assert!(asks(Retract, chat).is_err());
-        }
-        // Open requests are declined or retracted, not deleted.
-        assert!(asks(Delete, &incoming).is_err());
-        assert!(asks(Delete, &outgoing).is_err());
-        for chat in [&contact, &blocked, &ended] {
-            assert_eq!(asks(Delete, chat), Ok("Delete"));
-        }
-        assert_eq!(asks(Report, &contact), Ok("Report spam"));
+        let said = |op, facts| contact_confirmation(op, &chat(Some(facts))).unwrap().1;
+        let incoming = OneToOne {
+            side: Side::Incoming,
+            ..OneToOne::CONTACT
+        };
+        // Blocking a request's sender declines the request.
+        assert!(said(ContactOp::Block, incoming).contains("decline"));
+        // Deleting a contact ends their chat too, not only the user's.
+        assert!(said(ContactOp::Delete, OneToOne::CONTACT).contains("their chat with you ends"));
+        // The rules are `ContactOp::check`'s: refused where it refuses.
+        let ended = OneToOne {
+            stage: Stage::Ended,
+            ..incoming
+        };
+        assert!(contact_confirmation(ContactOp::Retract, &chat(Some(ended))).is_err());
+        assert!(contact_confirmation(ContactOp::Block, &chat(None)).is_err());
     }
 
     #[test]
@@ -3190,7 +3199,7 @@ mod tests {
             is_group,
             request: None,
             is_self_chat,
-            blocked: false,
+            one_to_one: None,
             preview: None,
             last_activity: None,
             unread: 0,

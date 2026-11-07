@@ -1015,3 +1015,28 @@ request replaces a pending one; mock data stops before the lookup.
 Fixed (low): a peer credential that hasn't arrived yet (expected) was
 logged as an error; the peer lookup logs a warning, the own lookup
 (which should never fail) an error.
+
+## Gate 17 — milestone 15 (`5617b19..be28733`): PASS
+
+Fixed:
+- **Two rule tables (medium).** The view's pre-check copied the
+  session's and already disagreed (unblock on a blocked request; report
+  or retract of a request to a username asked first, then refused).
+  There is one now, `model::ContactOp::check`, on `OneToOne` facts that
+  `ChatSummary` carries; the view only words the dialog.
+  `each_contact_operation_applies_only_where_it_may` replaces both tests.
+- **A blocked request's sender couldn't be unblocked (medium).** As
+  reported, it assumed the chat stays, blocked; the core in fact erases
+  it when blocking. Any blocked one-to-one chat that is left now shows
+  the Unblock footer, and the dialog for blocking a request says it
+  takes away the only place to unblock them. The e2e test covers the
+  path: the request is erased and the sender's next request never shows.
+  Deferred: a blocked-contacts list (the core's is `pub(crate)`;
+  upstream has none either).
+- `e`/`r` in a chat without a composer focused a composer that isn't
+  drawn; they do nothing now. A chat that stops taking messages while
+  its composer has focus (blocked from another device too) moves focus
+  to the messages, in `Conversation::update_chat`. Next unread skips
+  blocked chats. Deleting a contact's chat says their chat ends too.
+  Tests: the blocked-chat gpui test (each fails without its fix), the
+  `next_unread` test, `contact_dialogs_say_what_really_happens`.

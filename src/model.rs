@@ -79,9 +79,9 @@ pub struct ChatSummary {
     /// The chat with the user's own devices. Marked in the UI, so a peer
     /// can't pass off a chat titled "Notes to self" as it.
     pub is_self_chat: bool,
-    /// A contact the user blocked: their messages are dropped, and the
-    /// chat offers unblocking instead of a composer.
-    pub blocked: bool,
+    /// A one-to-one chat (or contact request): what contact operations
+    /// may do in it. `None` for groups and the self chat.
+    pub one_to_one: Option<OneToOne>,
     pub preview: Option<Preview>,
     /// `None` for a chat without messages.
     pub last_activity: Option<DateTime<Utc>>,
@@ -89,9 +89,116 @@ pub struct ChatSummary {
 }
 
 impl ChatSummary {
+    /// The user blocked the peer: their messages and requests are
+    /// dropped, and the chat offers unblocking instead of a composer.
+    pub fn blocked(&self) -> bool {
+        self.one_to_one
+            .is_some_and(|chat| chat.stage == Stage::Blocked)
+    }
+
     /// Messages and files can be sent: no request open, not blocked.
     pub fn composes(&self) -> bool {
-        self.request.is_none() && !self.blocked
+        self.request.is_none() && !self.blocked()
+    }
+}
+
+/// A one-to-one chat as contact operations see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OneToOne {
+    pub side: Side,
+    pub stage: Stage,
+    /// Who the peer is is known; a request sent to a username learns it
+    /// only once they answer.
+    pub peer_known: bool,
+}
+
+/// Whose the chat is: a contact's, or a request either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Contact,
+    Incoming,
+    Outgoing,
+}
+
+/// The core's chat status: blocking is the peer's, and hides the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// An outgoing request not sent yet.
+    Sending,
+    Open,
+    /// A request that expired or was withdrawn, or a deleted contact.
+    Ended,
+    Blocked,
+}
+
+impl OneToOne {
+    pub const CONTACT: Self = Self {
+        side: Side::Contact,
+        stage: Stage::Open,
+        peer_known: true,
+    };
+
+    /// The request the chat shows, if it isn't a contact's. Neither side
+    /// can act on an ended or blocked one.
+    pub fn request(self) -> Option<Request> {
+        Some(match (self.side, self.stage) {
+            (Side::Contact, _) => return None,
+            (_, Stage::Ended | Stage::Blocked) => Request::Closed,
+            (Side::Incoming, _) => Request::Incoming,
+            (Side::Outgoing, _) => Request::Outgoing,
+        })
+    }
+}
+
+/// What the user can do to a contact (or request) and its chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactOp {
+    Block,
+    Unblock,
+    Report,
+    Retract,
+    Delete,
+}
+
+impl ContactOp {
+    /// Whether `self` applies to `chat`, or why not. The one rule table:
+    /// the view asks before confirming, the session again on the core's
+    /// state before running.
+    ///
+    /// Blocking an incoming request declines it (as upstream); an open
+    /// outgoing request is retracted, not blocked or deleted, and an open
+    /// incoming one declined, not deleted. Blocking hides whether a
+    /// request was open: a blocked chat can always be unblocked or
+    /// deleted.
+    pub fn check(self, chat: OneToOne) -> Result<(), &'static str> {
+        let blocked = chat.stage == Stage::Blocked;
+        let open = matches!(chat.stage, Stage::Open | Stage::Sending);
+        match self {
+            ContactOp::Block if blocked => Err("They're blocked already"),
+            ContactOp::Block if chat.side == Side::Outgoing => {
+                Err("Retract your request instead: :retract")
+            }
+            ContactOp::Unblock if !blocked => Err("They aren't blocked"),
+            ContactOp::Block | ContactOp::Unblock | ContactOp::Report if !chat.peer_known => {
+                Err("Only their username is known until they answer")
+            }
+            ContactOp::Block | ContactOp::Unblock | ContactOp::Report => Ok(()),
+            ContactOp::Retract if chat.side != Side::Outgoing => {
+                Err("Only a contact request you sent can be retracted")
+            }
+            ContactOp::Retract if chat.stage == Stage::Sending => {
+                Err("The request is still being sent; try again in a moment")
+            }
+            ContactOp::Retract if !open => Err("That request has ended already"),
+            ContactOp::Retract => Ok(()),
+            ContactOp::Delete if open && chat.side == Side::Outgoing => {
+                Err("Retract the request instead: :retract")
+            }
+            ContactOp::Delete if open && chat.side == Side::Incoming => {
+                Err("Decline the request instead: :decline")
+            }
+            ContactOp::Delete => Ok(()),
+        }
     }
 }
 
@@ -555,7 +662,7 @@ pub fn step_index(len: usize, current: Option<usize>, forward: bool) -> Option<u
 }
 
 /// The nearest other chat with unread messages in the given direction,
-/// wrapping around.
+/// wrapping around. Blocked chats show no unread count, so never one.
 pub fn next_unread(chats: &[ChatSummary], current: Option<usize>, forward: bool) -> Option<usize> {
     let mut ix = current;
     for _ in 0..chats.len() {
@@ -564,7 +671,7 @@ pub fn next_unread(chats: &[ChatSummary], current: Option<usize>, forward: bool)
         if Some(candidate) == current {
             break;
         }
-        if chats[candidate].unread > 0 {
+        if chats[candidate].unread > 0 && !chats[candidate].blocked() {
             return Some(candidate);
         }
     }
@@ -718,7 +825,7 @@ pub mod mock {
                 is_group: group,
                 request: None,
                 is_self_chat: false,
-                blocked: false,
+                one_to_one: (!group).then_some(OneToOne::CONTACT),
                 preview: Some(Preview {
                     prefix: None,
                     text: last.into(),
@@ -876,6 +983,54 @@ mod tests {
     }
 
     #[test]
+    fn each_contact_operation_applies_only_where_it_may() {
+        use ContactOp::*;
+        let chat = |side, stage| OneToOne {
+            side,
+            stage,
+            peer_known: true,
+        };
+        let contact = OneToOne::CONTACT;
+        let blocked = chat(Side::Contact, Stage::Blocked);
+        let incoming = chat(Side::Incoming, Stage::Open);
+        let blocked_request = chat(Side::Incoming, Stage::Blocked);
+        let outgoing = chat(Side::Outgoing, Stage::Open);
+        let sending = chat(Side::Outgoing, Stage::Sending);
+        let by_name = OneToOne {
+            peer_known: false,
+            ..outgoing
+        };
+        let allowed = |op: ContactOp, chat| op.check(chat).is_ok();
+
+        // A contact: block once, unblock only when blocked, report, delete.
+        assert!(allowed(Block, contact) && !allowed(Block, blocked));
+        assert!(!allowed(Unblock, contact) && allowed(Unblock, blocked));
+        assert!(allowed(Report, contact) && !allowed(Retract, contact));
+        assert!(allowed(Delete, contact) && allowed(Delete, blocked));
+        // An open incoming request: blocking declines it; deleting it is
+        // declining, which has its own command. Once blocked, it can be
+        // unblocked (the block outlives the request) or deleted.
+        assert!(allowed(Block, incoming));
+        assert!(!allowed(Delete, incoming) && !allowed(Retract, incoming));
+        assert!(allowed(Unblock, blocked_request) && allowed(Delete, blocked_request));
+        assert_eq!(blocked_request.request(), Some(Request::Closed));
+        // An open outgoing request: retracted, not blocked or deleted, and
+        // not before it is sent.
+        assert!(allowed(Retract, outgoing) && allowed(Retract, by_name));
+        assert!(!allowed(Retract, sending));
+        assert!(!allowed(Block, outgoing) && !allowed(Delete, outgoing));
+        // Sent to a username: nobody known to report.
+        assert!(!allowed(Report, by_name) && allowed(Report, outgoing));
+        // Ended requests are only a record, deleted like a chat.
+        for side in [Side::Incoming, Side::Outgoing] {
+            let ended = chat(side, Stage::Ended);
+            assert!(allowed(Delete, ended) && !allowed(Retract, ended));
+            assert_eq!(ended.request(), Some(Request::Closed));
+        }
+        assert_eq!(contact.request(), None);
+    }
+
+    #[test]
     fn next_unread_skips_read_and_current_chats() {
         let chats: Vec<_> = [0, 3, 0, 1, 0]
             .into_iter()
@@ -886,7 +1041,7 @@ mod tests {
                 is_group: false,
                 request: None,
                 is_self_chat: false,
-                blocked: false,
+                one_to_one: None,
                 preview: None,
                 last_activity: None,
                 unread,
@@ -899,6 +1054,13 @@ mod tests {
         // The current chat alone being unread is not a target.
         assert_eq!(next_unread(&chats[..2], Some(1), true), None);
         assert_eq!(next_unread(&[], None, true), None);
+        // A blocked chat's unread messages lead nowhere.
+        let mut blocked = chats.clone();
+        blocked[3].one_to_one = Some(OneToOne {
+            stage: Stage::Blocked,
+            ..OneToOne::CONTACT
+        });
+        assert_eq!(next_unread(&blocked, Some(1), true), None);
     }
 
     #[test]

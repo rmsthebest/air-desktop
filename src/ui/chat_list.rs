@@ -164,7 +164,7 @@ impl ChatList {
         let preview = chat
             .preview
             .as_ref()
-            .filter(|_| !chat.blocked)
+            .filter(|_| !chat.blocked())
             .map(|preview| {
                 let italic = preview.kind != PreviewKind::Message;
                 h_flex()
@@ -237,7 +237,8 @@ impl ChatList {
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(chat.title.clone()),
                             )
-                            .when_some(chat.request, |line, request| {
+                            // Blocked says it all: no "Ended" beside it.
+                            .when_some(chat.request.filter(|_| !chat.blocked()), |line, request| {
                                 let label = match request {
                                     Request::Closed => "Ended",
                                     Request::Incoming | Request::Outgoing => "Request",
@@ -245,7 +246,7 @@ impl ChatList {
                                 line.child(tag(label, cx))
                             })
                             .when(chat.is_self_chat, |line| line.child(tag("Self", cx)))
-                            .when(chat.blocked, |line| line.child(tag("Blocked", cx)))
+                            .when(chat.blocked(), |line| line.child(tag("Blocked", cx)))
                             .child(
                                 div()
                                     .flex_none()
@@ -261,7 +262,7 @@ impl ChatList {
                             .h(px(20.))
                             .gap_2()
                             .children(preview)
-                            .when(chat.unread > 0 && !chat.blocked, |line| {
+                            .when(chat.unread > 0 && !chat.blocked(), |line| {
                                 line.child(div().flex_1()).child(badge(chat.unread, cx))
                             }),
                     ),

@@ -171,11 +171,19 @@ pub(super) async fn read_source(path: PathBuf) -> Result<Vec<u8>, Failure> {
 
 /// The file at `path`, if a regular one of at most [`MAX_SOURCE_BYTES`]:
 /// checked on the open file and bounded while read (a device or a pipe
-/// reports no size; a file can grow after its size is read).
+/// reports no size; a file can grow after its size is read). Opened
+/// without blocking: opening a named pipe otherwise waits for a writer.
 fn read_bounded(path: &std::path::Path) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
     let unreadable = || "Couldn't read that file".to_string();
-    let file = std::fs::File::open(path).map_err(|_| unreadable())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|_| unreadable())?;
     if !file.metadata().map_err(|_| unreadable())?.is_file() {
         return Err("That isn't a file".into());
     }
@@ -295,6 +303,15 @@ mod tests {
             Err("That isn't a file".into())
         );
         assert!(read_bounded(dir.path()).is_err());
+        // A named pipe without a writer: refused, not waited on (on a
+        // thread, so a hang fails the test instead of stalling it).
+        let fifo = dir.path().join("fifo");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(read_bounded(&fifo)));
+        let read = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(read, Ok(Err("That isn't a file".into())));
         let big = dir.path().join("big");
         std::fs::File::create(&big)
             .unwrap()

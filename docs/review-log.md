@@ -1192,3 +1192,15 @@ its textures (needs a session), and one for `pick_picture` refusing when
 another chat was opened during the file dialog (needs a test file
 dialog). Reopening a group decodes its members' pictures again (the
 cache lives with the entity): bounded by the members, accepted.
+
+## Gate 20b — gate 20 fixes (`dd713ad..6f85a5d`): PASS
+
+Fixed (low):
+- Opening a named pipe blocks until a writer comes, before the
+  regular-file check could run: `:picture ~/x.fifo` hung a blocking
+  thread. The file is now opened with `O_NONBLOCK` (regular files ignore
+  it); the test makes a FIFO with `mkfifo` and fails on a hang.
+- `:remove-group-picture`'s confirmation is tested (on a mock group).
+
+Still deferred to milestone 20: a test that `Members` releases its
+textures.

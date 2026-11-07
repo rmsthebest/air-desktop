@@ -183,6 +183,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
  "image",
+ "libc",
  "mimi-room-policy",
  "mimi_content",
  "pulldown-cmark",

@@ -2954,13 +2954,28 @@ mod tests {
             assert!(!asking(cx));
             assert_eq!(told(cx), before + 1, "{event:?}");
         }
-        // Typed, the same: it asks.
-        let command = command_line::parse(":remove-picture").unwrap();
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.run(command, window, cx)
+        // Typed, the same: it asks (the group's too, for everyone in it).
+        let run = |command: &str, cx: &mut VisualTestContext| {
+            let command = command_line::parse(command).unwrap();
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.run(command, window, cx)
+            });
+            cx.run_until_parked();
+        };
+        run(":remove-picture", cx);
+        assert!(asking(cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let chat_list = workspace.read_with(cx, |workspace, _| workspace.chat_list.clone());
+        chat_list.update(cx, |list, cx| {
+            let group = list.chats().iter().find(|chat| chat.is_group).unwrap();
+            list.open(group.id.clone(), cx);
         });
         cx.run_until_parked();
+        let before = told(cx);
+        run(":remove-group-picture", cx);
         assert!(asking(cx));
+        assert_eq!(told(cx), before);
     }
 
     #[gpui::test]

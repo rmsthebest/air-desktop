@@ -53,12 +53,14 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# O_NONBLOCK, so opening a picked path that is a pipe can't block. Same
-# copy as the rest of the tree's.
-libc = "0.2"
 # Desktop notifications over D-Bus. Same major and backend (async-io) as
 # gpui's own zbus, so no second copy or runtime is pulled in.
 zbus = { version = "5", default-features = false, features = ["async-io"] }
+
+[target.'cfg(unix)'.dependencies]
+# O_NONBLOCK, so opening a picked path that is a pipe can't block. Same
+# copy as the rest of the tree's.
+libc = "0.2"
 
 [dev-dependencies]
 # gpui-kit's own `test-support` feature drags in the gpui-fast backend, whose

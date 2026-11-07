@@ -178,7 +178,7 @@ fn read_bounded(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let unreadable = || "Couldn't read that file".to_string();
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK);
@@ -298,6 +298,7 @@ mod tests {
         std::fs::write(&fits, b"abc").unwrap();
         assert_eq!(read_bounded(&fits).unwrap(), b"abc");
         // A device reports no size and never ends; a directory isn't one.
+        #[cfg(unix)]
         assert_eq!(
             read_bounded(std::path::Path::new("/dev/zero")),
             Err("That isn't a file".into())
@@ -305,13 +306,16 @@ mod tests {
         assert!(read_bounded(dir.path()).is_err());
         // A named pipe without a writer: refused, not waited on (on a
         // thread, so a hang fails the test instead of stalling it).
-        let fifo = dir.path().join("fifo");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
-        assert!(made.unwrap().success());
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || tx.send(read_bounded(&fifo)));
-        let read = rx.recv_timeout(std::time::Duration::from_secs(5));
-        assert_eq!(read, Ok(Err("That isn't a file".into())));
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("fifo");
+            let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+            assert!(made.unwrap().success());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || tx.send(read_bounded(&fifo)));
+            let read = rx.recv_timeout(std::time::Duration::from_secs(5));
+            assert_eq!(read, Ok(Err("That isn't a file".into())));
+        }
         let big = dir.path().join("big");
         std::fs::File::create(&big)
             .unwrap()

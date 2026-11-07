@@ -1204,3 +1204,12 @@ Fixed (low):
 
 Still deferred to milestone 20: a test that `Members` releases its
 textures.
+
+## Gate 20c — gate 20b fixes (`6f85a5d..39d2aec`): PASS
+
+Fixed (low): the non-blocking open, `libc` and the device/pipe test
+cases were Linux-only; they are `cfg(unix)` now (a named pipe blocks
+`open` on macOS too).
+
+Accepted (low): the test makes its FIFO with the `mkfifo` program, not
+`libc::mkfifo` (which needs `unsafe`); coreutils is assumed present.

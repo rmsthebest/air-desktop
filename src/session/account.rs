@@ -50,11 +50,14 @@ pub async fn load_default(db_path: String) -> anyhow::Result<Option<CoreUser>> {
     Ok(None)
 }
 
-/// Marks `id`'s leftover database files for removal: a teardown that
-/// failed partway (the core drops the record even when a file stays) left
-/// them, nothing can load them, and they hold keys and history.
+/// Marks `id`'s database files for removal. Written *before* every
+/// teardown and dropped once the core reports success: the core drops the
+/// record even when a file stays, and files without a record can't be
+/// loaded (they hold keys and history), so the mark must already be there
+/// whatever cuts the deletion short. Synced, as the record's removal is.
 pub fn mark_deleted(dir: &std::path::Path, id: Uuid) -> std::io::Result<()> {
-    std::fs::write(dir.join(format!("{id}.deleted")), b"")
+    std::fs::File::create(dir.join(format!("{id}.deleted")))?.sync_all()?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Drops `id`'s mark once its files are gone.

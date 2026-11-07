@@ -952,3 +952,14 @@ Accepted: such a file logs an error on every load until it goes; the
 user isn't told (nothing they can act on in the app).
 Deferred (account seam): the subscriber's "look again, don't replace"
 branch; only `after_probe` is tested.
+
+## Gate 15f — gate 15e fixes (`b6ba09e..e798019`): PASS
+
+Fixed (low): `mark_deleted`'s comment described the old order (it is
+written before every teardown now); the mark and its directory are
+synced, so a power loss can't keep the record's removal but lose the
+mark. A failed mark is logged as possibly needing manual cleanup.
+
+Accepted: a mark beside a record that was kept does nothing until the
+record goes (its meaning); that account loading again is the deferred
+teardown-routing item.

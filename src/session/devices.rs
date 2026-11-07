@@ -656,7 +656,10 @@ pub async fn tear_down(user: CoreUser, db_path: String) -> TornDown {
     // good. A mark on an id that keeps its record is skipped.
     let dir = std::path::Path::new(&db_path);
     if let Err(err) = super::account::mark_deleted(dir, record) {
-        error!("failed to mark the unlinked account's data for removal: {err}");
+        error!(
+            "failed to mark the unlinked account's data for removal \
+             (if the deletion is cut short, files may need removing by hand): {err}"
+        );
     }
     let Err(err) = aircoreclient::delete_client_database(&db_path, record).await else {
         super::account::unmark_deleted(dir, record);

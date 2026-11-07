@@ -319,9 +319,11 @@ impl Session {
     }
 }
 
-/// A group the user is no longer in: the core keeps it inactive.
+/// A group the user is no longer in: the core keeps it inactive. Any
+/// status but active counts (the core gives groups no other today), so
+/// nothing is sent to a group that isn't plainly live.
 pub(super) fn group_ended(chat: &Chat) -> bool {
-    matches!(chat.chat_type, ChatType::Group(_)) && matches!(chat.status(), ChatStatus::Inactive(_))
+    matches!(chat.chat_type, ChatType::Group(_)) && !matches!(chat.status(), ChatStatus::Active)
 }
 
 /// The core stores "forever" as the start of 9999 but reads back only

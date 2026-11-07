@@ -1387,6 +1387,8 @@ mod tests {
         ];
         assert_eq!(next_mute_expiry(&chats, now), Some(soon));
         assert_eq!(next_mute_expiry(&chats[..3], now), None);
+        // The list's tag goes when the mute ends, not a moment later.
+        assert!(chats[4].is_muted(now) && !chats[4].is_muted(soon));
     }
 
     #[test]
@@ -1413,13 +1415,6 @@ mod tests {
         assert_eq!(kept.older, 980);
         assert_eq!(kept.versions.len(), MAX_VERSIONS);
         assert_eq!(kept.versions[0].at, at(999));
-        // The last of many edits is still history, if only one is kept.
-        assert_eq!(
-            EditHistory::new(1, vec![(Some("now"), at(1))])
-                .versions
-                .len(),
-            1
-        );
     }
 
     #[test]

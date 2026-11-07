@@ -1097,3 +1097,21 @@ Fixed:
 - Tests: the details step (only "a dialog opened") and the e2e mute
   block (the core's call, not the session's) are dropped; the mute test
   keeps only the expiry the list redraws on.
+
+## Gate 18b — gate 18 fixes (`8b3aeba..efd3625`): PASS
+
+Fixed (low):
+- A group in any status but active counted as live (the session used to
+  require active). `chats::group_ended` now covers every non-active
+  group status; the core gives groups only active or inactive today.
+- The ended-group footer and focus move had no view test: the
+  blocked-chat gpui test now ends a group under a focused composer
+  (focus moves to the messages; typing, `e` and `r` do nothing). It
+  fails if `composes` ignores `group_ended`.
+- Tests: kept the mute boundary (`is_muted` false at its end); dropped
+  an edit-history case no caller can produce.
+
+Accepted (low): muting can lose a race with alert processing that read
+the chat as unmuted just before, leaving that one alert up until the
+next rewrite or dismissal. Narrow and harmless; not worth re-reading
+the chat before every notice.

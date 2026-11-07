@@ -2484,6 +2484,34 @@ mod tests {
         };
         set_first(None, ended, cx);
         assert_eq!(focused(cx), Focus::Messages);
+
+        // Likewise a group the user is out of: no composer, and nothing
+        // edited or replied to from the messages.
+        let group = workspace.read_with(cx, |workspace, cx| {
+            let chats = workspace.chat_list.read(cx).chats();
+            chats.iter().position(|chat| chat.is_group).unwrap()
+        });
+        let set_group_ended = |ended, cx: &mut VisualTestContext| {
+            chat_list.update(cx, |list, cx| {
+                let mut chats = list.chats().to_vec();
+                chats[group].group_ended = ended;
+                let id = chats[group].id.clone();
+                list.set_chats(chats, LoadState::Loaded, cx);
+                list.open(id, cx);
+            });
+            cx.run_until_parked();
+        };
+        set_group_ended(false, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_composer(&FocusComposer, window, cx)
+        });
+        assert_eq!(focused(cx), Focus::Composer);
+        set_group_ended(true, cx);
+        assert_eq!(focused(cx), Focus::Messages);
+        cx.simulate_input("hi");
+        cx.simulate_keystrokes("up e r");
+        assert_eq!(focused(cx), Focus::Messages);
+        assert_eq!(composer_text(&workspace, cx), "");
     }
 
     #[gpui::test]

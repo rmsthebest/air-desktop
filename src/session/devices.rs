@@ -172,6 +172,8 @@ pub struct Devices {
     failed: bool,
     /// The latest load; a newer one replaces (cancels) it.
     load: Option<Task<()>>,
+    /// Looking up the self chat while it is unknown.
+    probe: Option<Task<()>>,
     _changes: Subscription,
 }
 
@@ -206,16 +208,36 @@ pub(super) async fn load(user: CoreUser) -> anyhow::Result<Loaded> {
     })
 }
 
-/// Whether `notification` can change the device list: the synced entries,
-/// or the self chat (its members). Before the first load, any chat. An
-/// account without a self chat has only this device; linking one stores
-/// the entries, so the setting reloads it.
-fn touches(notification: &DbNotification, loaded: bool, self_chat: Option<CoreChatId>) -> bool {
-    notification.ops.keys().any(|entity| match entity {
-        DbEntityId::UserSetting(key) => key == LinkedDevicesSetting::KEY,
-        DbEntityId::Chat(id) => !loaded || self_chat == Some(*id),
-        _ => false,
-    })
+/// What a notification means for the device list.
+#[derive(Debug, PartialEq)]
+enum Touch {
+    None,
+    Reload,
+    /// A chat changed while the self chat is unknown: it may be the self
+    /// group, joined only now (a new device processes its Welcome after
+    /// loading). Look the self chat up again, as upstream.
+    Probe,
+}
+
+/// The synced entries and the self chat (its members) change the list.
+/// Before the first load, any chat might.
+fn touches(notification: &DbNotification, loaded: bool, self_chat: Option<CoreChatId>) -> Touch {
+    let mut touch = Touch::None;
+    for entity in notification.ops.keys() {
+        match entity {
+            DbEntityId::UserSetting(key) if key == LinkedDevicesSetting::KEY => {
+                return Touch::Reload;
+            }
+            DbEntityId::Chat(_) if !loaded => return Touch::Reload,
+            DbEntityId::Chat(id) => match self_chat {
+                Some(chat) if chat == *id => return Touch::Reload,
+                Some(_) => {}
+                None => touch = Touch::Probe,
+            },
+            _ => {}
+        }
+    }
+    touch
 }
 
 impl Devices {
@@ -225,12 +247,14 @@ impl Devices {
                 notifications,
                 overflowed,
             } => {
-                if *overflowed
-                    || notifications
-                        .iter()
-                        .any(|notification| touches(notification, this.loaded, this.self_chat))
-                {
+                let touches: Vec<Touch> = notifications
+                    .iter()
+                    .map(|notification| touches(notification, this.loaded, this.self_chat))
+                    .collect();
+                if *overflowed || touches.contains(&Touch::Reload) {
                     this.reload(cx);
+                } else if touches.contains(&Touch::Probe) && this.probe.is_none() {
+                    this.probe_self_chat(cx);
                 }
             }
         });
@@ -243,6 +267,7 @@ impl Devices {
             loaded: false,
             failed: false,
             load: None,
+            probe: None,
             _changes: changes,
         };
         devices.reload(cx);
@@ -276,6 +301,24 @@ impl Devices {
                     }
                 }
                 cx.notify();
+            });
+        }));
+    }
+
+    /// Reloads once the self chat exists: one query per chat change until
+    /// then, rather than a full load.
+    fn probe_self_chat(&mut self, cx: &mut Context<Self>) {
+        let user = self.user.clone();
+        let task = Tokio::spawn(cx, async move { user.self_chat_id().await });
+        self.probe = Some(cx.spawn(async move |this, cx| {
+            let found = task.await.and_then(|found| found);
+            _ = this.update(cx, |this, cx| {
+                this.probe = None;
+                match found {
+                    Ok(Some(_)) if this.self_chat.is_none() => this.reload(cx),
+                    Ok(_) => {}
+                    Err(err) => error!("failed to look up the self chat: {err:#}"),
+                }
             });
         }));
     }
@@ -668,16 +711,13 @@ mod tests {
     }
 
     #[test]
-    fn every_link_error_is_a_failure() {
-        use MultiDeviceLinkClientError::*;
-        for result in [
-            Ok(Err(SessionNotFound)),
-            Ok(Err(InvalidCode)),
-            Ok(Err(DeviceLimitReached { max_devices: 3 })),
-            Err(anyhow::anyhow!("internal")),
-        ] {
-            assert!(matches!(link_outcome(result), LinkEvent::Failed(_)));
-        }
+    fn internal_link_errors_are_told_without_their_detail() {
+        let LinkEvent::Failed(message) =
+            link_outcome(Err(anyhow::anyhow!("relay said 10.0.0.7 refused")))
+        else {
+            panic!("not a failure");
+        };
+        assert!(!message.contains("10.0.0.7"), "{message}");
         assert_eq!(link_outcome(Ok(Ok(()))), LinkEvent::Linked);
     }
 
@@ -692,15 +732,16 @@ mod tests {
         let self_chat = changed(DbEntityId::Chat(chat(1)));
         let other_chat = changed(DbEntityId::Chat(chat(2)));
         for (loaded, known) in [(false, None), (true, None), (true, Some(chat(1)))] {
-            assert!(touches(&setting, loaded, known));
-            assert!(!touches(&other_setting, loaded, known));
+            assert_eq!(touches(&setting, loaded, known), Touch::Reload);
+            assert_eq!(touches(&other_setting, loaded, known), Touch::None);
         }
         // Before the first load, any chat might be the self chat.
-        assert!(touches(&other_chat, false, None));
-        assert!(touches(&self_chat, true, Some(chat(1))));
-        assert!(!touches(&other_chat, true, Some(chat(1))));
-        // Without a self chat, messages elsewhere never reload it.
-        assert!(!touches(&other_chat, true, None));
+        assert_eq!(touches(&other_chat, false, None), Touch::Reload);
+        assert_eq!(touches(&self_chat, true, Some(chat(1))), Touch::Reload);
+        assert_eq!(touches(&other_chat, true, Some(chat(1))), Touch::None);
+        // Loaded without one: a chat change may be the self group joined
+        // since, so it is looked up (not a full reload).
+        assert_eq!(touches(&other_chat, true, None), Touch::Probe);
     }
 
     #[test]

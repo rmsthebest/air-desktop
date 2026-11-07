@@ -83,7 +83,7 @@ impl AppRoot {
                 // Opening the account database creates it with the umask.
                 this.restrict_files();
                 match result {
-                    Ok(Some(user)) => this.start(user, window, cx),
+                    Ok(Some(user)) => this.start(user, notice, window, cx),
                     Ok(None) => this.onboard(db_path, notice, window, cx),
                     Err(err) => {
                         tracing::error!("failed to load account: {err:#}");
@@ -110,7 +110,7 @@ impl AppRoot {
                 &onboarding,
                 window,
                 |this, _, event, window, cx| match event {
-                    OnboardingEvent::SignedUp(user) => this.start(user.clone(), window, cx),
+                    OnboardingEvent::SignedUp(user) => this.start(user.clone(), None, window, cx),
                 },
             );
         onboarding.focus_handle(cx).focus(window, cx);
@@ -120,7 +120,15 @@ impl AppRoot {
         };
     }
 
-    fn start(&mut self, user: CoreUser, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens `user`'s workspace, telling `notice` (why the last account
+    /// went) if there is one.
+    fn start(
+        &mut self,
+        user: CoreUser,
+        notice: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Sign-up created the account's databases with the umask.
         self.restrict_files();
         let session = Session::start(user.clone(), cx);
@@ -132,14 +140,19 @@ impl AppRoot {
             workspace,
             _unlinked: unlinked,
         };
+        if let Some(notice) = notice {
+            crate::ui::show_info(notice.to_string(), window, cx);
+        }
         cx.notify();
     }
 
     /// Drops the account (the workspace and session go, stopping their
-    /// work), deletes its data and starts over, saying why. As upstream,
-    /// a failed deletion still signs out: staying in an account the user
-    /// took this device out of is worse than data left behind (the next
-    /// start finds it unlinked again and retries).
+    /// work), deletes its data and starts over, saying why: with another
+    /// account left in the data dir if one loads, else onboarding. As
+    /// upstream, a failed deletion still signs out: staying in an account
+    /// the user took this device out of is worse than data left behind. It
+    /// goes to onboarding then, never loading again (that would find the
+    /// same account and fail again, in a loop); the next start retries.
     fn tear_down(
         &mut self,
         user: CoreUser,
@@ -158,21 +171,25 @@ impl AppRoot {
         self.screen = Screen::TearingDown;
         cx.notify();
         let db_path = self.db_path.clone();
-        // Detached: closing the window mustn't stop the deletion between
-        // removing the database and its record.
+        // Detached, so dropping this view doesn't stop the deletion between
+        // removing the database and its record. Quitting still can (the
+        // runtime shuts down); the next start then skips the bare record.
         let task = Tokio::handle(cx).spawn(devices::tear_down(user, db_path.clone()));
         cx.spawn_in(window, async move |this, cx| {
-            if let Err(err) = task
+            let deleted = task
                 .await
                 .map_err(anyhow::Error::from)
-                .and_then(|done| done)
-            {
-                tracing::error!("failed to delete the unlinked account's data: {err:#}");
-            }
+                .and_then(|done| done);
             _ = this.update_in(cx, |this, window, cx| {
-                // Another account may be left (an earlier deletion failed):
-                // that one opens; onboarding only if none does.
-                this.load(db_path, Some(notice), window, cx);
+                match deleted {
+                    // Another account may be left (an earlier deletion
+                    // failed): that one opens; onboarding only if none does.
+                    Ok(()) => this.load(db_path, Some(notice), window, cx),
+                    Err(err) => {
+                        tracing::error!("failed to delete the unlinked account's data: {err:#}");
+                        this.onboard(db_path, Some(notice), window, cx);
+                    }
+                }
                 cx.notify();
             });
         })

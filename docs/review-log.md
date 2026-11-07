@@ -873,3 +873,27 @@ Deferred:
   is dropped without closing them; closing every tracked id before the
   session goes needs a teardown path in the notifier.
 - **No test that teardown releases the session (account seam).**
+
+## Gate 15b — gate 15 fixes (`3e15766..67ac71f`): PASS
+
+Fixed:
+- **A failing teardown restarted the unlinked account in a loop
+  (medium).** Gate 15's "load again" applied to failures too: the record
+  was still there, so the same account loaded, was found unlinked and
+  failed again. Only a successful deletion loads again; a failed one goes
+  to onboarding (the next start retries), as before gate 15.
+- **A new device's list could stay without its self chat (medium).** Gate
+  15 stopped reloading on chat changes once loaded without a self chat,
+  but a new device joins its self group after its first load. As
+  upstream, a chat change then looks the self chat up (one query) and
+  reloads once it exists. `the_list_reloads_for_…` asserts the probe.
+- **The notice was lost when another account loaded (low).** It shows as
+  a toast in that account's workspace.
+- **Teardown comment overstated (low).** Quitting stops the runtime, so
+  it can still cut the deletion short; the next start skips the bare
+  record (logged). Not worth blocking quit for.
+- The link-failure test checks again that an internal error's detail
+  isn't shown (the one arm that could regress to `{err:#}`).
+
+Still deferred (account seam): a failed teardown landing on onboarding,
+and the notice surviving another account loading.

@@ -132,6 +132,18 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     the own user for the core's unlink reason; the app root then drops the
     workspace, closes and deletes this client's database (as upstream's
     `deleteCurrentDatabase`) and shows onboarding with a notice.
+  - `contact_safety.rs`: block / unblock, report spam, retract an
+    outgoing request, delete a one-to-one chat (upstream `UserCubit`).
+    The pure `check` decides from the chat's type and status what may
+    run and on whom (a request sent to a username has no known peer);
+    the workspace's `contact_confirmation` words the dialog and refuses
+    early, but the session's check is the one that counts. Blocking is
+    local and synced to the user's devices: an incoming request is
+    declined, a contact's chat shows `blocked` (no composer, an Unblock
+    footer, no preview or badge in the list) and the core drops their
+    messages. In a group, `:report <member>` (name or `#tag`, like
+    `:kick`) and `:delete-chat` deletes the group. `:delete-chat` refuses
+    open requests (decline or retract them).
   - `safety.rs`: safety codes, port of upstream `UserCubit::safety_codes`.
     The core hashes each user's credential; the pair is ordered so both
     sides see the same 12 zero-padded five-digit blocks (3 lines of 4).
@@ -251,7 +263,8 @@ From an Air checkout:
 Clients use domain `localhost`. E2E: `AIR_E2E_CODE=<code> cargo test e2e_sign_up --
 --ignored`, and the two-user test with `AIR_E2E_CODES=<code>,<code> cargo test
 e2e_two -- --ignored`; linked devices with `AIR_E2E_CODES=<code>,<code> cargo test e2e_linked --
---ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
+--ignored`; blocking, reporting, retracting and deleting with `AIR_E2E_CODES=<code>,<code>
+cargo test e2e_contacts -- --ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
 `AIR_DESKTOP_DATA_DIR=<dir> cargo run`. E2E tests use `flavor = "multi_thread"`: the
 core calls `block_in_place`.
 

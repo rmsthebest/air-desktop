@@ -1016,6 +1016,156 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Air server and AIR_E2E_CODES"]
+async fn e2e_contacts_are_blocked_reported_retracted_and_deleted() {
+    use super::contact_safety::{ContactOp, run as contact_op};
+    let codes = std::env::var("AIR_E2E_CODES").expect("set AIR_E2E_CODES to two codes");
+    let [ada_code, bob_code] = codes.split(',').collect::<Vec<_>>()[..] else {
+        panic!("AIR_E2E_CODES takes two comma-separated codes");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ada = new_account(dir.path(), "Ada Lovelace", ada_code).await;
+    let bob = new_account(dir.path(), "Bob", bob_code).await;
+    let (ada_alerts, _, _) = alerts();
+    let (bob_alerts, _, _) = alerts();
+    let _queues = [
+        listen_queue(&ada, ada_alerts.clone()).await,
+        listen_queue(&bob, bob_alerts.clone()).await,
+    ];
+    let _usernames = [
+        Aborting(tokio::spawn(contacts::run(ada.clone(), ada_alerts, |_| {}))),
+        Aborting(tokio::spawn(contacts::run(bob.clone(), bob_alerts, |_| {}))),
+    ];
+    let username = async |user: &CoreUser, prefix: &str| {
+        let name = format!(
+            "{prefix}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        eventually("a username", async || {
+            contacts::add_username(user.clone(), name.clone())
+                .await
+                .ok()
+        })
+        .await
+    };
+    let pending_request = async |user: &CoreUser| {
+        eventually("the request arrives", async || {
+            for id in user.ordered_chat_ids().await.unwrap() {
+                if let Some(chat) = user.chat(&id).await
+                    && matches!(chat.chat_type, ChatType::PendingConnection(_))
+                    && matches!(chat.status(), ChatStatus::Active)
+                {
+                    return Some(id);
+                }
+            }
+            None
+        })
+        .await
+    };
+    let refused = |result: Result<(), Failure>| matches!(result, Err(Failure::Shown(_)));
+    let (ada_name, bob_name) = (username(&ada, "ada").await, username(&bob, "bob").await);
+
+    // Ada asks Bob, then retracts once Bob has the request: he can no
+    // longer accept it, and her chat is gone.
+    let asked = eventually("Ada sends a request", async || {
+        contacts::add_contact(ada.clone(), bob_name.clone())
+            .await
+            .ok()
+    })
+    .await;
+    let asked = messages::core_chat_id(&asked);
+    let bobs_request = pending_request(&bob).await;
+    assert!(refused(
+        contact_op(ada.clone(), ContactOp::Block, asked).await
+    ));
+    assert!(refused(
+        contact_op(ada.clone(), ContactOp::Delete, asked).await
+    ));
+    eventually("Ada retracts", async || {
+        contact_op(ada.clone(), ContactOp::Retract, asked)
+            .await
+            .ok()
+    })
+    .await;
+    assert!(ada.chat(&asked).await.is_none());
+    assert!(matches!(
+        contacts::accept_request(bob.clone(), bobs_request).await,
+        Err(Failure::Shown(_))
+    ));
+
+    // Bob asks Ada; she accepts.
+    eventually("Bob sends a request", async || {
+        contacts::add_contact(bob.clone(), ada_name.clone())
+            .await
+            .ok()
+    })
+    .await;
+    let request = pending_request(&ada).await;
+    let chat = contacts::accept_request(ada.clone(), request)
+        .await
+        .unwrap();
+    let chat = messages::core_chat_id(&chat);
+    let bob_chat = eventually("Bob's request is accepted", async || {
+        for id in bob.ordered_chat_ids().await.unwrap() {
+            if let Some(found) = bob.chat(&id).await
+                && matches!(found.chat_type, ChatType::Connection(_))
+            {
+                return Some(id);
+            }
+        }
+        None
+    })
+    .await;
+    let status = async |user: &CoreUser, chat| user.chat(&chat).await.unwrap().status().clone();
+
+    // Blocked, Bob's messages are dropped; unblocked, they arrive again.
+    let (_ada_worker, mut ada_updates, _) = open_messages(&ada, chat);
+    contact_op(ada.clone(), ContactOp::Block, chat)
+        .await
+        .unwrap();
+    assert_eq!(status(&ada, chat).await, ChatStatus::Blocked);
+    assert!(refused(
+        contact_op(ada.clone(), ContactOp::Block, chat).await
+    ));
+    let sent = composer::send(&bob, bob_chat, "while blocked".into(), None).await;
+    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+    // Nothing tells when Ada's queue dropped it: give it time. Too little
+    // fails the test (the message arrives unblocked), never passes it.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    contact_op(ada.clone(), ContactOp::Unblock, chat)
+        .await
+        .unwrap();
+    assert_eq!(status(&ada, chat).await, ChatStatus::Active);
+    assert!(refused(
+        contact_op(ada.clone(), ContactOp::Unblock, chat).await
+    ));
+    let sent = composer::send(&bob, bob_chat, "unblocked".into(), None).await;
+    assert!(matches!(sent, composer::Sent::Ok), "{sent:?}");
+    let got = next_message(&mut ada_updates, |m| {
+        assert_ne!(m.plain_text(), "while blocked", "a blocked message arrived");
+        m.plain_text() == "unblocked"
+    })
+    .await;
+    assert!(!got.own);
+
+    // Reporting tells the server; the chat stays.
+    contact_op(ada.clone(), ContactOp::Report, chat)
+        .await
+        .unwrap();
+    assert!(ada.chat(&chat).await.is_some());
+
+    // Deleting erases Ada's chat and ends Bob's.
+    contact_op(ada.clone(), ContactOp::Delete, chat)
+        .await
+        .unwrap();
+    assert!(ada.chat(&chat).await.is_none());
+    eventually("Bob's chat ends", async || {
+        matches!(status(&bob, bob_chat).await, ChatStatus::Inactive(_)).then_some(())
+    })
+    .await;
+}
+
 async fn new_account(dir: &std::path::Path, name: &str, code: &str) -> CoreUser {
     let data = dir.join(name);
     crate::paths::ensure_private_dir(&data).unwrap();

@@ -7,6 +7,7 @@ pub mod alerts;
 mod attachments;
 pub mod chats;
 pub mod composer;
+pub mod contact_safety;
 mod contacts;
 pub mod devices;
 #[cfg(test)]

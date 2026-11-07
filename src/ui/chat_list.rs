@@ -160,37 +160,42 @@ impl ChatList {
             .map(|at| format_activity(at, chrono::Utc::now()).into())
             .unwrap_or_default();
 
-        let preview = chat.preview.as_ref().map(|preview| {
-            let italic = preview.kind != PreviewKind::Message;
-            h_flex()
-                .flex_1()
-                .min_w_0()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .when_some(preview.prefix.clone(), |line, prefix| {
-                    line.child(
+        // A blocked peer's last words aren't worth showing (as upstream).
+        let preview = chat
+            .preview
+            .as_ref()
+            .filter(|_| !chat.blocked)
+            .map(|preview| {
+                let italic = preview.kind != PreviewKind::Message;
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .when_some(preview.prefix.clone(), |line, prefix| {
+                        line.child(
+                            div()
+                                .flex_shrink_0()
+                                .max_w(gpui_kit::relative(0.5))
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                // The client's labels are styled apart from
+                                // names a peer chose.
+                                .when(prefix.is_label(), |label| {
+                                    label.italic().text_color(theme.primary)
+                                })
+                                .child(format!("{}:\u{a0}", prefix.label())),
+                        )
+                    })
+                    .child(
                         div()
-                            .flex_shrink_0()
-                            .max_w(gpui_kit::relative(0.5))
+                            .flex_1()
+                            .min_w_0()
                             .truncate()
-                            .font_weight(FontWeight::MEDIUM)
-                            // The client's labels are styled apart from
-                            // names a peer chose.
-                            .when(prefix.is_label(), |label| {
-                                label.italic().text_color(theme.primary)
-                            })
-                            .child(format!("{}:\u{a0}", prefix.label())),
+                            .when(italic, |text| text.italic())
+                            .child(preview.text.clone()),
                     )
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .when(italic, |text| text.italic())
-                        .child(preview.text.clone()),
-                )
-        });
+            });
 
         let row = h_flex()
             .id(("chat-row", ix))
@@ -240,6 +245,7 @@ impl ChatList {
                                 line.child(tag(label, cx))
                             })
                             .when(chat.is_self_chat, |line| line.child(tag("Self", cx)))
+                            .when(chat.blocked, |line| line.child(tag("Blocked", cx)))
                             .child(
                                 div()
                                     .flex_none()
@@ -255,7 +261,7 @@ impl ChatList {
                             .h(px(20.))
                             .gap_2()
                             .children(preview)
-                            .when(chat.unread > 0, |line| {
+                            .when(chat.unread > 0 && !chat.blocked, |line| {
                                 line.child(div().flex_1()).child(badge(chat.unread, cx))
                             }),
                     ),

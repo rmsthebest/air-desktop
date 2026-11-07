@@ -32,8 +32,17 @@ pub enum Command {
     /// Rename the open group.
     Rename(String),
     Leave,
-    /// Delete the open group (after confirming).
+    /// Delete the open chat (after confirming): a group, a contact's chat
+    /// or an ended request.
     DeleteChat,
+    /// Block or unblock the open chat's contact (or request's sender).
+    Block,
+    Unblock,
+    /// Report the open chat's contact for spam, or the open group's member
+    /// named (as typed).
+    Report(String),
+    /// Retract the open chat's contact request.
+    Retract,
     /// Send the file at this path, as typed, to the open chat.
     Attach(String),
     /// Change the user's display name.
@@ -164,7 +173,27 @@ const SPECS: &[Spec] = &[
     Spec {
         names: &["delete-chat"],
         arg: Arg::None,
-        help: "Delete the open group",
+        help: "Delete the open chat (a group, contact or ended request)",
+    },
+    Spec {
+        names: &["block"],
+        arg: Arg::None,
+        help: "Block the contact (declines their request)",
+    },
+    Spec {
+        names: &["unblock"],
+        arg: Arg::None,
+        help: "Unblock the contact",
+    },
+    Spec {
+        names: &["report"],
+        arg: Arg::Member,
+        help: "Report the contact (or a group member) for spam",
+    },
+    Spec {
+        names: &["retract"],
+        arg: Arg::None,
+        help: "Retract the contact request you sent",
     },
     Spec {
         names: &["attach"],
@@ -268,6 +297,10 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "rename" => Command::Rename(need("a name")?),
         "leave" => Command::Leave,
         "delete-chat" => Command::DeleteChat,
+        "block" => Command::Block,
+        "unblock" => Command::Unblock,
+        "report" => Command::Report(arg.to_string()),
+        "retract" => Command::Retract,
         "attach" => Command::Attach(need("a file path")?),
         "name" => Command::DisplayName(need("a name")?),
         "link" => Command::Link(need("the code the new device shows")?),

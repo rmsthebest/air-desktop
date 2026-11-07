@@ -79,10 +79,20 @@ pub struct ChatSummary {
     /// The chat with the user's own devices. Marked in the UI, so a peer
     /// can't pass off a chat titled "Notes to self" as it.
     pub is_self_chat: bool,
+    /// A contact the user blocked: their messages are dropped, and the
+    /// chat offers unblocking instead of a composer.
+    pub blocked: bool,
     pub preview: Option<Preview>,
     /// `None` for a chat without messages.
     pub last_activity: Option<DateTime<Utc>>,
     pub unread: u32,
+}
+
+impl ChatSummary {
+    /// Messages and files can be sent: no request open, not blocked.
+    pub fn composes(&self) -> bool {
+        self.request.is_none() && !self.blocked
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -708,6 +718,7 @@ pub mod mock {
                 is_group: group,
                 request: None,
                 is_self_chat: false,
+                blocked: false,
                 preview: Some(Preview {
                     prefix: None,
                     text: last.into(),
@@ -875,6 +886,7 @@ mod tests {
                 is_group: false,
                 request: None,
                 is_self_chat: false,
+                blocked: false,
                 preview: None,
                 last_activity: None,
                 unread,

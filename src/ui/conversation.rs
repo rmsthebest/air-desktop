@@ -28,9 +28,10 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    AcceptRequest, CancelCompose, ClearCursor, CursorDown, CursorFirst, CursorLast, CursorUp,
-    DeclineRequest, EditLastMessage, EditMessage, HalfPageDown, HalfPageUp, OpenLinks,
-    PickReaction, React, ReplyToMessage, SaveAttachment, ToggleDetails, YankMessage,
+    AcceptRequest, BlockContact, CancelCompose, ClearCursor, CursorDown, CursorFirst, CursorLast,
+    CursorUp, DeclineRequest, DeleteChat, EditLastMessage, EditMessage, HalfPageDown, HalfPageUp,
+    OpenLinks, PickReaction, React, ReplyToMessage, RetractRequest, SaveAttachment, ToggleDetails,
+    UnblockContact, YankMessage,
 };
 use crate::markdown::Block;
 use crate::model::{
@@ -1054,7 +1055,7 @@ impl Render for Conversation {
 
         let drop_target = theme.drop_target;
         root.bg(theme.background)
-            .when(chat.request.is_none(), |root| {
+            .when(chat.composes(), |root| {
                 root.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_target))
                     .on_drop(cx.listener(|_, paths: &ExternalPaths, _, cx| {
                         cx.emit(ConversationEvent::Attach(paths.paths().to_vec()))
@@ -1132,10 +1133,11 @@ impl Render for Conversation {
                     .child(self.probe_results(cx)),
             )
             .child(match chat.request {
+                Some(request) => render_request(request, &chat.title, cx),
+                None if chat.blocked => render_blocked(&chat.title, cx),
                 None => self
                     .render_composer(composer_context, composer_focused, compose_bar, cx)
                     .into_any_element(),
-                Some(request) => render_request(request, &chat.title, cx),
             })
     }
 }
@@ -1176,11 +1178,10 @@ impl Conversation {
     }
 }
 
-/// Takes the composer's place in a chat whose contact request is open:
-/// nothing can be sent before both sides are connected.
-fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElement {
+/// A card in the composer's place, for a chat nothing can be sent to.
+fn card(cx: &App) -> gpui::Div {
     let theme = cx.theme();
-    let card = h_flex()
+    h_flex()
         .mx_auto()
         .w_full()
         .max_w(px(MAX_CONTENT_WIDTH))
@@ -1190,22 +1191,55 @@ fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElemen
         .bg(theme.popover)
         .border_1()
         .border_color(theme.border)
-        .shadow_sm();
-    let text = |text: String| div().flex_1().min_w_0().text_sm().child(text);
+        .shadow_sm()
+}
+
+fn card_text(text: String) -> gpui::Div {
+    div().flex_1().min_w_0().text_sm().child(text)
+}
+
+/// A button on a card that runs `action` (bound in the workspace).
+fn card_button(
+    id: &'static str,
+    label: &'static str,
+    tooltip: &'static str,
+    action: impl gpui::Action + Clone,
+) -> Button {
+    Button::new(id)
+        .label(label)
+        .ghost()
+        .tooltip_with_action(tooltip, &action, Some("Workspace"))
+        .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+}
+
+fn in_composer_place(card: gpui::Div) -> AnyElement {
+    div()
+        .flex_none()
+        .px_6()
+        .pb_4()
+        .child(card)
+        .into_any_element()
+}
+
+/// Takes the composer's place in a chat whose contact request is open:
+/// nothing can be sent before both sides are connected.
+fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElement {
+    let muted = cx.theme().muted_foreground;
     let card = match request {
-        Request::Incoming => card
-            .child(text(format!("{title} wants to connect with you.")))
-            .child(
-                Button::new("decline-request")
-                    .label("Decline")
-                    .ghost()
-                    .tooltip_with_action(
-                        "Decline: nothing is sent to them",
-                        &DeclineRequest,
-                        Some("Workspace"),
-                    )
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(DeclineRequest), cx)),
-            )
+        Request::Incoming => card(cx)
+            .child(card_text(format!("{title} wants to connect with you.")))
+            .child(card_button(
+                "block-request",
+                "Block",
+                "Block: declines, and no more requests or messages from them",
+                BlockContact,
+            ))
+            .child(card_button(
+                "decline-request",
+                "Decline",
+                "Decline: nothing is sent to them",
+                DeclineRequest,
+            ))
             .child(
                 Button::new("accept-request")
                     .label("Accept")
@@ -1213,23 +1247,52 @@ fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElemen
                     .tooltip_with_action("Accept", &AcceptRequest, Some("Workspace"))
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(AcceptRequest), cx)),
             ),
-        Request::Outgoing => card.child(
-            text(format!(
-                "Waiting for {title} to accept your contact request."
-            ))
-            .text_color(theme.muted_foreground),
-        ),
-        Request::Closed => card.child(
-            text("This contact request ended without a connection.".into())
-                .text_color(theme.muted_foreground),
-        ),
+        Request::Outgoing => card(cx)
+            .child(
+                card_text(format!(
+                    "Waiting for {title} to accept your contact request."
+                ))
+                .text_color(muted),
+            )
+            .child(card_button(
+                "retract-request",
+                "Retract",
+                "Retract: they can no longer accept it",
+                RetractRequest,
+            )),
+        Request::Closed => card(cx)
+            .child(
+                card_text("This contact request ended without a connection.".into())
+                    .text_color(muted),
+            )
+            .child(card_button(
+                "delete-request",
+                "Delete",
+                "Delete this chat",
+                DeleteChat,
+            )),
     };
-    div()
-        .flex_none()
-        .px_6()
-        .pb_4()
-        .child(card)
-        .into_any_element()
+    in_composer_place(card)
+}
+
+/// Takes the composer's place in a blocked contact's chat (as upstream's
+/// footer): their messages are dropped until they are unblocked.
+fn render_blocked(title: &SharedString, cx: &App) -> AnyElement {
+    let card = card(cx)
+        .child(
+            card_text(format!(
+                "You won't receive messages from {title} unless you unblock them."
+            ))
+            .text_color(cx.theme().muted_foreground),
+        )
+        .child(card_button(
+            "delete-blocked",
+            "Delete",
+            "Delete this chat",
+            DeleteChat,
+        ))
+        .child(card_button("unblock", "Unblock", "Unblock", UnblockContact));
+    in_composer_place(card)
 }
 
 /// A file as a card (name, size, what is happening to it), and an image's

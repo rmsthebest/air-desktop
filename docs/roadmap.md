@@ -32,7 +32,7 @@ Milestones 15 and on cover upstream features the core already supports
 and the desktop app doesn't show yet (compared with upstream's app at the
 pinned rev). Safety and privacy features come first.
 
-15. **Contact safety.** Block and unblock a contact, report spam, delete
+15. **Contact safety** (done). Block and unblock a contact, report spam, delete
     a one-to-one chat, and retract an outgoing contact request. Each is
     confirmed and has a `:` command.
 16. **Message deletion and mute.** Delete a message for yourself or for

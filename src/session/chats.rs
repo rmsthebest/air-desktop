@@ -344,6 +344,7 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         is_group,
         request,
         is_self_chat,
+        blocked: blocked(&chat.chat_type, chat.status()),
         preview: preview::preview(
             draft.as_ref().map(|draft| draft.message.as_str()),
             last_message,
@@ -360,6 +361,12 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         users,
     };
     (summary, keys)
+}
+
+/// A contact the user blocked. Blocking is the connection user's; a
+/// request's chat shows it as ended instead (see [`request`]).
+fn blocked(chat_type: &ChatType, status: &ChatStatus) -> bool {
+    matches!(chat_type, ChatType::Connection(_)) && matches!(status, ChatStatus::Blocked)
 }
 
 /// A connection chat's request state. The core closes a request that
@@ -507,7 +514,12 @@ mod tests {
             request(&incoming, &ChatStatus::Blocked),
             Some(Request::Closed)
         );
-        assert_eq!(request(&ChatType::Connection(user), &ended), None);
+        assert_eq!(request(&ChatType::Connection(user.clone()), &ended), None);
+        // Only a contact is shown blocked; a blocked request has ended.
+        let contact = ChatType::Connection(user);
+        assert!(blocked(&contact, &ChatStatus::Blocked));
+        assert!(!blocked(&contact, &ChatStatus::Active));
+        assert!(!blocked(&incoming, &ChatStatus::Blocked));
     }
 
     use uuid::Uuid;
@@ -521,6 +533,7 @@ mod tests {
             is_group: false,
             request: None,
             is_self_chat: false,
+            blocked: false,
             preview: None,
             last_activity: None,
             unread: 0,

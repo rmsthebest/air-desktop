@@ -13,16 +13,18 @@ use gpui_kit::{
 use std::path::PathBuf;
 
 use crate::actions::{
-    self, AcceptRequest, AddContact, AttachFile, DeclineRequest, FindChat, FocusChatList,
-    FocusComposer, FocusConversation, FocusMessages, FocusNextPane, InviteToGroup, JumpBack,
-    JumpForward, LinkDevice, NewGroup, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine,
-    OpenPalette, OpenSettings, PickTheme, PrevChat, PrevUnreadChat, SelectFirst, SelectLast,
-    ShowSafetyCode, ShowShortcuts, ToggleAppearance, ToggleDetails, ToggleHelixMode,
+    self, AcceptRequest, AddContact, AttachFile, BlockContact, DeclineRequest, DeleteChat,
+    FindChat, FocusChatList, FocusComposer, FocusConversation, FocusMessages, FocusNextPane,
+    InviteToGroup, JumpBack, JumpForward, LinkDevice, NewGroup, NextChat, NextUnreadChat,
+    OpenChatAt, OpenCommandLine, OpenPalette, OpenSettings, PickTheme, PrevChat, PrevUnreadChat,
+    ReportSpam, RetractRequest, SelectFirst, SelectLast, ShowSafetyCode, ShowShortcuts,
+    ToggleAppearance, ToggleDetails, ToggleHelixMode, UnblockContact,
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{ChatId, ChatSummary, JumpList, Message, MessageId, Request, UserId, mock};
 use crate::session::chats::{Chats, LoadState};
 use crate::session::composer::Composer;
+use crate::session::contact_safety::ContactOp;
 use crate::session::devices::{self, Devices, Link, LinkEvent};
 use crate::session::groups::Members;
 use crate::session::messages::Messages;
@@ -87,6 +89,84 @@ struct Linking {
 
 /// Focuses the open chat one way or another.
 type FocusChat = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
+
+/// What reporting spam tells, as upstream.
+const REPORT_SPAM: &str = "Air will be notified that this person may be sending spam. \
+                           Air is never able to see the contents of any chats.";
+
+/// The confirmation `op` asks for in the one-to-one `chat` (title,
+/// description, button), or why it doesn't apply there. Upstream's wording.
+/// The session checks again against the core's state.
+fn contact_confirmation(
+    op: ContactOp,
+    chat: &ChatSummary,
+) -> Result<(String, String, &'static str), &'static str> {
+    let name = &chat.title;
+    Ok(match (op, chat.request) {
+        (ContactOp::Block, _) if chat.blocked => return Err("They're blocked already"),
+        (ContactOp::Block, Some(Request::Outgoing)) => {
+            return Err("Retract your request instead: :retract");
+        }
+        (ContactOp::Block, Some(Request::Incoming)) => (
+            format!("Block {name}?"),
+            format!(
+                "You'll decline {name}'s contact request and won't receive contact \
+                 requests or messages from them anymore. They won't be able to see \
+                 that you blocked them."
+            ),
+            "Block",
+        ),
+        (ContactOp::Block, _) => (
+            format!("Block {name}?"),
+            format!(
+                "You won't receive messages from {name} and they won't be able to view \
+                 any updates to your profile. They won't be able to see that you \
+                 blocked them. You can unblock them anytime."
+            ),
+            "Block",
+        ),
+        (ContactOp::Unblock, _) if !chat.blocked => return Err("They aren't blocked"),
+        (ContactOp::Unblock, _) => (
+            format!("Unblock {name}?"),
+            format!(
+                "You'll be able to send and receive messages from {name} and they'll be \
+                 able to view your current profile."
+            ),
+            "Unblock",
+        ),
+        (ContactOp::Report, _) => (
+            format!("Report {name} for spam?"),
+            REPORT_SPAM.into(),
+            "Report spam",
+        ),
+        (ContactOp::Retract, Some(Request::Outgoing)) => (
+            "Retract contact request?".into(),
+            format!(
+                "If you retract your contact request, {name} will no longer be able to accept it."
+            ),
+            "Retract",
+        ),
+        (ContactOp::Retract, _) => return Err("Only a contact request you sent can be retracted"),
+        (ContactOp::Delete, Some(Request::Incoming)) => {
+            return Err("Decline the request instead: :decline");
+        }
+        (ContactOp::Delete, Some(Request::Outgoing)) => {
+            return Err("Retract the request instead: :retract");
+        }
+        (ContactOp::Delete, Some(Request::Closed)) => (
+            "Delete this request?".into(),
+            "The ended request is erased from all your devices.".into(),
+            "Delete",
+        ),
+        (ContactOp::Delete, None) => (
+            format!("Delete {name}?"),
+            "The chat and its message history are erased from all your devices. \
+             This can't be undone."
+                .into(),
+            "Delete",
+        ),
+    })
+}
 
 /// Whose safety code `:safety-code <query>` asks for in the open `chat`.
 #[derive(Debug, PartialEq)]
@@ -373,10 +453,11 @@ impl Workspace {
         let Some(ix) = list.selected_index() else {
             return;
         };
-        let request = list.chats()[ix].request.is_some();
+        let composes = list.chats()[ix].composes();
         self.hide_settings(window, cx);
-        // A contact request's chat has no composer until it is accepted.
-        if request {
+        // A contact request's chat has no composer until it is accepted,
+        // nor has a blocked contact's.
+        if !composes {
             self.conversation.focus_handle(cx).focus(window, cx);
         } else {
             self.conversation
@@ -945,7 +1026,11 @@ impl Workspace {
         let list = self.chat_list.read(cx);
         let chat = list.selected_index().map(|ix| &list.chats()[ix]);
         match chat {
-            Some(chat) if chat.request.is_none() => Some(chat.id.clone()),
+            Some(chat) if chat.composes() => Some(chat.id.clone()),
+            Some(chat) if chat.blocked => {
+                show_refusal("Unblock them first: :unblock".into(), window, cx);
+                None
+            }
             Some(_) => {
                 show_refusal("Accept the contact request first".into(), window, cx);
                 None
@@ -1036,7 +1121,7 @@ impl Workspace {
             chats: chats.iter().map(|chat| chat.title.to_string()).collect(),
             contacts: chats
                 .iter()
-                .filter(|chat| !chat.is_group && !chat.is_self_chat && chat.request.is_none())
+                .filter(|chat| !chat.is_group && !chat.is_self_chat && chat.composes())
                 .map(|chat| chat.title.to_string())
                 .collect(),
             members: self
@@ -1260,31 +1345,140 @@ impl Workspace {
             Command::DeviceName(input) => self.rename_device(&input, window, cx),
             Command::Unlink(query) => self.unlink_device(&query, window, cx),
             Command::SafetyCode(query) => self.safety_code(&query, window, cx),
-            Command::DeleteChat => {
-                let Some(chat) = self.open_group(window, cx) else {
-                    return;
-                };
-                let name = self.open_title(cx);
-                self.confirm(
-                    format!("Delete {name}?"),
-                    "If the group is still going, this ends it for everyone in it. \
-                     It is then erased from all your devices. This can't be undone."
-                        .into(),
-                    "Delete",
-                    move |this, window, cx| {
-                        let chat = chat.clone();
-                        this.contact_op(
-                            window,
-                            cx,
-                            |session, cx| session.delete_group(&chat, cx),
-                            |(), _, _, _| {},
-                        );
-                    },
+            Command::DeleteChat => self.contact_safety(ContactOp::Delete, "", window, cx),
+            Command::Block => self.contact_safety(ContactOp::Block, "", window, cx),
+            Command::Unblock => self.contact_safety(ContactOp::Unblock, "", window, cx),
+            Command::Report(query) => self.contact_safety(ContactOp::Report, &query, window, cx),
+            Command::Retract => self.contact_safety(ContactOp::Retract, "", window, cx),
+        }
+    }
+
+    /// Runs `op` in the open chat once the user confirms: for a contact (or
+    /// request), or in a group deleting it or reporting the member `query`
+    /// names.
+    fn contact_safety(
+        &mut self,
+        op: ContactOp,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let list = self.chat_list.read(cx);
+        let Some(chat) = list.selected_index().map(|ix| list.chats()[ix].clone()) else {
+            return show_refusal("Open a chat first".into(), window, cx);
+        };
+        if chat.is_self_chat {
+            return show_refusal("That's your own devices".into(), window, cx);
+        }
+        if chat.is_group {
+            return match op {
+                ContactOp::Delete => self.delete_group(chat, window, cx),
+                ContactOp::Report => self.report_member(query, window, cx),
+                _ => show_refusal("That's for a contact's chat".into(), window, cx),
+            };
+        }
+        if !query.trim().is_empty() {
+            return show_refusal(
+                "Only a group's members are named: here it's the contact".into(),
+                window,
+                cx,
+            );
+        }
+        let (title, description, ok) = match contact_confirmation(op, &chat) {
+            Ok(confirmation) => confirmation,
+            Err(refusal) => return show_refusal(refusal.into(), window, cx),
+        };
+        let variant = match op {
+            ContactOp::Unblock => ButtonVariant::Primary,
+            _ => ButtonVariant::Danger,
+        };
+        let id = chat.id;
+        self.confirm_as(
+            title,
+            description,
+            ok,
+            variant,
+            move |this, window, cx| {
+                let id = id.clone();
+                this.contact_op(
                     window,
                     cx,
+                    move |session, cx| session.contact_op(op, &id, cx),
+                    move |(), this, window, cx| match op {
+                        ContactOp::Report => show_info("Spam reported".into(), window, cx),
+                        // The composer goes: keep the keyboard in the chat.
+                        ContactOp::Block => {
+                            let conversation = this.conversation.read(cx);
+                            if conversation.composer_focus(cx).contains_focused(window, cx) {
+                                conversation.focus_handle(cx).focus(window, cx);
+                            }
+                        }
+                        _ => {}
+                    },
                 );
-            }
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn delete_group(&mut self, chat: ChatSummary, window: &mut Window, cx: &mut Context<Self>) {
+        let id = chat.id;
+        self.confirm(
+            format!("Delete {}?", chat.title),
+            "If the group is still going, this ends it for everyone in it. \
+             It is then erased from all your devices. This can't be undone."
+                .into(),
+            "Delete",
+            move |this, window, cx| {
+                let id = id.clone();
+                this.contact_op(
+                    window,
+                    cx,
+                    |session, cx| session.delete_group(&id, cx),
+                    |(), _, _, _| {},
+                );
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Reports the open group's member `query` names (asked for if empty).
+    fn report_member(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if query.trim().is_empty() {
+            return self.prompt("report ", window, cx);
         }
+        let Some((members, _)) = &self.members else {
+            return show_refusal("That needs an account".into(), window, cx);
+        };
+        let members = members.clone();
+        let suspect = match members.read(cx).suspect(query) {
+            Ok(suspect) => suspect,
+            Err(refusal) => return show_refusal(refusal, window, cx),
+        };
+        // Names are peer-chosen: the tag shows who it really is.
+        let title = format!("Report {} for spam?", suspect.label);
+        let suspect = std::cell::RefCell::new(Some(suspect));
+        self.confirm(
+            title,
+            REPORT_SPAM.into(),
+            "Report spam",
+            move |this, window, cx| {
+                let Some(suspect) = suspect.borrow_mut().take() else {
+                    return;
+                };
+                let members = members.clone();
+                this.contact_op(
+                    window,
+                    cx,
+                    move |_, cx| members.read(cx).report_spam(suspect, cx),
+                    |(), _, window, cx| show_info("Spam reported".into(), window, cx),
+                );
+            },
+            window,
+            cx,
+        );
     }
 
     /// The open chat's title (peer-chosen, one bounded line).
@@ -1319,6 +1513,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.confirm_as(
+            title,
+            description,
+            ok,
+            ButtonVariant::Danger,
+            run,
+            window,
+            cx,
+        );
+    }
+
+    /// [`Self::confirm`], with the confirming button's look.
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_as(
+        &self,
+        title: String,
+        description: String,
+        ok: &'static str,
+        variant: ButtonVariant,
+        run: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let this = cx.weak_entity();
         let run = std::rc::Rc::new(run);
         let previous_focus = window.focused(cx);
@@ -1329,7 +1546,7 @@ impl Workspace {
                 .title(title.clone())
                 .description(description.clone())
                 .ok_text(ok)
-                .ok_variant(ButtonVariant::Danger)
+                .ok_variant(variant)
                 .on_ok(move |_, window, cx| {
                     // Closed first, so focus is back before `run` (which
                     // may report) and stays where the command came from.
@@ -1676,6 +1893,21 @@ impl Render for Workspace {
                     this.safety_code("", window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &BlockContact, window, cx| {
+                this.contact_safety(ContactOp::Block, "", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UnblockContact, window, cx| {
+                this.contact_safety(ContactOp::Unblock, "", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ReportSpam, window, cx| {
+                this.contact_safety(ContactOp::Report, "", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RetractRequest, window, cx| {
+                this.contact_safety(ContactOp::Retract, "", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DeleteChat, window, cx| {
+                this.contact_safety(ContactOp::Delete, "", window, cx)
+            }))
             .on_action(cx.listener(Self::attach_file))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::invite_to_group))
@@ -2123,6 +2355,48 @@ mod tests {
         cx.simulate_keystrokes("escape enter");
         cx.simulate_input("hi");
         assert_eq!(composer_text(&workspace, cx), "hi");
+    }
+
+    #[gpui::test]
+    fn a_blocked_contact_takes_no_typing_and_nothing_runs_unasked(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let focused = focus_probe(&workspace, cx);
+        let chat_list = workspace.read_with(cx, |workspace, _| workspace.chat_list.clone());
+        chat_list.update(cx, |list, cx| {
+            let mut chats = list.chats().to_vec();
+            assert!(!chats[0].is_group);
+            chats[0].blocked = true;
+            list.set_chats(chats, LoadState::Loaded, cx);
+        });
+        cx.simulate_keystrokes("j enter");
+        // Nothing reaches a blocked contact: no composer to type into.
+        assert_eq!(focused(cx), Focus::Messages);
+        cx.simulate_input("hi");
+        assert_eq!(composer_text(&workspace, cx), "");
+
+        let asking = |cx: &mut VisualTestContext| cx.update(|w, cx| w.has_active_dialog(cx));
+        let told = |cx: &mut VisualTestContext| cx.update(|w, cx| w.notifications(cx).len());
+        let ask = |op, query: &'static str, cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.contact_safety(op, query, window, cx)
+            });
+            cx.run_until_parked();
+        };
+        // What can't apply is refused at once, without a dialog.
+        let before = told(cx);
+        ask(ContactOp::Block, "", cx);
+        ask(ContactOp::Retract, "", cx);
+        ask(ContactOp::Report, "grace", cx);
+        assert_eq!(told(cx), before + 3);
+        assert!(!asking(cx));
+        // Unblocking asks first; Escape runs nothing.
+        ask(ContactOp::Unblock, "", cx);
+        assert!(asking(cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!asking(cx));
+        assert_eq!(told(cx), before + 3);
+        assert_eq!(focused(cx), Focus::Messages);
     }
 
     #[gpui::test]
@@ -2865,6 +3139,50 @@ mod tests {
     }
 
     #[test]
+    fn contact_operations_are_asked_about_only_where_they_apply() {
+        use ContactOp::*;
+        let chat = |request, blocked| ChatSummary {
+            id: ChatId("c".into()),
+            title: "Ada".into(),
+            is_group: false,
+            request,
+            is_self_chat: false,
+            blocked,
+            preview: None,
+            last_activity: None,
+            unread: 0,
+        };
+        let asks = |op, chat: &ChatSummary| contact_confirmation(op, chat).map(|(_, _, ok)| ok);
+        let contact = chat(None, false);
+        let blocked = chat(None, true);
+        let (incoming, outgoing, ended) = (
+            chat(Some(Request::Incoming), false),
+            chat(Some(Request::Outgoing), false),
+            chat(Some(Request::Closed), false),
+        );
+        assert_eq!(asks(Block, &contact), Ok("Block"));
+        assert!(asks(Block, &blocked).is_err());
+        assert!(asks(Unblock, &contact).is_err());
+        assert_eq!(asks(Unblock, &blocked), Ok("Unblock"));
+        // Blocking a request's sender says it declines the request.
+        let (_, said, _) = contact_confirmation(Block, &incoming).unwrap();
+        assert!(said.contains("decline"), "{said}");
+        assert!(asks(Block, &outgoing).is_err());
+        // Only an open request the user sent is retracted.
+        assert_eq!(asks(Retract, &outgoing), Ok("Retract"));
+        for chat in [&contact, &incoming, &ended] {
+            assert!(asks(Retract, chat).is_err());
+        }
+        // Open requests are declined or retracted, not deleted.
+        assert!(asks(Delete, &incoming).is_err());
+        assert!(asks(Delete, &outgoing).is_err());
+        for chat in [&contact, &blocked, &ended] {
+            assert_eq!(asks(Delete, chat), Ok("Delete"));
+        }
+        assert_eq!(asks(Report, &contact), Ok("Report spam"));
+    }
+
+    #[test]
     fn a_safety_code_is_asked_for_only_from_someone_to_compare_with() {
         let chat = |is_group, is_self_chat| ChatSummary {
             id: ChatId("c".into()),
@@ -2872,6 +3190,7 @@ mod tests {
             is_group,
             request: None,
             is_self_chat,
+            blocked: false,
             preview: None,
             last_activity: None,
             unread: 0,

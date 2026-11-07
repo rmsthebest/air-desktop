@@ -175,6 +175,8 @@ pub struct Devices {
     load: Option<Task<()>>,
     /// Looking up the self chat while it is unknown.
     probe: Option<Task<()>>,
+    /// A chat changed during the lookup: look again once it is done.
+    reprobe: bool,
     _changes: Subscription,
 }
 
@@ -220,6 +222,24 @@ enum Touch {
     Probe,
 }
 
+/// What follows a self-chat lookup.
+#[derive(Debug, PartialEq)]
+enum AfterProbe {
+    Reload,
+    /// A chat changed while looking: it may have brought the self chat.
+    Again,
+    Done,
+}
+
+fn after_probe(found: bool, known: bool, reprobe: &mut bool) -> AfterProbe {
+    let again = std::mem::take(reprobe);
+    match (found, known) {
+        (true, false) => AfterProbe::Reload,
+        (false, false) if again => AfterProbe::Again,
+        _ => AfterProbe::Done,
+    }
+}
+
 /// The synced entries and the self chat (its members) change the list.
 /// Before the first load, any chat might.
 fn touches(notification: &DbNotification, loaded: bool, self_chat: Option<CoreChatId>) -> Touch {
@@ -255,9 +275,14 @@ impl Devices {
                 if *overflowed || touches.contains(&Touch::Reload) {
                     this.reload(cx);
                 } else if touches.contains(&Touch::Probe) {
-                    // Replaces a running lookup: one that started before
-                    // this change could miss the self group it brings.
-                    this.probe_self_chat(cx);
+                    // A running lookup may have read before this change:
+                    // one more follows it (never aborted, so busy chats
+                    // can't starve it).
+                    if this.probe.is_some() {
+                        this.reprobe = true;
+                    } else {
+                        this.probe_self_chat(cx);
+                    }
                 }
             }
         });
@@ -271,6 +296,7 @@ impl Devices {
             failed: false,
             load: None,
             probe: None,
+            reprobe: false,
             _changes: changes,
         };
         devices.reload(cx);
@@ -317,10 +343,13 @@ impl Devices {
             let found = task.await.and_then(|found| found);
             _ = this.update(cx, |this, cx| {
                 this.probe = None;
-                match found {
-                    Ok(Some(_)) if this.self_chat.is_none() => this.reload(cx),
-                    Ok(_) => {}
-                    Err(err) => error!("failed to look up the self chat: {err:#}"),
+                let found = found
+                    .inspect_err(|err| error!("failed to look up the self chat: {err:#}"))
+                    .is_ok_and(|found| found.is_some());
+                match after_probe(found, this.self_chat.is_some(), &mut this.reprobe) {
+                    AfterProbe::Reload => this.reload(cx),
+                    AfterProbe::Again => this.probe_self_chat(cx),
+                    AfterProbe::Done => {}
                 }
             });
         }));
@@ -607,8 +636,8 @@ pub enum TornDown {
     Deleted,
     /// Some of it failed. The record decides what happens next: kept, the
     /// account loads again (and fails again); gone, it never loads again,
-    /// and the next start sweeps up the files left (see
-    /// [`super::account::remove_orphans`]).
+    /// and the files left are marked for the next load to remove (see
+    /// [`super::account::remove_marked`]).
     Failed {
         record_kept: bool,
     },
@@ -631,6 +660,11 @@ pub async fn tear_down(user: CoreUser, db_path: String) -> TornDown {
         // Can't tell: assume the worst (don't load again).
         Err(_) => true,
     };
+    if !record_kept
+        && let Err(err) = super::account::mark_deleted(std::path::Path::new(&db_path), record)
+    {
+        error!("failed to mark the unlinked account's data for removal: {err}");
+    }
     TornDown::Failed { record_kept }
 }
 
@@ -734,6 +768,19 @@ mod tests {
             linking_url(&domain, "123456789"),
             "air://example.com/multiDeviceLinkingCode?code=123456789"
         );
+    }
+
+    #[test]
+    fn a_change_during_a_lookup_gets_one_more_lookup() {
+        let mut reprobe = true;
+        assert_eq!(after_probe(false, false, &mut reprobe), AfterProbe::Again);
+        // That one found nothing either, and nothing changed meanwhile.
+        assert_eq!(after_probe(false, false, &mut reprobe), AfterProbe::Done);
+        assert_eq!(after_probe(true, false, &mut true), AfterProbe::Reload);
+        // A load found it meanwhile: nothing more to do.
+        let mut reprobe = true;
+        assert_eq!(after_probe(true, true, &mut reprobe), AfterProbe::Done);
+        assert!(!reprobe);
     }
 
     #[test]

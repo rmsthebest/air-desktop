@@ -918,3 +918,22 @@ Fixed:
 
 Still deferred (account seam): routing a failed teardown by its record,
 and a self-chat lookup outrun by the Welcome, in a `#[gpui::test]`.
+
+## Gate 15d — gate 15c fixes (`edc28b6..433483d`): PASS
+
+Fixed:
+- **The sweep could delete a link under way in another instance
+  (medium).** The core writes a new account's record last, so a database
+  without one may still be in the making (nothing stops a second
+  instance on the same data dir). Gate 15c's blind sweep is gone: a
+  teardown whose record went but whose files stayed marks its id
+  (`<id>.deleted`), and only marked ids' files are removed when an
+  account loads (in `spawn_blocking`).
+  `only_marked_databases_without_a_record_are_removed` keeps an unmarked
+  record-less database.
+- **Busy chats could starve the self-chat lookup (low).** Gate 15c
+  replaced a running lookup on every change. Now the lookup runs to its
+  end and one more follows if a chat changed meanwhile.
+  `a_change_during_a_lookup_gets_one_more_lookup`.
+
+Still deferred (account seam): `AppRoot::tear_down`'s routing.

@@ -853,8 +853,7 @@ async fn e2e_linked_devices_share_the_account_and_quiet_each_other() {
         }
     };
     assert_eq!(desk.user_id(), ada.user_id());
-    // A finished record, so the next start loads it (and the sweep of
-    // record-less databases leaves it alone).
+    // A finished record, so the next start loads it.
     let desk_path = desk_dir.to_str().unwrap().to_string();
     let records = ClientRecord::load_all_from_air_db(&desk_path)
         .await

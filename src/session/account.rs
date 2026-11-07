@@ -33,7 +33,8 @@ pub async fn load_default(db_path: String) -> anyhow::Result<Option<CoreUser>> {
         .iter()
         .map(|record| record.client_record_id)
         .collect();
-    remove_orphans(std::path::Path::new(&db_path), &known);
+    let dir = std::path::PathBuf::from(&db_path);
+    tokio::task::spawn_blocking(move || remove_marked(&dir, &known)).await?;
     records.retain(|record| record.client_record_state == ClientRecordState::Finished);
     records.sort_unstable_by_key(|record| Reverse((record.is_default, record.created_at)));
     for record in records {
@@ -49,38 +50,49 @@ pub async fn load_default(db_path: String) -> anyhow::Result<Option<CoreUser>> {
     Ok(None)
 }
 
-/// Removes account databases without a record (`<id>.db` and its `-shm` /
-/// `-wal`): what a deletion that failed partway left (the core drops the
-/// record even when a file stays), or a link cut short by a crash. Nothing
-/// can load them, and they hold keys and history. Runs only when an
-/// account is loaded (at startup, after a teardown), never while sign-up or
-/// linking creates one.
-pub fn remove_orphans(dir: &std::path::Path, known: &std::collections::HashSet<Uuid>) {
+/// Marks `id`'s leftover database files for removal: a teardown that
+/// failed partway (the core drops the record even when a file stays) left
+/// them, nothing can load them, and they hold keys and history.
+pub fn mark_deleted(dir: &std::path::Path, id: Uuid) -> std::io::Result<()> {
+    std::fs::write(dir.join(format!("{id}.deleted")), b"")
+}
+
+/// Removes the database files (`<id>.db`, `-shm`, `-wal`) of accounts
+/// marked by [`mark_deleted`], then the mark. Only marked ones: a database
+/// without a record may be a sign-up or link still under way in another
+/// instance, and the core writes the record last. A marked id that has a
+/// record again is left alone.
+pub fn remove_marked(dir: &std::path::Path, known: &std::collections::HashSet<Uuid>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(id) = name.to_str().and_then(client_db_id) else {
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".deleted"))
+            .and_then(|stem| Uuid::parse_str(stem).ok())
+        else {
             continue;
         };
-        if known.contains(&id) || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+        if known.contains(&id) {
             continue;
         }
-        info!("removing the data of a deleted account");
-        if let Err(err) = std::fs::remove_file(entry.path()) {
-            error!("failed to remove a deleted account's data: {err}");
+        let mut removed = true;
+        for extension in ["db", "db-shm", "db-wal"] {
+            match std::fs::remove_file(dir.join(format!("{id}.{extension}"))) {
+                Ok(()) => info!("removed the data of a deleted account"),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    error!("failed to remove a deleted account's data: {err}");
+                    removed = false;
+                }
+            }
+        }
+        if removed && let Err(err) = std::fs::remove_file(entry.path()) {
+            error!("failed to remove a deletion mark: {err}");
         }
     }
-}
-
-/// The account a file of the core's belongs to, if it is a client
-/// database (`<uuid>.db`, `.db-shm` or `.db-wal`).
-fn client_db_id(name: &str) -> Option<Uuid> {
-    let (stem, extension) = name.split_once('.')?;
-    matches!(extension, "db" | "db-shm" | "db-wal")
-        .then(|| Uuid::parse_str(stem).ok())
-        .flatten()
 }
 
 #[derive(Debug, Clone)]
@@ -286,34 +298,37 @@ mod tests {
     }
 
     #[test]
-    fn only_client_databases_without_a_record_are_removed() {
+    fn only_marked_databases_without_a_record_are_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let (kept, orphan) = (Uuid::new_v4(), Uuid::new_v4());
+        let (deleted, linking, recorded) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let files = [
-            format!("{kept}.db"),
-            format!("{kept}.db-wal"),
-            format!("{orphan}.db"),
-            format!("{orphan}.db-shm"),
-            format!("{orphan}.db-wal"),
+            format!("{deleted}.db"),
+            format!("{deleted}.db-shm"),
+            format!("{deleted}.db-wal"),
+            // No record yet, no mark: a link under way elsewhere.
+            format!("{linking}.db"),
+            format!("{linking}.db-wal"),
+            // Marked, but its record is back: left alone.
+            format!("{recorded}.db"),
             "air.db".into(),
-            format!("{orphan}.txt"),
-            "notes.db".into(),
         ];
         for file in &files {
             std::fs::write(dir.path().join(file), b"").unwrap();
         }
-        remove_orphans(dir.path(), &[kept].into());
+        mark_deleted(dir.path(), deleted).unwrap();
+        mark_deleted(dir.path(), recorded).unwrap();
+        remove_marked(dir.path(), &[recorded].into());
         let mut left: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
         left.sort();
         let mut expected = vec![
-            format!("{kept}.db"),
-            format!("{kept}.db-wal"),
+            format!("{linking}.db"),
+            format!("{linking}.db-wal"),
+            format!("{recorded}.db"),
+            format!("{recorded}.deleted"),
             "air.db".into(),
-            format!("{orphan}.txt"),
-            "notes.db".into(),
         ];
         expected.sort();
         assert_eq!(left, expected);

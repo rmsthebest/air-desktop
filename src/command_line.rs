@@ -55,6 +55,12 @@ pub enum Command {
     DeleteExpiredRequests(bool),
     /// Send the file at this path, as typed, to the open chat.
     Attach(String),
+    /// Set the user's picture from this path, as typed (empty: pick one).
+    Picture(String),
+    RemovePicture,
+    /// Set the open group's picture from this path (empty: pick one).
+    GroupPicture(String),
+    RemoveGroupPicture,
     /// Change the user's display name.
     DisplayName(String),
     /// Link the new device that shows this code (as typed).
@@ -238,6 +244,26 @@ const SPECS: &[Spec] = &[
         help: "Send a file (a path) to the open chat",
     },
     Spec {
+        names: &["picture"],
+        arg: Arg::Text,
+        help: "Set your picture (a path; none: pick a file)",
+    },
+    Spec {
+        names: &["remove-picture"],
+        arg: Arg::None,
+        help: "Remove your picture",
+    },
+    Spec {
+        names: &["group-picture"],
+        arg: Arg::Text,
+        help: "Set the open group's picture (a path; none: pick a file)",
+    },
+    Spec {
+        names: &["remove-group-picture"],
+        arg: Arg::None,
+        help: "Remove the open group's picture",
+    },
+    Spec {
         names: &["name"],
         arg: Arg::Text,
         help: "Change your display name",
@@ -346,6 +372,10 @@ pub fn parse(input: &str) -> Result<Command, String> {
             Command::DeleteExpiredRequests(toggle(arg, "delete-expired-requests")?)
         }
         "attach" => Command::Attach(need("a file path")?),
+        "picture" => Command::Picture(arg.to_string()),
+        "remove-picture" => Command::RemovePicture,
+        "group-picture" => Command::GroupPicture(arg.to_string()),
+        "remove-group-picture" => Command::RemoveGroupPicture,
         "name" => Command::DisplayName(need("a name")?),
         "link" => Command::Link(need("the code the new device shows")?),
         "device-name" => Command::DeviceName(need("a name")?),
@@ -500,6 +530,17 @@ mod tests {
             parse(":delete-account  delete "),
             Ok(Command::DeleteAccount("delete".into()))
         );
+        // Paths as typed (spaces too); none picks a file.
+        assert_eq!(
+            parse(":picture  ~/My Pictures/me.png "),
+            Ok(Command::Picture("~/My Pictures/me.png".into()))
+        );
+        assert_eq!(parse(":picture"), Ok(Command::Picture(String::new())));
+        assert_eq!(
+            parse(":remove-group-picture"),
+            Ok(Command::RemoveGroupPicture)
+        );
+        assert!(parse(":remove-picture me.png").is_err());
         // Usernames go to the session as typed; it normalizes them.
         assert_eq!(
             parse(":add  @Ada-L "),

@@ -240,7 +240,7 @@ impl ChatList {
                 this.focus_handle.focus(window, cx);
                 this.open(id.clone(), cx);
             }))
-            .child(avatar(&chat.title, px(40.), cx))
+            .child(avatar(&chat.title, chat.picture.as_ref(), px(40.), cx))
             .child(
                 v_flex()
                     .flex_1()

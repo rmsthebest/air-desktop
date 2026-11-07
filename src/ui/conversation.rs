@@ -1161,7 +1161,7 @@ impl Render for Conversation {
                     .gap_3()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(avatar(&chat.title, px(30.), cx))
+                    .child(avatar(&chat.title, chat.picture.as_ref(), px(30.), cx))
                     .child(
                         div()
                             .flex_1()

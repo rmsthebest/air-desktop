@@ -42,7 +42,7 @@ pinned rev). Safety and privacy features come first.
 17. **Account management** (done). Delete the account, including upstream's
     abort handling. Settings rows for read receipts and for deleting
     expired contact requests (both synced by the core). Invitation codes.
-18. **Profile pictures.** Set your own and show peers' pictures, decoded
+18. **Profile pictures** (done). Set your own and show peers' pictures, decoded
     under the same limits as attachments.
 19. **Polish.** Emoji picker and autocomplete, a full-size image viewer,
     retrying a failed upload, and adding a contact from a group.

@@ -17,6 +17,9 @@ use mimi_room_policy::{MimiProposal, RoleIndex, VerifiedRoomState};
 use tls_codec::Serialize as _;
 use tracing::error;
 
+use std::sync::Arc;
+
+use super::avatars::{self, Avatars};
 use super::chats::model_id;
 use super::contacts::{Failure, on_tokio};
 use super::messages::core_chat_id;
@@ -71,6 +74,27 @@ impl Session {
         })
     }
 
+    /// Sets the group's picture from the file at `path` (`None` removes
+    /// it), for every member. The core shrinks it to a small JPEG.
+    pub fn set_group_picture(
+        &self,
+        chat: &ChatId,
+        path: Option<std::path::PathBuf>,
+        cx: &App,
+    ) -> impl Future<Output = Result<(), String>> + use<> {
+        let (user, chat) = (self.user.clone(), core_chat_id(chat));
+        let what = if path.is_some() {
+            "change the group's picture"
+        } else {
+            "remove the group's picture"
+        };
+        on_tokio(
+            cx,
+            what,
+            async move { set_picture(&user, chat, path).await },
+        )
+    }
+
     /// Leaves the group; it stays in the list, ended, until deleted.
     pub fn leave_group(
         &self,
@@ -109,6 +133,22 @@ pub(super) async fn create(user: &CoreUser, title: &str) -> Result<CoreChatId, F
 pub(super) async fn rename(user: &CoreUser, chat: CoreChatId, title: &str) -> Result<(), Failure> {
     active_group(user, chat).await?;
     Ok(user.set_chat_title(chat, parse_title(title)?).await?)
+}
+
+/// See [`Session::set_group_picture`].
+pub(super) async fn set_picture(
+    user: &CoreUser,
+    chat: CoreChatId,
+    path: Option<std::path::PathBuf>,
+) -> Result<(), Failure> {
+    active_group(user, chat).await?;
+    let picture = match path {
+        // Checked first: the core drops a picture it can't shrink, which
+        // removes the group's current one.
+        Some(path) => Some(avatars::read_source(path).await?),
+        None => None,
+    };
+    Ok(user.set_chat_picture(chat, picture).await?)
 }
 
 pub(super) async fn leave(user: &CoreUser, chat: CoreChatId) -> Result<(), Failure> {
@@ -239,6 +279,8 @@ pub struct Members {
     failed: bool,
     /// The latest load; a newer one replaces (cancels) it.
     load: Option<Task<()>>,
+    /// The members' pictures, kept across loads.
+    avatars: Arc<tokio::sync::Mutex<Avatars<CoreUserId>>>,
     _changes: Subscription,
 }
 
@@ -273,6 +315,7 @@ impl Members {
             loaded: false,
             failed: false,
             load: None,
+            avatars: Arc::default(),
             _changes: changes,
         };
         members.reload(cx);
@@ -351,14 +394,28 @@ impl Members {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let (user, chat) = (self.user.clone(), self.chat);
-        let load = Tokio::spawn(cx, async move { load(&user, chat).await });
+        let (user, chat, avatars) = (self.user.clone(), self.chat, self.avatars.clone());
+        let load = Tokio::spawn(cx, async move {
+            // One load at a time: a newer one waits for (and replaces) it.
+            let mut avatars = avatars.lock().await;
+            load(&user, chat, &mut avatars).await
+        });
         self.load = Some(cx.spawn(async move |this, cx| {
             let loaded = load.await;
             _ = this.update(cx, |this, cx| {
                 this.failed = loaded.is_err();
                 match loaded {
-                    Ok(Some(loaded)) => (this.members, this.core_ids) = loaded.into_iter().unzip(),
+                    Ok(Some(loaded)) => {
+                        let old = std::mem::take(&mut this.members);
+                        (this.members, this.core_ids) = loaded.into_iter().unzip();
+                        avatars::drop_unused(
+                            old.iter().filter_map(|member| member.picture.as_ref()),
+                            this.members
+                                .iter()
+                                .filter_map(|member| member.picture.as_ref()),
+                            cx,
+                        );
+                    }
                     // The chat is gone; the workspace closes it.
                     Ok(None) => {}
                     Err(err) => error!("failed to load group members: {err:#}"),
@@ -447,7 +504,11 @@ fn removal_candidates(members: &[Member]) -> Vec<(String, String)> {
 }
 
 /// The group's members, the user first, then by name. `None` without a chat.
-pub(super) async fn load(user: &CoreUser, chat: CoreChatId) -> Option<Vec<(Member, CoreUserId)>> {
+pub(super) async fn load(
+    user: &CoreUser,
+    chat: CoreChatId,
+    avatars: &mut Avatars<CoreUserId>,
+) -> Option<Vec<(Member, CoreUserId)>> {
     let active = user
         .chat(&chat)
         .await
@@ -462,9 +523,16 @@ pub(super) async fn load(user: &CoreUser, chat: CoreChatId) -> Option<Vec<(Membe
     let mut members = Vec::with_capacity(participants.len());
     for id in participants {
         let own = &id == user.user_id();
+        let profile = user.user_profile(&id).await;
+        let picture = profile.profile_picture.map(|picture| picture.into_bytes());
         let member = Member {
             id: UserId(SharedString::default()),
-            name: super::display_name(user, &id).await,
+            name: if own {
+                "You".into()
+            } else {
+                crate::model::name_line(profile.display_name.as_ref())
+            },
+            picture: avatars.get(&id, picture).await,
             own,
             removing: removing.contains(&id),
             tag: SharedString::default(),
@@ -476,6 +544,7 @@ pub(super) async fn load(user: &CoreUser, chat: CoreChatId) -> Option<Vec<(Membe
         };
         members.push((member, id));
     }
+    avatars.retain(|id| members.iter().any(|(_, member)| member == id));
     identify(&mut members);
     members.sort_by(|(a, _), (b, _)| (!a.own, &a.name).cmp(&(!b.own, &b.name)));
     Some(members)
@@ -538,6 +607,7 @@ mod tests {
             removing: false,
             can_remove,
             tag: tag.to_string().into(),
+            picture: None,
         }
     }
 

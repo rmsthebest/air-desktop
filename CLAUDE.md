@@ -195,6 +195,22 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     A late code for a chat the user left is dropped; a failed lookup (often a
     peer credential not here yet) never blames the connection. Shown in a dialog:
     Enter copies, Escape closes.
+  - `avatars.rs`: profile and group pictures. A chat shows its group's
+    picture or an established contact's (`model::shows_picture`: not a
+    requester's, a blocked one's, or the self chat's); members and the
+    nav rail show profile pictures. Air sends them as JPEG the core shrank
+    to 256²: only JPEG is drawn, decoded by us under limits (512 KiB,
+    1024² edge, 8 MiB alloc), kept at most 128². Workers keep each
+    picture with a keyed hash of its bytes (`Avatars`), so a reload with
+    the same bytes reuses it; entities drop a replaced picture's texture
+    (`drop_unused`). Setting one (`:picture [path]`, `:group-picture
+    [path]`, no path: file dialog; `:remove-picture`,
+    `:remove-group-picture`; a settings row) first decodes the file
+    once under limits (`read_source`, 4096² edge): the core resizes it
+    without limits, and for a group silently drops one it can't read,
+    which would remove the current picture. Profile updates cost the
+    server's per-address rate limit one request per group: the e2e
+    retries them slowly (`patiently`).
 - `src/notifier.rs` — shows alerts via `org.freedesktop.Notifications`
   (zbus 5 on async-io, gpui's own copy). Replaces a chat's notification
   instead of stacking, closes it on dismissal, escapes bodies when the
@@ -305,7 +321,7 @@ From an Air checkout:
    (the local server requires them).
 Clients use domain `localhost`. E2E: `AIR_E2E_CODE=<code> cargo test e2e_sign_up --
 --ignored` (and `e2e_account`: synced settings, invite codes, account deletion), and the two-user test with `AIR_E2E_CODES=<code>,<code> cargo test
-e2e_two -- --ignored`; linked devices with `AIR_E2E_CODES=<code>,<code> cargo test e2e_linked --
+e2e_two -- --ignored` (also pictures); linked devices with `AIR_E2E_CODES=<code>,<code> cargo test e2e_linked --
 --ignored`; blocking, reporting, retracting and deleting (contacts and messages, edit history, mute) with three codes, `AIR_E2E_CODES=<code>,<code>,<code>
 cargo test e2e_contacts -- --ignored`; add `AIR_E2E_DATA_DIR=<dir>` to keep the account, then
 `AIR_DESKTOP_DATA_DIR=<dir> cargo run`. E2E tests use `flavor = "multi_thread"`: the

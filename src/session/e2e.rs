@@ -19,7 +19,7 @@ use super::chats::{self, Update};
 use super::contacts::{self, Failure};
 use super::pending::Pending;
 use super::queue::{self, ConnectionStatus, QueueEvent};
-use super::{attachments, composer, devices, groups, messages, safety};
+use super::{attachments, avatars, composer, devices, groups, messages, safety};
 use crate::model::{AttachmentState, Message, MessageBody, MessageStatus, Quote};
 use crate::settings::Notifications;
 use aircommon::identifiers::UserId as CoreUserId;
@@ -700,7 +700,9 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     // Both see both members, themselves first. Groups are created with the
     // core's trusted policy: any member may remove another.
     let members = |user: CoreUser, chat| async move {
-        let members = groups::load(&user, chat).await.unwrap_or_default();
+        let members = groups::load(&user, chat, &mut Default::default())
+            .await
+            .unwrap_or_default();
         members
             .into_iter()
             .map(|(member, _)| (member.name.to_string(), member.own, member.can_remove))
@@ -731,8 +733,82 @@ async fn e2e_two_users_connect_by_username_and_talk() {
     })
     .await;
 
+    // Pictures: Ada's reaches Bob in their chat and the group's members,
+    // the group's in his list; removing either reaches him too.
+    let png = |name: &str| {
+        let path = dir.path().join(name);
+        image::RgbImage::from_pixel(300, 300, image::Rgb([10, 120, 200]))
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        path
+    };
+    let bob_sees = async |chat| {
+        let chat = bob.chat(&chat).await?;
+        Some(chats::summary(&bob, chat).await.picture.map(|p| p.size()))
+    };
+    let adas_picture_in_group = async || {
+        let members = groups::load(&bob, bob_group, &mut Default::default()).await?;
+        let (ada, _) = members.into_iter().find(|(member, _)| !member.own)?;
+        Some(ada.picture.map(|p| p.size()))
+    };
+    // The server rate-limits profile updates: retried.
+    let ada_png = png("ada.png");
+    patiently("Ada sets her picture", async || {
+        super::set_picture(ada.clone(), Some(ada_png.clone())).await
+    })
+    .await;
+    // The core shrank it to 256²; we keep it at most 128².
+    let kept = Some((avatars::MAX_KEPT, avatars::MAX_KEPT));
+    eventually("Bob sees Ada's picture", async || {
+        (bob_sees(bob_chat).await? == kept).then_some(())
+    })
+    .await;
+    assert_eq!(adas_picture_in_group().await, Some(kept));
+    // A broken file is refused before the core sees it.
+    let broken = dir.path().join("broken.png");
+    let mut bytes = std::fs::read(png("whole.png")).unwrap();
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(&broken, bytes).unwrap();
+    assert!(refused(
+        groups::set_picture(&ada, group, Some(broken.clone())).await
+    ));
+    let group_png = png("group.png");
+    patiently("Ada sets the group's picture", async || {
+        groups::set_picture(&ada, group, Some(group_png.clone())).await
+    })
+    .await;
+    eventually("Bob sees the group's picture", async || {
+        (bob_sees(bob_group).await? == kept).then_some(())
+    })
+    .await;
+    // Refused for the group, the broken file left its picture alone.
+    assert!(refused(
+        groups::set_picture(&ada, group, Some(broken)).await
+    ));
+    assert!(
+        chats::summary(&ada, ada.chat(&group).await.unwrap())
+            .await
+            .picture
+            .is_some()
+    );
+    patiently("Ada removes her picture", async || {
+        super::set_picture(ada.clone(), None).await
+    })
+    .await;
+    patiently("Ada removes the group's picture", async || {
+        groups::set_picture(&ada, group, None).await
+    })
+    .await;
+    eventually("Bob sees both pictures go", async || {
+        (bob_sees(bob_chat).await?.is_none() && bob_sees(bob_group).await?.is_none()).then_some(())
+    })
+    .await;
+    // Profile updates cost many requests (one per group): let the
+    // server's rate limit refill before the rest.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
     // Ada removes Bob: his group ends, and he can only delete it.
-    let (_, bob_id) = groups::load(&ada, group)
+    let (_, bob_id) = groups::load(&ada, group, &mut Default::default())
         .await
         .unwrap()
         .into_iter()
@@ -1401,6 +1477,21 @@ async fn eventually<T>(what: &str, check: impl AsyncFn() -> Option<T>) -> T {
     })
     .await
     .unwrap_or_else(|_| panic!("timed out: {what}"))
+}
+
+/// Runs `op` until it succeeds, waiting 5 s after each failure: the
+/// server's rate limit (per address, shared by every account in a test)
+/// refills slowly, and quick retries keep it exhausted.
+async fn patiently<T, E: std::fmt::Debug>(what: &str, op: impl AsyncFn() -> Result<T, E>) -> T {
+    eventually(what, async || match op().await {
+        Ok(value) => Some(value),
+        Err(err) => {
+            eprintln!("{what}: {err:?}; retrying");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            None
+        }
+    })
+    .await
 }
 
 /// Synced settings and invite codes load as stored, and deleting the

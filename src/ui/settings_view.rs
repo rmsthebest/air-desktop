@@ -38,6 +38,10 @@ pub enum SettingsEvent {
     Notifications(Notifications),
     /// Type a new display name, starting from this one.
     EditDisplayName(SharedString),
+    /// Pick a new picture (file dialog).
+    SetPicture,
+    /// Remove the user's picture (confirmed first).
+    RemovePicture,
     AddUsername,
     RemoveUsername(SharedString),
     /// Type a new name for the device with this tag, starting from this one.
@@ -71,6 +75,8 @@ pub enum Row {
     Keymap(KeymapMode),
     Notifications(Notifications),
     DisplayName(SharedString),
+    /// The user's picture: whether there is one.
+    Picture(bool),
     Username(SharedString),
     AddUsername,
     Device(Device),
@@ -99,6 +105,7 @@ pub enum Row {
 #[derive(Clone, Default)]
 pub struct AccountRows {
     pub display_name: SharedString,
+    pub has_picture: bool,
     pub usernames: Vec<SharedString>,
     pub devices: Vec<Device>,
     pub max_devices: u32,
@@ -118,6 +125,7 @@ pub fn rows(settings: &Settings, account: Option<&AccountRows>) -> Vec<Row> {
     ];
     if let Some(account) = account {
         rows.push(Row::DisplayName(account.display_name.clone()));
+        rows.push(Row::Picture(account.has_picture));
         rows.extend(account.usernames.iter().cloned().map(Row::Username));
         rows.push(Row::AddUsername);
         rows.push(Row::ReadReceipts(account.synced.map(|s| s.read_receipts)));
@@ -160,6 +168,7 @@ pub fn rows(settings: &Settings, account: Option<&AccountRows>) -> Vec<Row> {
 pub fn remove(row: &Row) -> Option<SettingsEvent> {
     match row {
         Row::Username(name) => Some(SettingsEvent::RemoveUsername(name.clone())),
+        Row::Picture(true) => Some(SettingsEvent::RemovePicture),
         Row::Device(device) if !device.this_device => {
             Some(SettingsEvent::UnlinkDevice(device.tag.clone()))
         }
@@ -206,6 +215,7 @@ pub fn change(row: &Row, forward: bool, themes: &Themes) -> Option<SettingsEvent
         // right) acts on them, so stepping back never starts a removal.
         _ if !forward => return None,
         Row::DisplayName(name) => SettingsEvent::EditDisplayName(name.clone()),
+        Row::Picture(_) => SettingsEvent::SetPicture,
         Row::Username(name) => SettingsEvent::RemoveUsername(name.clone()),
         Row::AddUsername => SettingsEvent::AddUsername,
         Row::Device(device) => SettingsEvent::EditDeviceName {
@@ -339,6 +349,7 @@ impl SettingsView {
         let devices = account.map(|account| account.devices.read(cx));
         Some(AccountRows {
             display_name: session.display_name().clone(),
+            has_picture: session.picture().is_some(),
             usernames: session.usernames().to_vec(),
             devices: devices.map(|d| d.devices().to_vec()).unwrap_or_default(),
             max_devices: devices.map_or(0, Devices::max_devices),
@@ -427,6 +438,8 @@ impl SettingsView {
                 "← →",
             ),
             Row::DisplayName(name) => ("Display name", name.to_string(), "enter to change"),
+            Row::Picture(true) => ("Picture", "Set".into(), "enter to change, delete removes"),
+            Row::Picture(false) => ("Picture", "None".into(), "enter to pick one"),
             Row::Username(name) => ("Username", name.to_string(), "enter or delete to remove"),
             Row::AddUsername => ("", "Add a username…".into(), "enter"),
             Row::Device(device) => {
@@ -645,11 +658,12 @@ mod tests {
             .iter()
             .position(|row| matches!(row, Row::DisplayName(_)))
             .unwrap();
-        let tail: Vec<_> = rows[at..at + 4].to_vec();
+        let tail: Vec<_> = rows[at..at + 5].to_vec();
         assert_eq!(
             tail,
             [
                 Row::DisplayName("Ada".into()),
+                Row::Picture(false),
                 Row::Username("ada-1".into()),
                 Row::Username("ada-2".into()),
                 Row::AddUsername
@@ -658,17 +672,27 @@ mod tests {
         // A username row removes that username, never another, and only
         // on the forward key.
         assert_eq!(
-            change(&tail[2], true, &themes()),
+            change(&tail[3], true, &themes()),
             Some(SettingsEvent::RemoveUsername("ada-2".into()))
         );
         for row in &tail {
             assert_eq!(change(row, false, &themes()), None, "{row:?}");
         }
         assert_eq!(
-            remove(&tail[1]),
+            remove(&tail[2]),
             Some(SettingsEvent::RemoveUsername("ada-1".into()))
         );
         assert_eq!(remove(&tail[0]), None);
+        // The picture: enter picks one; delete removes one there is.
+        assert_eq!(
+            change(&tail[1], true, &themes()),
+            Some(SettingsEvent::SetPicture)
+        );
+        assert_eq!(remove(&tail[1]), None);
+        assert_eq!(
+            remove(&Row::Picture(true)),
+            Some(SettingsEvent::RemovePicture)
+        );
     }
 
     #[test]

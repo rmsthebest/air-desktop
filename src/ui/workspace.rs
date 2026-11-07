@@ -804,6 +804,15 @@ impl Workspace {
                 self.prompt(&format!("name {name}"), window, cx)
             }
             SettingsEvent::AddUsername => self.prompt("username ", window, cx),
+            SettingsEvent::SetPicture => self.pick_picture(PictureOf::Own, window, cx),
+            SettingsEvent::RemovePicture => self.confirm(
+                "Remove your picture?".into(),
+                "Your contacts see your initials instead.".into(),
+                "Remove",
+                |this, window, cx| this.change_picture(PictureOf::Own, None, window, cx),
+                window,
+                cx,
+            ),
             SettingsEvent::RemoveUsername(username) => {
                 let name = username.to_string();
                 self.confirm(
@@ -1532,6 +1541,30 @@ impl Workspace {
                     self.attach(chat, vec![path], window, cx);
                 }
             }
+            Command::Picture(path) if path.is_empty() => {
+                self.pick_picture(PictureOf::Own, window, cx)
+            }
+            Command::Picture(path) => {
+                self.change_picture(PictureOf::Own, Some(expand_home(&path)), window, cx)
+            }
+            Command::RemovePicture => self.change_picture(PictureOf::Own, None, window, cx),
+            Command::GroupPicture(path) => {
+                let Some(chat) = self.open_group(window, cx) else {
+                    return;
+                };
+                if path.is_empty() {
+                    self.pick_picture(PictureOf::Group(chat), window, cx)
+                } else {
+                    let path = Some(expand_home(&path));
+                    self.change_picture(PictureOf::Group(chat), path, window, cx)
+                }
+            }
+            Command::RemoveGroupPicture => {
+                let Some(chat) = self.open_group(window, cx) else {
+                    return;
+                };
+                self.change_picture(PictureOf::Group(chat), None, window, cx)
+            }
             Command::Rename(title) => {
                 let Some(chat) = self.open_group(window, cx) else {
                     return;
@@ -1892,6 +1925,85 @@ impl Workspace {
         }));
     }
 
+    /// Sets (`Some` path) or removes a picture: the user's or a group's.
+    fn change_picture(
+        &mut self,
+        of: PictureOf,
+        path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let done = match (&of, path.is_some()) {
+            (PictureOf::Own, true) => "Your picture is changed",
+            (PictureOf::Own, false) => "Your picture is removed",
+            (PictureOf::Group(_), true) => "The group's picture is changed",
+            (PictureOf::Group(_), false) => "The group's picture is removed",
+        };
+        match of {
+            PictureOf::Own => self.contact_op(
+                window,
+                cx,
+                |session, cx| session.set_picture(path, cx),
+                move |(), this, window, cx| {
+                    // The core may not report its own change.
+                    if let Some(session) = &this.session {
+                        session.update(cx, |session, cx| session.reload_profile(cx));
+                    }
+                    show_info(done.into(), window, cx)
+                },
+            ),
+            PictureOf::Group(chat) => self.contact_op(
+                window,
+                cx,
+                |session, cx| session.set_group_picture(&chat, path, cx),
+                move |(), _, window, cx| show_info(done.into(), window, cx),
+            ),
+        }
+    }
+
+    /// Picks a picture with the system's file dialog, then sets it. A
+    /// group's goes to the group open when the dialog was, if still open.
+    fn pick_picture(&mut self, of: PictureOf, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let path = match picked.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(_)) => {
+                    _ = cx.update(|window, cx| {
+                        show_refusal(
+                            "Couldn't open a file dialog; give a path: :picture <path>".into(),
+                            window,
+                            cx,
+                        )
+                    });
+                    None
+                }
+            };
+            let Some(path) = path else {
+                return;
+            };
+            _ = this.update_in(cx, |this, window, cx| {
+                if let PictureOf::Group(chat) = &of {
+                    let list = this.chat_list.read(cx);
+                    let open = list.selected_index().map(|ix| &list.chats()[ix].id);
+                    if open != Some(chat) {
+                        let refusal = "Another chat was opened meanwhile; nothing was changed";
+                        show_refusal(refusal.into(), window, cx);
+                        return;
+                    }
+                }
+                this.change_picture(of, Some(path), window, cx)
+            });
+        })
+        .detach();
+    }
+
     /// Opens `chat` now, or once the chat list has loaded it.
     fn open_when_listed(&mut self, chat: ChatId, window: &mut Window, cx: &mut Context<Self>) {
         self.open_then_focus(chat, Self::focus_composer_now, window, cx);
@@ -2034,6 +2146,12 @@ impl Workspace {
 }
 
 /// A typed path with a leading `~` meaning the home directory.
+/// Whose picture a command changes.
+enum PictureOf {
+    Own,
+    Group(ChatId),
+}
+
 fn expand_home(path: &str) -> PathBuf {
     let home = || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
     match path.strip_prefix('~') {
@@ -2091,6 +2209,7 @@ impl Render for Workspace {
             let session = session.read(cx);
             Account {
                 name: session.display_name().clone(),
+                picture: session.picture().cloned(),
                 status: session.status(),
                 version_expires: session.version_expires(),
                 usernames: session.usernames().to_vec(),
@@ -2791,31 +2910,34 @@ mod tests {
     }
 
     #[gpui::test]
-    fn removing_given_out_codes_asks_first(cx: &mut TestAppContext) {
+    fn removals_from_the_settings_ask_first(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         let asking = |cx: &mut VisualTestContext| cx.update(|w, cx| w.has_active_dialog(cx));
         let told = |cx: &mut VisualTestContext| cx.update(|w, cx| w.notifications(cx).len());
-        let remove = |cx: &mut VisualTestContext| {
+        let remove = |event: SettingsEvent, cx: &mut VisualTestContext| {
             workspace.update_in(cx, |workspace, window, cx| {
-                workspace.settings_changed(SettingsEvent::RemoveUsedCodes, window, cx)
+                workspace.settings_changed(event, window, cx)
             });
             cx.run_until_parked();
         };
-        let before = told(cx);
-        // Escape removes nothing. (Without an account, reaching the
-        // removal is told as a refusal: that's what shows it ran.)
-        remove(cx);
-        assert!(asking(cx));
-        cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
-        assert!(!asking(cx));
-        assert_eq!(told(cx), before);
-        // Confirmed, it runs.
-        remove(cx);
-        cx.simulate_keystrokes("enter");
-        cx.run_until_parked();
-        assert!(!asking(cx));
-        assert_eq!(told(cx), before + 1);
+        // Given-out codes, the user's picture.
+        for event in [SettingsEvent::RemoveUsedCodes, SettingsEvent::RemovePicture] {
+            let before = told(cx);
+            // Escape removes nothing. (Without an account, reaching the
+            // removal is told as a refusal: that's what shows it ran.)
+            remove(event.clone(), cx);
+            assert!(asking(cx), "{event:?}");
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(!asking(cx));
+            assert_eq!(told(cx), before, "{event:?}");
+            // Confirmed, it runs.
+            remove(event.clone(), cx);
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+            assert!(!asking(cx));
+            assert_eq!(told(cx), before + 1, "{event:?}");
+        }
     }
 
     #[gpui::test]
@@ -3586,6 +3708,7 @@ mod tests {
             unread: 0,
             muted: None,
             group_ended: false,
+            picture: None,
         };
         let said = |op, facts| contact_confirmation(op, &chat(Some(facts))).unwrap().1;
         let incoming = OneToOne {
@@ -3620,6 +3743,7 @@ mod tests {
             unread: 0,
             muted: None,
             group_ended: false,
+            picture: None,
         };
         let (contact, group, own) = (chat(false, false), chat(true, false), chat(false, true));
         assert!(safety_target(None, "").is_err());

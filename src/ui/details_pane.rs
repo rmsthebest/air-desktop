@@ -25,7 +25,7 @@ pub fn details_pane(
         .px_4()
         .bg(theme.sidebar)
         .when_some(chat, |pane, chat| {
-            pane.child(avatar(&chat.title, px(72.), cx))
+            pane.child(avatar(&chat.title, chat.picture.as_ref(), px(72.), cx))
                 .child(
                     div()
                         .pt_2()
@@ -100,7 +100,7 @@ fn member_row(member: &Member, cx: &App) -> impl IntoElement {
     h_flex()
         .w_full()
         .gap_2()
-        .child(avatar(&member.name, px(24.), cx))
+        .child(avatar(&member.name, member.picture.as_ref(), px(24.), cx))
         .child(
             div()
                 .flex_1()

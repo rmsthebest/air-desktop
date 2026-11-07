@@ -17,8 +17,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::error;
 
-use crate::model::{ChatId, ChatSummary, Mute, OneToOne, Side, Stage, name_line};
+use crate::model::{self, ChatId, ChatSummary, Mute, OneToOne, Side, Stage, name_line};
 use crate::runtime::{Tokio, TokioTask};
+use crate::session::avatars::{self, Avatars};
 use crate::session::pending::Pending;
 use crate::session::preview;
 use crate::session::{Session, SessionEvent};
@@ -80,7 +81,17 @@ impl Chats {
     fn update(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
             Update::Delta(delta) => {
+                let old: Vec<_> = self
+                    .chats
+                    .iter()
+                    .filter_map(|c| c.picture.clone())
+                    .collect();
                 apply(&mut self.chats, delta);
+                avatars::drop_unused(
+                    old.iter(),
+                    self.chats.iter().filter_map(|chat| chat.picture.as_ref()),
+                    cx,
+                );
                 self.state = LoadState::Loaded;
             }
             Update::Failed(message) => self.state = LoadState::Failed(message),
@@ -223,7 +234,7 @@ async fn initial_load(
         let mut upserted = Vec::with_capacity(chunk.len());
         for id in chunk {
             if let Some(chat) = user.chat(id).await {
-                let (summary, keys) = load_chat(user, chat).await;
+                let (summary, keys) = load_chat(user, chat, &mut state.avatars).await;
                 state.record(*id, keys);
                 state.order.push(*id);
                 upserted.push(summary);
@@ -253,7 +264,7 @@ async fn reload(
     for id in affected {
         match user.chat(&id).await {
             Some(chat) => {
-                let (summary, keys) = load_chat(user, chat).await;
+                let (summary, keys) = load_chat(user, chat, &mut state.avatars).await;
                 state.record(id, keys);
                 delta.upserted.push(summary);
             }
@@ -271,7 +282,7 @@ async fn reload(
             && let Some(chat) = user.chat(id).await
         {
             // A chat no notification told us about.
-            let (summary, keys) = load_chat(user, chat).await;
+            let (summary, keys) = load_chat(user, chat, &mut state.avatars).await;
             state.record(*id, keys);
             delta.upserted.push(summary);
         }
@@ -283,7 +294,7 @@ async fn reload(
 /// How `chat` is listed.
 #[cfg(test)]
 pub(super) async fn summary(user: &CoreUser, chat: Chat) -> ChatSummary {
-    load_chat(user, chat).await.0
+    load_chat(user, chat, &mut Avatars::default()).await.0
 }
 
 impl Session {
@@ -337,7 +348,11 @@ fn mute(muted: &ChatMuted) -> Mute {
 
 /// Loads what the list shows for a chat. Port of `load_chat_details`, minus
 /// what the list doesn't show yet.
-async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
+async fn load_chat(
+    user: &CoreUser,
+    chat: Chat,
+    avatars: &mut Avatars<CoreChatId>,
+) -> (ChatSummary, ChatKeys) {
     let unread = user.unread_messages_count(chat.id).await;
     let last = user
         .last_message(chat.id)
@@ -357,20 +372,29 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         .inspect_err(|err| error!("failed to check for the self chat: {err:#}"))
         .unwrap_or(false);
 
+    let one_to_one = one_to_one(&chat.chat_type, chat.status());
+    let shows_picture = model::shows_picture(one_to_one, is_self_chat);
     let mut users = Vec::new();
-    let (title, is_group) = match &chat.chat_type {
-        ChatType::HandleConnection(username) => (username.plaintext().to_string(), false),
+    let (title, is_group, picture) = match &chat.chat_type {
+        ChatType::HandleConnection(username) => (username.plaintext().to_string(), false, None),
         ChatType::Connection(peer)
         | ChatType::TargetedMessageConnection(peer)
         | ChatType::PendingConnection(peer) => {
             users.push(peer.clone());
-            let name = user.user_profile(peer).await.display_name.to_string();
-            (name, false)
+            let profile = user.user_profile(peer).await;
+            let picture = profile.profile_picture.map(|picture| picture.into_bytes());
+            (profile.display_name.to_string(), false, picture)
         }
         // The self chat is a group of the user's devices, not one to manage.
-        ChatType::Group(attributes) => (attributes.title.clone(), !is_self_chat),
+        ChatType::Group(attributes) => (
+            attributes.title.clone(),
+            !is_self_chat,
+            attributes.picture.clone(),
+        ),
     };
-    let one_to_one = one_to_one(&chat.chat_type, chat.status());
+    let picture = avatars
+        .get(&chat.id, picture.filter(|_| shows_picture))
+        .await;
     let title = if is_self_chat {
         "Notes to self".to_string()
     } else {
@@ -404,6 +428,7 @@ async fn load_chat(user: &CoreUser, chat: Chat) -> (ChatSummary, ChatKeys) {
         unread: u32::try_from(unread).unwrap_or(u32::MAX),
         muted: chat.muted_until.as_ref().map(mute),
         group_ended: group_ended(&chat),
+        picture,
     };
     let keys = ChatKeys {
         last_message: last.map(|message| message.id()),
@@ -446,6 +471,8 @@ pub(super) fn model_id(id: &CoreChatId) -> ChatId {
 struct LocalState {
     published: HashMap<CoreChatId, ChatKeys>,
     order: Vec<CoreChatId>,
+    /// The published chats' pictures.
+    avatars: Avatars<CoreChatId>,
 }
 
 #[derive(Debug)]
@@ -494,6 +521,9 @@ impl LocalState {
             self.order.retain(|ordered| ordered != &id);
             delta.removed.insert(model_id(&id));
         }
+        // Pictures go with their chats (also those held back).
+        let published = &self.published;
+        self.avatars.retain(|id| published.contains_key(id));
         held_back
     }
 
@@ -627,6 +657,7 @@ mod tests {
             unread: 0,
             muted: None,
             group_ended: false,
+            picture: None,
         }
     }
 

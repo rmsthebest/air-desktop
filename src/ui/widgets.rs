@@ -2,13 +2,26 @@
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::*;
-use gpui_kit::{App, Div, Pixels, div, px};
+use gpui_kit::{App, Div, ImageSource, ObjectFit, Pixels, div, img, px};
 
-use crate::model::initials;
+use crate::model::{Picture, initials};
 
-/// Round avatar placeholder showing the initials of `name`.
-pub fn avatar(name: &str, size: Pixels, cx: &App) -> Div {
+/// Round avatar: the picture if there is one, else the initials of `name`.
+pub fn avatar(name: &str, picture: Option<&Picture>, size: Pixels, cx: &App) -> Div {
     let theme = cx.theme();
+    if let Some(picture) = picture {
+        return div()
+            .flex_none()
+            .size(size)
+            .rounded_full()
+            .overflow_hidden()
+            .bg(theme.primary.opacity(0.14))
+            .child(
+                img(ImageSource::Render(picture.0.clone()))
+                    .size(size)
+                    .object_fit(ObjectFit::Cover),
+            );
+    }
     div()
         .flex()
         .flex_none()

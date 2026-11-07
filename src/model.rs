@@ -40,6 +40,8 @@ pub struct Member {
     /// Unique within the group, from a hash of the user id: tells apart
     /// members whose (peer-chosen) names are the same. `:kick #<tag>`.
     pub tag: SharedString,
+    /// Their profile picture, if one could be drawn.
+    pub picture: Option<Picture>,
 }
 
 /// One of the user's devices (a leaf of their self group).
@@ -91,6 +93,9 @@ pub struct ChatSummary {
     /// A group the user is no longer in (left, removed, or it was
     /// deleted): only deleting it is left.
     pub group_ended: bool,
+    /// The contact's profile picture or the group's, if one could be
+    /// drawn (see `session::chats::picture_bytes`).
+    pub picture: Option<Picture>,
 }
 
 impl ChatSummary {
@@ -126,6 +131,16 @@ impl ChatSummary {
                 stage: Stage::Ended,
                 ..OneToOne::CONTACT
             })
+    }
+}
+
+/// Whether a chat shows a picture, as upstream: a group's own (never the
+/// self chat's), or an established contact's, not a requester's (they
+/// aren't accepted yet) nor a blocked one's.
+pub fn shows_picture(one_to_one: Option<OneToOne>, self_chat: bool) -> bool {
+    match one_to_one {
+        None => !self_chat,
+        Some(chat) => chat.side == Side::Contact && chat.stage != Stage::Blocked,
     }
 }
 
@@ -1166,6 +1181,7 @@ pub mod mock {
                 unread,
                 muted: None,
                 group_ended: false,
+                picture: None,
             }
         };
         vec![
@@ -1553,6 +1569,25 @@ mod tests {
     }
 
     #[test]
+    fn pictures_show_for_groups_and_established_contacts_only() {
+        let chat = |side, stage| {
+            Some(OneToOne {
+                side,
+                stage,
+                peer_known: true,
+            })
+        };
+        assert!(shows_picture(None, false));
+        assert!(!shows_picture(None, true), "the self chat has its own mark");
+        assert!(shows_picture(chat(Side::Contact, Stage::Open), false));
+        assert!(shows_picture(chat(Side::Contact, Stage::Ended), false));
+        // A requester's picture waits for acceptance; a blocked one's goes.
+        assert!(!shows_picture(chat(Side::Incoming, Stage::Open), false));
+        assert!(!shows_picture(chat(Side::Outgoing, Stage::Sending), false));
+        assert!(!shows_picture(chat(Side::Contact, Stage::Blocked), false));
+    }
+
+    #[test]
     fn only_a_live_chat_is_written_to() {
         let chat = |one_to_one: Option<OneToOne>, request| ChatSummary {
             id: ChatId("c".into()),
@@ -1566,6 +1601,7 @@ mod tests {
             unread: 0,
             muted: None,
             group_ended: false,
+            picture: None,
         };
         let stage = |stage| {
             Some(OneToOne {
@@ -1626,6 +1662,7 @@ mod tests {
                 unread,
                 muted: None,
                 group_ended: false,
+                picture: None,
             })
             .collect();
         assert_eq!(next_unread(&chats, None, true), Some(1));

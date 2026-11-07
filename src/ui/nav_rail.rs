@@ -18,6 +18,7 @@ pub const RAIL_WIDTH: f32 = 56.;
 /// The signed-in account, shown at the bottom of the rail.
 pub struct Account {
     pub name: SharedString,
+    pub picture: Option<crate::model::Picture>,
     pub status: ConnectionStatus,
     /// When the server stops accepting this client version, if announced.
     pub version_expires: Option<chrono::DateTime<chrono::Utc>>,
@@ -106,7 +107,7 @@ fn account_badge(account: Account, cx: &App) -> AnyElement {
         .id("nav-account")
         .relative()
         .mt_2()
-        .child(avatar(&account.name, px(32.), cx))
+        .child(avatar(&account.name, account.picture.as_ref(), px(32.), cx))
         .child(
             div()
                 .absolute()

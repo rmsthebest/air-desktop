@@ -6,6 +6,7 @@ pub mod account;
 pub mod account_settings;
 pub mod alerts;
 mod attachments;
+mod avatars;
 pub mod chats;
 pub mod composer;
 pub mod contact_safety;
@@ -97,6 +98,9 @@ struct QueueState {
 pub struct Session {
     user: CoreUser,
     display_name: SharedString,
+    /// The user's own profile picture, if one could be drawn.
+    picture: Option<crate::model::Picture>,
+    own_avatar: Arc<tokio::sync::Mutex<avatars::Avatars<()>>>,
     queue_state: QueueState,
     /// The latest profile load; a newer one replaces (cancels) it, so an
     /// older result can't overwrite a newer one.
@@ -265,6 +269,8 @@ impl Session {
                 _notifier: notifier,
                 _settings: settings,
                 display_name: SharedString::default(),
+                picture: None,
+                own_avatar: Arc::default(),
                 queue_state: initial,
                 profile_task: None,
                 user,
@@ -293,6 +299,10 @@ impl Session {
 
     pub fn display_name(&self) -> &SharedString {
         &self.display_name
+    }
+
+    pub fn picture(&self) -> Option<&crate::model::Picture> {
+        self.picture.as_ref()
     }
 
     pub fn status(&self) -> ConnectionStatus {
@@ -338,6 +348,23 @@ impl Session {
     ) -> impl Future<Output = Result<SharedString, String>> + use<> {
         let (user, name) = (self.user.clone(), name.to_string());
         contacts::on_tokio(cx, "change your name", set_display_name(user, name))
+    }
+
+    /// Sets the user's profile picture from the file at `path` (`None`
+    /// removes it), as their contacts see it. The core shrinks it to a
+    /// small JPEG; then [`Self::reload_profile`] shows it.
+    pub fn set_picture(
+        &self,
+        path: Option<std::path::PathBuf>,
+        cx: &App,
+    ) -> impl Future<Output = Result<(), String>> + use<> {
+        let user = self.user.clone();
+        let what = if path.is_some() {
+            "change your picture"
+        } else {
+            "remove your picture"
+        };
+        contacts::on_tokio(cx, what, set_picture(user, path))
     }
 
     /// Deletes the account on the server, as upstream: the deletion is
@@ -420,15 +447,24 @@ impl Session {
     }
 
     pub(crate) fn reload_profile(&mut self, cx: &mut Context<Self>) {
-        let user = self.user.clone();
-        let profile = Tokio::spawn(cx, async move { user.own_user_profile().await });
+        let (user, avatar) = (self.user.clone(), self.own_avatar.clone());
+        let profile = Tokio::spawn(cx, async move {
+            let profile = user.own_user_profile().await?;
+            let bytes = profile.profile_picture.map(|picture| picture.into_bytes());
+            let picture = avatar.lock().await.get(&(), bytes).await;
+            anyhow::Ok((
+                SharedString::from(profile.display_name.to_string()),
+                picture,
+            ))
+        });
         self.profile_task =
             Some(cx.spawn(
-                async move |this, cx| match profile.await.and_then(|profile| Ok(profile?)) {
-                    Ok(profile) => {
-                        let name = SharedString::from(profile.display_name.to_string());
+                async move |this, cx| match profile.await.and_then(|profile| profile) {
+                    Ok((name, picture)) => {
                         _ = this.update(cx, |this, cx| {
                             this.display_name = name;
+                            let old = std::mem::replace(&mut this.picture, picture);
+                            avatars::drop_unused(old.iter(), this.picture.iter(), cx);
                             cx.notify();
                         });
                     }
@@ -477,6 +513,21 @@ fn alert_outcome(
             });
         }
     }
+}
+
+/// See [`Session::set_picture`].
+async fn set_picture(
+    user: CoreUser,
+    path: Option<std::path::PathBuf>,
+) -> Result<(), contacts::Failure> {
+    let picture = match path {
+        Some(path) => Some(avatars::read_source(path).await?),
+        None => None,
+    };
+    let mut profile = user.own_user_profile().await.map_err(anyhow::Error::from)?;
+    profile.profile_picture = picture.map(aircoreclient::Asset::Value);
+    user.set_own_user_profile(profile).await?;
+    Ok(())
 }
 
 /// See [`Session::set_display_name`].

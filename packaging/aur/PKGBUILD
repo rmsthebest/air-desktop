@@ -13,7 +13,8 @@ license=(AGPL-3.0-or-later)
 depends=(gcc-libs glibc libxcb libxkbcommon libxkbcommon-x11
          vulkan-icd-loader vulkan-driver wayland ttf-font)
 optdepends=('xdg-desktop-portal: file dialogs and opening links')
-makedepends=(rustup)
+# fontconfig: a build script asks pkg-config for it; the binary doesn't link it.
+makedepends=(rustup fontconfig)
 # makepkg's LTO flags reach the C code that Rust crates build.
 options=(!lto)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")

@@ -1431,3 +1431,26 @@ Incident: the reviewer ran probes with `CARGO_TARGET_DIR` set to the project's
 `target/`, then ran `cargo clean -p air-desktop --profile dev` to undo it,
 deleting 65.6 GiB of rebuildable artifacts (80G to 23G). No tracked file
 changed. Gate briefs now say to build elsewhere and never clean.
+
+## Gate 23b — gate 23 fixes (`1227884..8c35a18`): PASS
+
+Fixed (medium): an animated original over 8 MiB was read whole but took no
+slot (documented as holding one), so a peer's large files could cost a full
+read each per chat open. It holds a slot now, so at most 6 are read.
+
+Fixed (low):
+- A cursor move onto a message cut off at the top stayed cut off: only a
+  message in view in full counts as in view (`Shown::shows_whole`).
+- `close` left the countdown timer running.
+- A slot lost while the message couldn't be reloaded left the view holding
+  frames the worker had forgotten: forgotten only once the view can be told.
+- `Attachment::drawn` existed only for its test: inlined, test removed.
+- `seam_the_newest_gifs_get_the_animation_slots` now covers a newer image
+  taking a slot (it passed with eviction removed).
+
+Accepted (low):
+- The freeze isn't checked at draw level: the tests see `plays`, not which
+  picture `render_attachment` chose. Reading only.
+- The refusal of an oversize animation is a unit test of `moving`, not a seam
+  test: Air's core re-encodes images when sending, so the harness can't send
+  one (a padded GIF arrives as a small WebP). Only a modified client can.

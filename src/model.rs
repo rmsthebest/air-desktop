@@ -526,16 +526,6 @@ impl Animation {
     }
 }
 
-impl Attachment {
-    /// What the view draws: the animation while `moving`, else the still.
-    pub fn drawn(&self, moving: bool) -> Option<&Picture> {
-        let animation = self.animation.as_ref().filter(|_| moving);
-        animation
-            .map(|animation| &animation.picture)
-            .or(self.image.as_ref())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentState {
     Uploading,
@@ -1453,20 +1443,6 @@ mod tests {
         };
         assert!(slow.plays(Span::from_secs(29), true));
         assert!(!slow.plays(Span::from_secs(30), true));
-
-        // What is drawn follows: the still once it stops.
-        let still = Picture(Arc::new(gpui_kit::RenderImage::new(Vec::new())));
-        let attachment = Attachment {
-            id: AttachmentId(uuid::Uuid::nil()),
-            name: "f".into(),
-            description: None,
-            size: 1,
-            state: AttachmentState::Ready,
-            image: Some(still.clone()),
-            animation: Some(animation.clone()),
-        };
-        assert_eq!(attachment.drawn(true), Some(&animation.picture));
-        assert_eq!(attachment.drawn(false), Some(&still));
     }
 
     fn message(sender_id: &str, sender_name: &str) -> Message {

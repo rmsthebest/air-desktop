@@ -316,10 +316,11 @@ const SLOWED_FRAME_DELAY: Duration = Duration::from_millis(100);
 /// What a stored image turned out to be, for its animation.
 #[derive(Clone)]
 pub(super) enum Moving {
-    /// It doesn't move: costs nothing, so takes no slot.
+    /// It doesn't move, or its content isn't here: little was read, so it
+    /// takes no slot.
     Still,
-    /// It should, but is too large or can't be read. Decoding it cost as
-    /// much as an animation, so it holds a slot too.
+    /// It should, but is too large or can't be read. Reading and decoding
+    /// it cost as much as an animation, so it holds a slot too.
     Refused,
     Animated(Animation),
 }
@@ -335,21 +336,29 @@ pub(super) async fn animation(user: &CoreUser, id: AttachmentId) -> Moving {
             AttachmentContent::Ready(bytes)
             | AttachmentContent::Uploading(bytes)
             | AttachmentContent::UploadFailed(bytes),
-        ) if bytes.len() <= MAX_PREVIEW_BYTES => bytes,
+        ) => bytes,
         Ok(_) => return Moving::Still,
         Err(err) => {
             error!("failed to load an attachment: {err:#}");
             return Moving::Still;
         }
     };
-    match tokio::task::spawn_blocking(move || decode_animation(&bytes)).await {
-        Ok(Some(animation)) => Moving::Animated(animation),
-        Ok(None) => Moving::Refused,
+    match tokio::task::spawn_blocking(move || moving(&bytes)).await {
+        Ok(moving) => moving,
         Err(err) => {
             error!("animation decode panicked: {err}");
             Moving::Refused
         }
     }
+}
+
+/// What a moving image's bytes, read whole, come to. Air's clients re-encode
+/// images when sending, so an oversize one takes a modified client.
+fn moving(bytes: &[u8]) -> Moving {
+    if bytes.len() > MAX_PREVIEW_BYTES {
+        return Moving::Refused;
+    }
+    decode_animation(bytes).map_or(Moving::Refused, Moving::Animated)
 }
 
 /// Decodes an animated GIF, WebP or PNG under limits, by our own decoder.
@@ -885,6 +894,18 @@ mod tests {
     fn a_zero_delay_plays_slowed() {
         let animation = decode_animation(&gif(1, 1, 2, 0)).unwrap();
         assert_eq!(animation.loop_time, SLOWED_FRAME_DELAY * 2);
+    }
+
+    #[test]
+    fn what_was_read_whole_holds_a_slot_even_refused() {
+        let small = gif(4, 4, 2, 50);
+        assert!(matches!(moving(&small), Moving::Animated(_)));
+        // Valid past its end, so only the size refuses it.
+        let mut oversize = small.clone();
+        oversize.resize(MAX_PREVIEW_BYTES + 1, 0);
+        assert!(decode_animation(&oversize).is_some());
+        assert!(matches!(moving(&oversize), Moving::Refused));
+        assert!(matches!(moving(b"not an image"), Moving::Refused));
     }
 
     #[test]

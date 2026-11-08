@@ -1126,38 +1126,47 @@ impl Worker {
         let mut slots = 0;
         for (message, attachment) in previews {
             let room = slots < attachments::MAX_ANIMATIONS;
-            let changed = match self.animations.get(&attachment) {
-                Some(Moving::Still) => false,
-                Some(Moving::Refused) if room => {
-                    slots += 1;
-                    false
-                }
-                Some(Moving::Animated(_)) if room => {
-                    slots += 1;
-                    false
-                }
-                // Forgotten: if it gets a slot again, it decodes again.
-                Some(moving) => {
-                    let animated = matches!(moving, Moving::Animated(_));
+            match self.animations.get(&attachment).cloned() {
+                Some(Moving::Still) => {}
+                Some(Moving::Refused | Moving::Animated(_)) if room => slots += 1,
+                Some(Moving::Refused) => {
                     self.animations.remove(&attachment);
-                    animated
                 }
+                // Forgotten only once the view can be told, so what it holds
+                // never goes past the bound; else tried again next time.
+                Some(Moving::Animated(_)) => match self.user.message(message).await {
+                    Ok(stored) => {
+                        self.animations.remove(&attachment);
+                        self.publish_reloaded(stored).await?;
+                    }
+                    Err(err) => error!("failed to reload a message: {err:#}"),
+                },
                 None if room => {
                     let moving = attachments::animation(&self.user, attachment).await;
                     let animated = matches!(moving, Moving::Animated(_));
                     slots += usize::from(!matches!(moving, Moving::Still));
                     self.animations.insert(attachment, moving);
-                    animated
+                    if animated {
+                        match self.user.message(message).await {
+                            Ok(stored) => self.publish_reloaded(stored).await?,
+                            Err(err) => error!("failed to reload a message: {err:#}"),
+                        }
+                    }
                 }
-                None => false,
-            };
-            if changed && let Ok(Some(stored)) = self.user.message(message).await {
-                let (key, item) = self.convert(stored).await;
-                let edits = self.window.patch(key, item).into_iter().collect();
-                self.publish(edits, None, false).await?;
+                None => {}
             }
         }
         Ok(())
+    }
+
+    /// Patches a message reloaded after what it shows changed.
+    async fn publish_reloaded(&mut self, stored: Option<ChatMessage>) -> Result<(), Closed> {
+        let Some(stored) = stored else {
+            return Ok(());
+        };
+        let (key, item) = self.convert(stored).await;
+        let edits = self.window.patch(key, item).into_iter().collect();
+        self.publish(edits, None, false).await
     }
 
     /// Reloads the messages showing any of `attachments`.

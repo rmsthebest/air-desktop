@@ -114,6 +114,14 @@ struct Shown {
     seen: Option<usize>,
 }
 
+impl Shown {
+    /// Whether the message at `ix` is in view in full.
+    fn shows_whole(&self, ix: usize) -> bool {
+        let first = self.range.start + usize::from(self.first_offset > px(0.));
+        self.seen.is_some_and(|last| (first..=last).contains(&ix))
+    }
+}
+
 /// Where each message was drawn this frame, collected while the list draws
 /// and turned into a [`Shown`] right after. The list itself only reports
 /// what it shows on wheel scrolls.
@@ -386,6 +394,7 @@ impl Conversation {
         self.reacting = false;
         self.details = None;
         self.viewing = None;
+        self.request_tick = None;
         cx.notify();
     }
 
@@ -645,7 +654,12 @@ impl Conversation {
         if let Some(ix) = cursor {
             // Off screen, following the tail would undo the reveal. On the
             // newest message, the view may go on following.
-            let in_view = self.shown.as_ref().is_some_and(|s| s.range.contains(&ix));
+            // Only all of it counts: following the tail would keep a message
+            // cut off at the top cut off.
+            let in_view = self
+                .shown
+                .as_ref()
+                .is_some_and(|shown| shown.shows_whole(ix));
             if !in_view && ix + 1 < self.messages(cx).len() {
                 self.list.pause_following_tail();
             }
@@ -1940,7 +1954,11 @@ fn render_attachment(attachment: &Attachment, moving: bool, under_cursor: bool) 
     v_flex()
         .gap_1()
         .children(attachment.image.as_ref().map(|picture| {
-            let shown = attachment.drawn(moving).unwrap_or(picture);
+            let shown = attachment
+                .animation
+                .as_ref()
+                .filter(|_| moving)
+                .map_or(picture, |animation| &animation.picture);
             let (width, height) = crate::model::fit(picture.size(), crate::model::PREVIEW_BOX);
             // gpui keeps the playing frame by the element's id.
             img(ImageSource::Render(shown.0.clone()))
@@ -2129,10 +2147,31 @@ mod tests {
         conversation.update(cx, |conversation, cx| conversation.set_cursor(Some(20), cx));
         cx.run_until_parked();
         assert!(shown(cx).contains(&20), "the move showed {:?}", shown(cx));
+
+        // Nor one cut off at the top.
+        conversation.update(cx, |conversation, cx| {
+            conversation.set_cursor(None, cx);
+            conversation.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let top = conversation.read_with(cx, |c, _| c.shown.clone()).unwrap();
+        assert!(top.first_offset > px(0.), "the top message is cut off");
+        conversation.update(cx, |conversation, cx| {
+            conversation.set_cursor(Some(top.range.start), cx)
+        });
+        cx.run_until_parked();
+        let moved = conversation.read_with(cx, |c, _| c.shown.clone()).unwrap();
+        assert!(
+            moved.shows_whole(top.range.start),
+            "the move left it cut off: {:?} at {:?}",
+            moved.range,
+            moved.first_offset
+        );
     }
 
     #[gpui::test]
-    fn an_open_requests_countdown_keeps_redrawing(cx: &mut gpui::TestAppContext) {
+    fn an_open_requests_countdown_has_a_timer_while_shown(cx: &mut gpui::TestAppContext) {
         let (window, conversation) = cx.update(|cx| {
             gpui_kit::init(cx);
             crate::settings::SettingsStore::open(None, cx);
@@ -2156,6 +2195,11 @@ mod tests {
         };
         assert!(show(Some(Utc::now() + chrono::Duration::days(1))));
         assert!(!show(None), "a chat with no request has no timer");
+        assert!(show(Some(Utc::now() + chrono::Duration::days(1))));
+        conversation.update_in(cx, |conversation, window, cx| {
+            conversation.close(window, cx);
+            assert!(conversation.request_tick.is_none(), "closed, it stops");
+        });
     }
 
     #[gpui::test]

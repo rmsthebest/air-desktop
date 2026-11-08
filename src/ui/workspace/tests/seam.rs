@@ -243,27 +243,37 @@ fn seam_the_newest_gifs_get_the_animation_slots(cx: &mut TestAppContext) {
             .unwrap();
     }
     seam.open(&bob_name);
-    seam.until(
-        "the newest six moving, the oldest two still",
-        |workspace, cx| {
-            workspace.read_with(cx, |workspace, cx| {
-                let conversation = workspace.conversation.read(cx);
-                let Some(messages) = conversation.messages_entity() else {
-                    return false;
-                };
-                let moving: Vec<bool> = messages
-                    .read(cx)
-                    .messages()
-                    .iter()
-                    .filter_map(|message| match &message.body {
-                        crate::model::MessageBody::Attachment(a) => Some(a.animation.is_some()),
-                        _ => None,
-                    })
-                    .collect();
-                moving == [false, false, true, true, true, true, true, true]
-            })
-        },
-    );
+    let moving = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        workspace.read_with(cx, |workspace, cx| {
+            let conversation = workspace.conversation.read(cx);
+            let Some(messages) = conversation.messages_entity() else {
+                return Vec::new();
+            };
+            messages
+                .read(cx)
+                .messages()
+                .iter()
+                .filter_map(|message| match &message.body {
+                    crate::model::MessageBody::Attachment(a) => Some(a.animation.is_some()),
+                    _ => None,
+                })
+                .collect::<Vec<bool>>()
+        })
+    };
+    seam.until("the newest six moving", |workspace, cx| {
+        moving(workspace, cx) == [false, false, true, true, true, true, true, true]
+    });
+
+    // A newer one takes the slot of the oldest that moved.
+    tokio
+        .block_on(
+            seam.backend()
+                .send_attachment(chat, &bob, &[&user], &gif, "moves-8.gif"),
+        )
+        .unwrap();
+    seam.until("the slot passed on", |workspace, cx| {
+        moving(workspace, cx) == [false, false, false, true, true, true, true, true, true]
+    });
 }
 
 fn small_gif() -> Vec<u8> {

@@ -175,6 +175,54 @@ async fn eventually<T>(what: &str, check: impl AsyncFn() -> Option<T>) -> T {
     }
 }
 
+/// `retry` fetches a file left "downloading" by a quit mid-download, as
+/// nothing is fetching it, unless this process's own transfer holds it
+/// (gate 12e).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+async fn seam_a_stale_download_is_fetched_unless_claimed() {
+    let mut backend = TestBackend::single().await;
+    let [alice, bob] = backend.add_users::<2>().await;
+    let chat = backend.connect_users(&alice, &bob).await;
+    // Large, so that the download is still running when it's stopped.
+    backend
+        .send_attachment(chat, &bob, &[&alice], &vec![7; 8 << 20], "big.bin")
+        .await
+        .unwrap();
+    let message = alice.last_message(chat).await.unwrap().unwrap().id();
+    let id = alice.attachment_infos_for_message(message).await[0].attachment_id;
+    let status = async || alice.attachment_status(id).await.unwrap();
+    assert!(matches!(status().await, Some(AttachmentStatus::Pending)));
+    {
+        // Stopped right after the core marked it, like a quit.
+        let (_progress, download) = alice.download_attachment(id);
+        let marked = async {
+            while !matches!(status().await, Some(AttachmentStatus::Downloading)) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            () = marked => {}
+            result = download => panic!("the download ended first: {result:?}"),
+        }
+    }
+
+    let held = attachments::hold(id).unwrap();
+    let err = refusal(attachments::retry(alice.clone(), chat, message).await);
+    assert_eq!(err, "Already downloading");
+    assert!(matches!(
+        status().await,
+        Some(AttachmentStatus::Downloading)
+    ));
+    drop(held);
+
+    attachments::retry(alice.clone(), chat, message)
+        .await
+        .unwrap();
+    assert!(matches!(status().await, Some(AttachmentStatus::Ready)));
+}
+
 /// A failed upload is sent again only once at a time and only when it
 /// failed; sent again, it uploads (gates 12d and 21).
 #[tokio::test(flavor = "multi_thread")]

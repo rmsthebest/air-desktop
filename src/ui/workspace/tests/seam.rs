@@ -11,6 +11,7 @@ use airserver_test_harness::utils::setup::TestBackend;
 
 use super::*;
 use crate::runtime::Tokio;
+use crate::session::SessionEvent;
 
 /// The recipients a test's peer names when sending: none, so the session's
 /// own listener receives it (the harness draining the same queue would race
@@ -473,6 +474,291 @@ fn seam_leaving_a_link_returns_to_the_page_under_it(cx: &mut TestAppContext) {
     });
     seam.cx
         .update(|window, _| assert!(info.is_focused(window), "the page has the keys"));
+}
+
+/// Changes made while the app is busy reach the views as one event, however
+/// many there were (gates 4-7).
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_a_burst_of_changes_arrives_batched(cx: &mut TestAppContext) {
+    const BURST: usize = 5;
+    let mut seam = start(cx);
+    let (_peer, chat, _) = seam.contact();
+    seam.settle();
+    let session = seam.workspace.read_with(seam.cx, |workspace, _| {
+        workspace.session().cloned().unwrap()
+    });
+    let batches = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let _subscription = seam.cx.update({
+        let batches = batches.clone();
+        |_, cx| {
+            cx.subscribe(&session, move |_, event: &SessionEvent, _| {
+                let SessionEvent::Changed { notifications, .. } = event;
+                batches.borrow_mut().push(notifications.len());
+            })
+        }
+    });
+    // The app's tasks don't run during this.
+    let user = seam.user.clone();
+    seam.tokio().block_on(async move {
+        for n in 0..BURST {
+            let draft = aircoreclient::MessageDraft {
+                message: format!("draft {n}"),
+                in_reply_to: None,
+                editing_id: None,
+                updated_at: chrono::Utc::now(),
+                is_committed: false,
+            };
+            user.store_message_draft(chat, Some(&draft)).await.unwrap();
+        }
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(batches.borrow().is_empty());
+    seam.cx.run_until_parked();
+    let batches = batches.borrow();
+    assert!(
+        batches.first().is_some_and(|first| *first >= BURST),
+        "{batches:?}"
+    );
+}
+
+/// A stored draft fills an empty composer when the chat opens, and never
+/// replaces what the user typed before it loaded (gate 7).
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_a_draft_fills_only_an_empty_composer(cx: &mut TestAppContext) {
+    let mut seam = start(cx);
+    let (_bob, bob_chat, bob) = seam.contact();
+    let (_carol, carol_chat, carol) = seam.contact();
+    let user = seam.user.clone();
+    seam.tokio().block_on(async move {
+        for chat in [bob_chat, carol_chat] {
+            let draft = aircoreclient::MessageDraft {
+                message: "stored".into(),
+                in_reply_to: None,
+                editing_id: None,
+                updated_at: chrono::Utc::now(),
+                is_committed: true,
+            };
+            user.store_message_draft(chat, Some(&draft)).await.unwrap();
+        }
+    });
+    let text = |seam: &mut Seam<'_>| {
+        seam.workspace.read_with(seam.cx, |workspace, cx| {
+            workspace.conversation.read(cx).composer_text(cx)
+        })
+    };
+    seam.open(&bob);
+    seam.until("the draft", |workspace, cx| {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.conversation.read(cx).composer_text(cx) == "stored"
+        })
+    });
+
+    let carol = seam.listed(&carol);
+    // Separate updates: the switch happens as the first one ends, and the app's
+    // tasks, which would deliver the draft, run only once the test lets them.
+    seam.workspace.update(seam.cx, |workspace, cx| {
+        workspace
+            .chat_list
+            .update(cx, |list, cx| list.open(carol, cx))
+    });
+    seam.workspace.update_in(seam.cx, |workspace, window, cx| {
+        workspace.conversation.update(cx, |conversation, cx| {
+            conversation.set_composer_text("typed", window, cx)
+        });
+    });
+    seam.settle();
+    assert_eq!(text(&mut seam), "typed");
+}
+
+/// A new safety code request replaces one still being looked up: one dialog,
+/// not one for each (gate 16).
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_a_new_safety_code_request_replaces_a_pending_one(cx: &mut TestAppContext) {
+    let mut seam = start(cx);
+    let (_bob, _, bob) = seam.contact();
+    seam.open(&bob);
+    seam.workspace.update_in(seam.cx, |workspace, window, cx| {
+        workspace.safety_code("", window, cx);
+        assert!(workspace.safety_code.is_some(), "the first is under way");
+        workspace.safety_code("", window, cx);
+    });
+    seam.until("the code", |_, cx| {
+        cx.update(|window, cx| window.has_active_dialog(cx))
+    });
+    seam.settle();
+    seam.workspace.read_with(seam.cx, |workspace, _| {
+        assert_eq!(workspace.safety_codes_shown, [bob.as_str()]);
+    });
+}
+
+/// While the self chat is unknown, a chat change looks it up. One arriving
+/// during a lookup asks for one more after it, and doesn't replace it: busy
+/// chats could otherwise starve the lookup (gate 15e).
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_a_change_during_a_self_chat_lookup_looks_again(cx: &mut TestAppContext) {
+    use aircoreclient::db::notification::{DbEntityId, DbNotification};
+    let mut seam = start(cx);
+    let (session, devices) = seam.workspace.read_with(seam.cx, |workspace, _| {
+        (
+            workspace.session().cloned().unwrap(),
+            workspace.devices.clone().unwrap(),
+        )
+    });
+    seam.until("the devices", {
+        let devices = devices.clone();
+        move |_, cx| devices.read_with(cx, |devices, _| devices.knows_self_chat())
+    });
+    let chat_changed = |seam: &mut Seam<'_>| {
+        session.update(seam.cx, |_, cx| {
+            let id = aircoreclient::ChatId::new(uuid::Uuid::from_u128(1));
+            cx.emit(SessionEvent::Changed {
+                notifications: vec![std::sync::Arc::new(DbNotification {
+                    ops: [(DbEntityId::Chat(id), Default::default())].into(),
+                })],
+                overflowed: false,
+            })
+        });
+    };
+
+    // With none running, a change starts one, and finding the chat reloads.
+    devices.update(seam.cx, |devices, _| devices.forget_self_chat());
+    chat_changed(&mut seam);
+    seam.until("the self chat again", {
+        let devices = devices.clone();
+        move |_, cx| devices.read_with(cx, |devices, _| devices.knows_self_chat())
+    });
+    devices.read_with(seam.cx, |devices, _| assert!(!devices.looks_again()));
+
+    devices.update(seam.cx, |devices, _| {
+        devices.forget_self_chat();
+        devices.hold_lookup();
+    });
+    chat_changed(&mut seam);
+    seam.cx.run_until_parked();
+    devices.read_with(seam.cx, |devices, _| {
+        assert!(devices.looks_again());
+        assert!(!devices.knows_self_chat(), "the running one isn't replaced");
+    });
+}
+
+/// The window pages both ways: one page per request however often it's asked
+/// for, in order, without gaps, up to the newest (gates 4-7).
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
+    use crate::session::messages::PAGE;
+    const TOTAL: usize = 3 * PAGE;
+    // Sent before the session starts: its outbound service, running beside
+    // these sends, would stamp some of them later, and so reorder them.
+    let mut seeded = None;
+    let mut seam = start_after(cx, async |backend, user| {
+        let bob = backend.add_user().await;
+        let chat = backend.connect_users(user, &bob).await;
+        let name = user.user_profile(bob.user_id()).await.display_name;
+        let mut oldest = None;
+        for n in 0..TOTAL {
+            let content =
+                mimi_content::MimiContent::simple_markdown_message(format!("m{n}"), [n as u8; 16]);
+            let sent = Box::pin(user.send_message(
+                chat,
+                content,
+                None,
+                aircoreclient::clients::MarkChatAsRead::Yes,
+            ))
+            .await
+            .unwrap();
+            oldest.get_or_insert(sent.id());
+        }
+        seeded = Some((name.to_string(), oldest.unwrap()));
+    });
+    let (bob, oldest) = seeded.unwrap();
+    seam.until("the chat", {
+        let bob = bob.clone();
+        move |workspace, cx| titles(workspace, cx).contains(&bob)
+    });
+    seam.open(&bob);
+    // The numbers of the messages shown, checked to be in order without gaps.
+    let shown = |seam: &mut Seam<'_>| -> std::ops::RangeInclusive<usize> {
+        seam.workspace.read_with(seam.cx, |workspace, cx| {
+            let conversation = workspace.conversation.read(cx);
+            let numbers: Vec<usize> = conversation
+                .messages_entity()
+                .map(|messages| messages.read(cx).messages().to_vec())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|message| message.plain_text().strip_prefix('m')?.parse().ok())
+                .collect();
+            let (Some(first), Some(last)) = (numbers.first(), numbers.last()) else {
+                return 1..=0;
+            };
+            let expected: Vec<usize> = (*first..=*last).collect();
+            assert_eq!(numbers, expected, "out of order or with a gap");
+            *first..=*last
+        })
+    };
+    let messages = |seam: &mut Seam<'_>| {
+        seam.workspace.read_with(seam.cx, |workspace, cx| {
+            workspace
+                .conversation
+                .read(cx)
+                .messages_entity()
+                .cloned()
+                .unwrap()
+        })
+    };
+    let wait = |seam: &mut Seam<'_>, what: &str, done: &dyn Fn(usize, usize) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            seam.cx.run_until_parked();
+            let range = shown(seam);
+            if !range.is_empty() && done(*range.start(), *range.end()) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out: {what}, at {range:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait(&mut seam, "the newest page", &|_, last| last == TOTAL - 1);
+    let first = *shown(&mut seam).start();
+    assert!(first > 0, "the oldest are left out");
+
+    // Asked for twice, as scrolling does: one page.
+    let list = messages(&mut seam);
+    list.update(seam.cx, |list, _| {
+        list.load_older();
+        list.load_older();
+    });
+    wait(&mut seam, "the older page", &|now, _| now < first);
+    seam.settle();
+    assert_eq!(*shown(&mut seam).start(), first - PAGE, "a page, once");
+
+    // Away from the newest, then back up a page at a time.
+    let oldest = crate::model::MessageId(oldest.uuid().to_string().into());
+    seam.workspace.update(seam.cx, |workspace, cx| {
+        let list = workspace.conversation.read(cx).messages_entity().cloned();
+        list.unwrap()
+            .update(cx, |list, cx| list.jump_to_message(&oldest, cx));
+    });
+    wait(&mut seam, "the oldest", &|now, _| now == 0);
+    let last = *shown(&mut seam).end();
+    assert!(last < TOTAL - 1, "the newest are left out");
+    let list = messages(&mut seam);
+    list.update(seam.cx, |list, _| {
+        list.load_newer();
+        list.load_newer();
+    });
+    wait(&mut seam, "the newer page", &|_, now| now > last);
+    seam.settle();
+    assert_eq!(*shown(&mut seam).end(), last + PAGE, "a page, once");
+    while *shown(&mut seam).end() < TOTAL - 1 {
+        let before = *shown(&mut seam).end();
+        list.update(seam.cx, |list, _| list.load_newer());
+        wait(&mut seam, "another page", &|_, now| now > before);
+    }
 }
 
 /// `:debug-info` shows this account's id, from the core.

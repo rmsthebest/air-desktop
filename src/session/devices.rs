@@ -307,6 +307,31 @@ impl Devices {
         &self.devices
     }
 
+    /// Forgets the self chat, as before it exists (seam tests: a harness
+    /// account always has one).
+    #[cfg(all(test, feature = "seam"))]
+    pub fn forget_self_chat(&mut self) {
+        self.self_chat = None;
+    }
+
+    /// Whether the self chat is known (seam tests).
+    #[cfg(all(test, feature = "seam"))]
+    pub fn knows_self_chat(&self) -> bool {
+        self.self_chat.is_some()
+    }
+
+    /// Holds a lookup "running" until the test ends it (seam tests: a real
+    /// one can't be held). Whether one more lookup is due.
+    #[cfg(all(test, feature = "seam"))]
+    pub fn hold_lookup(&mut self) {
+        self.probe = Some(Task::ready(()));
+    }
+
+    #[cfg(all(test, feature = "seam"))]
+    pub fn looks_again(&self) -> bool {
+        self.reprobe
+    }
+
     pub fn max_devices(&self) -> u32 {
         self.max_devices
     }

@@ -36,7 +36,7 @@ use crate::session::preview::{Body, body_of, quote_line};
 use crate::session::{Session, SessionEvent, display_name};
 
 /// Messages loaded per page. As upstream.
-const PAGE: usize = 64;
+pub(crate) const PAGE: usize = 64;
 /// Most messages kept loaded; paging further drops them from the far end.
 const MAX_WINDOW: usize = PAGE * 10;
 /// How long the newest seen message has to stay put before the chat is

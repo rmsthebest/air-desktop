@@ -85,6 +85,10 @@ pub struct Workspace {
     linking: Option<Linking>,
     /// The safety code being looked up; a new request replaces it.
     safety_code: Option<Task<()>>,
+    /// The names of the safety codes shown so far (seam tests: a dialog's
+    /// contents can't be read back).
+    #[cfg(all(test, feature = "seam"))]
+    safety_codes_shown: Vec<gpui::SharedString>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -407,6 +411,8 @@ impl Workspace {
             invitations,
             linking: None,
             safety_code: None,
+            #[cfg(all(test, feature = "seam"))]
+            safety_codes_shown: Vec::new(),
             _subscriptions: subscriptions,
         };
         this.report_attention(window, cx);
@@ -1216,12 +1222,14 @@ impl Workspace {
     }
 
     fn show_safety_code(
-        &self,
+        &mut self,
         name: gpui::SharedString,
         lines: SafetyLines,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(all(test, feature = "seam"))]
+        self.safety_codes_shown.push(name.clone());
         let previous_focus = window.focused(cx);
         let text = lines.text();
         window.open_alert_dialog(cx, move |alert, _, cx| {

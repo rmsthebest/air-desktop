@@ -78,6 +78,8 @@ pub struct ChatSummary {
     pub is_group: bool,
     /// A contact request not accepted yet, or `None` for an established chat.
     pub request: Option<Request>,
+    /// When an open request expires, if the core knows.
+    pub request_expires: Option<DateTime<Utc>>,
     /// The chat with the user's own devices. Marked in the UI, so a peer
     /// can't pass off a chat titled "Notes to self" as it.
     pub is_self_chat: bool,
@@ -371,6 +373,8 @@ pub struct Message {
     pub edited: bool,
     /// The message this one replies to.
     pub reply_to: Option<Quote>,
+    /// The replied-to message, when it is here and in this chat.
+    pub reply_target: Option<MessageId>,
     /// See [`reactions`]: bounded, the user's own always among them.
     pub reactions: Vec<Reaction>,
     /// Kinds of reaction not shown.
@@ -493,6 +497,28 @@ pub struct Attachment {
     /// Only ever a preview the core made (or checked) and we decoded under
     /// size limits; never the received file itself, undecoded.
     pub image: Option<Picture>,
+    /// The image's frames, when it moves and fits the limits. Drawn in
+    /// place of `image`, which stays what it freezes on.
+    pub animation: Option<Animation>,
+}
+
+/// An animated image, decoded under limits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Animation {
+    pub picture: Picture,
+    /// How long one loop takes.
+    pub loop_time: std::time::Duration,
+}
+
+/// Times an animation plays by itself when limited. As upstream.
+const MAX_AUTO_LOOPS: u32 = 3;
+
+impl Animation {
+    /// Whether it still plays, `played` after it started: past its loops
+    /// it freezes, when `limited`.
+    pub fn plays(&self, played: std::time::Duration, limited: bool) -> bool {
+        !limited || played < self.loop_time * MAX_AUTO_LOOPS
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,6 +679,7 @@ impl Message {
             status: MessageStatus::Sent,
             edited: false,
             reply_to: None,
+            reply_target: None,
             reactions: Vec::new(),
             more_reactions: 0,
             deleted: false,
@@ -977,6 +1004,54 @@ pub fn starts_day(messages: &[Message], ix: usize) -> bool {
     }
 }
 
+/// The countdown to a contact request's expiry, `None` once it has passed.
+/// As upstream: rounded up, so it shows the most that could still be left,
+/// and never "24 hours" or "60 minutes" (the next unit takes over).
+pub fn expires_label(expires: DateTime<Utc>, now: DateTime<Utc>) -> Option<String> {
+    let remaining = expires - now;
+    let in_units = |count: i64, unit: &str| {
+        let plural = if count == 1 { "" } else { "s" };
+        format!("Expires in {count} {unit}{plural}")
+    };
+    let round_up = |unit: chrono::Duration| {
+        let (remaining, unit) = (remaining.num_seconds(), unit.num_seconds());
+        (remaining + unit - 1) / unit
+    };
+    if remaining <= chrono::Duration::zero() {
+        None
+    } else if remaining < chrono::Duration::minutes(1) {
+        Some("Expires in less than a minute".into())
+    } else if remaining < chrono::Duration::hours(1) {
+        Some(match round_up(chrono::Duration::minutes(1)) {
+            60.. => in_units(1, "hour"),
+            minutes => in_units(minutes, "minute"),
+        })
+    } else if remaining < chrono::Duration::days(1) {
+        Some(match round_up(chrono::Duration::hours(1)) {
+            24.. => in_units(1, "day"),
+            hours => in_units(hours, "hour"),
+        })
+    } else {
+        Some(in_units(round_up(chrono::Duration::days(1)), "day"))
+    }
+}
+
+/// Most emoji a message can have and still show large. As upstream.
+const MAX_JUMBO_EMOJI: usize = 5;
+
+/// Whether a message is only a few emoji (and spaces), which show large.
+pub fn is_jumbo_emoji(source: &str) -> bool {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    let mut count = 0;
+    for grapheme in source.graphemes(true).filter(|g| !g.trim().is_empty()) {
+        count += 1;
+        if count > MAX_JUMBO_EMOJI || emojis::get(grapheme).is_none() {
+            return false;
+        }
+    }
+    count > 0
+}
+
 /// A date divider's label: "Today", "Yesterday", or the date.
 pub fn format_day(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let at = at.with_timezone(&Local);
@@ -1177,6 +1252,7 @@ pub mod mock {
                 title: title.into(),
                 is_group: group,
                 request: None,
+                request_expires: None,
                 is_self_chat: false,
                 one_to_one: (!group).then_some(OneToOne::CONTACT),
                 preview: Some(Preview {
@@ -1277,6 +1353,7 @@ pub mod mock {
                     size: 248_000,
                     state: AttachmentState::Ready,
                     image: None,
+                    animation: None,
                 }),
                 ..msg(false, "", 2)
             },
@@ -1289,6 +1366,49 @@ mod tests {
     use chrono::{Duration, TimeZone as _};
 
     use super::*;
+
+    #[test]
+    fn a_request_counts_down_rounding_up() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let label = |left: Duration| expires_label(now + left, now);
+        assert_eq!(label(Duration::zero()), None);
+        assert_eq!(label(Duration::seconds(-1)), None);
+        let says = |what: &str| Some(what.to_string());
+        assert_eq!(
+            label(Duration::seconds(59)),
+            says("Expires in less than a minute")
+        );
+        assert_eq!(label(Duration::seconds(60)), says("Expires in 1 minute"));
+        assert_eq!(label(Duration::seconds(61)), says("Expires in 2 minutes"));
+        // Rounding up reads as the next unit, never "60 minutes".
+        assert_eq!(label(Duration::seconds(3599)), says("Expires in 1 hour"));
+        assert_eq!(label(Duration::hours(1)), says("Expires in 1 hour"));
+        assert_eq!(label(Duration::seconds(86399)), says("Expires in 1 day"));
+        assert_eq!(label(Duration::days(30)), says("Expires in 30 days"));
+    }
+
+    #[test]
+    fn only_a_few_emoji_show_large() {
+        for jumbo in ["😀", " 😀 😀 ", "😀😀😀😀😀", "👍🏽", "👨‍👩‍👧‍👦", "🇸🇪"]
+        {
+            assert!(is_jumbo_emoji(jumbo), "{jumbo}");
+        }
+        for plain in ["", "  ", "hi", "😀 hi", "😀😀😀😀😀😀", "*😀*", "1"] {
+            assert!(!is_jumbo_emoji(plain), "{plain}");
+        }
+    }
+
+    #[test]
+    fn a_limited_animation_stops_after_its_loops() {
+        use std::time::Duration as Span;
+        let animation = Animation {
+            picture: Picture(Arc::new(gpui_kit::RenderImage::new(Vec::new()))),
+            loop_time: Span::from_secs(2),
+        };
+        assert!(animation.plays(Span::from_millis(5999), true));
+        assert!(!animation.plays(Span::from_secs(6), true));
+        assert!(animation.plays(Span::from_secs(600), false));
+    }
 
     fn message(sender_id: &str, sender_name: &str) -> Message {
         let sender = (
@@ -1311,6 +1431,7 @@ mod tests {
                 size: 1,
                 state,
                 image: None,
+                animation: None,
             });
             message
         };
@@ -1624,6 +1745,7 @@ mod tests {
             title: "chat".into(),
             is_group: one_to_one.is_none(),
             request,
+            request_expires: None,
             is_self_chat: false,
             one_to_one,
             preview: None,
@@ -1685,6 +1807,7 @@ mod tests {
                 title: "chat".into(),
                 is_group: false,
                 request: None,
+                request_expires: None,
                 is_self_chat: false,
                 one_to_one: None,
                 preview: None,

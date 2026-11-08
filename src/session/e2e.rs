@@ -313,6 +313,7 @@ async fn next_window(updates: &mut mpsc::Receiver<messages::Update>) -> messages
     match update.expect("no message update within 10s") {
         Some(messages::Update::Window(update)) => update,
         Some(messages::Update::Failed(err)) => panic!("the message worker failed: {err}"),
+        Some(messages::Update::Reveal(_)) => panic!("a jump nobody asked for"),
         None => panic!("the message worker stopped"),
     }
 }

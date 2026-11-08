@@ -49,3 +49,18 @@ pinned rev). Safety and privacy features come first.
 20. **Account seam tests** (done). The real core against Air's in-process test
     server, in session, workspace and app-root tests, covering the
     deferred teardown, routing and late-result tests from the review log.
+
+Milestones 21 and on close the remaining gaps with upstream's app at the
+pinned rev. Upstream's share target and developer account switching stay
+out; desktop notifications stay Linux-only, as is the package.
+
+21. **Messaging gaps** (done). Jump to a replied-to message, animated images,
+    large emoji-only messages, and a contact request's expiry countdown.
+22. **App and support screens**. About and licenses, help, logs, debug info,
+    the update-required screen and reminder, and a username suggestion.
+23. **Release readiness**. A PKGBUILD from tagged releases for the AUR, a
+    `.desktop` file and icon, a data-directory lock, and the tests still
+    open in the review log.
+24. **Translations and interface scale**. Move the UI's strings to a
+    translation system, reuse upstream's where the meaning is the same, fall
+    back to English otherwise; an interface scale setting.

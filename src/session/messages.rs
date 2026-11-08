@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::markdown;
 use crate::model::{
-    ChatId, Message, MessageBody, MessageId, MessageStatus, Picture, Quote, UserId,
+    Animation, ChatId, Message, MessageBody, MessageId, MessageStatus, Picture, Quote, UserId,
 };
 use crate::runtime::{Tokio, TokioTask};
 use crate::session::attachments;
@@ -58,6 +58,10 @@ pub enum MessagesEvent {
     },
     /// The user asked for the newest messages: show them.
     ScrolledToBottom,
+    /// The message the user asked to jump to is loaded, at this index.
+    Revealed(usize),
+    /// The message the user asked to jump to can't be shown.
+    RevealFailed,
 }
 
 pub struct Messages {
@@ -153,6 +157,7 @@ impl Messages {
             window: Window::default(),
             names: HashMap::new(),
             pictures: HashMap::new(),
+            animations: HashMap::new(),
             tx: updates_tx,
         };
         let live = Live {
@@ -169,10 +174,8 @@ impl Messages {
         };
         // Drawn images live on the GPU until dropped.
         cx.on_release(|this: &mut Self, cx| {
-            for message in &this.messages {
-                if let Some(picture) = picture_of(message) {
-                    cx.drop_image(picture.0.clone(), None);
-                }
+            for picture in this.messages.iter().flat_map(pictures_of) {
+                cx.drop_image(picture.0.clone(), None);
             }
         })
         .detach();
@@ -235,6 +238,17 @@ impl Messages {
             self.command(Command::JumpToBottom);
         } else {
             cx.emit(MessagesEvent::ScrolledToBottom);
+        }
+    }
+
+    /// Shows the message `id`, loading the messages around it if it isn't
+    /// in the window, then emits [`MessagesEvent::Revealed`]. Nothing is
+    /// marked as read but what then shows.
+    pub fn jump_to_message(&mut self, id: &MessageId, cx: &mut Context<Self>) {
+        if let Some(ix) = self.messages.iter().position(|message| &message.id == id) {
+            cx.emit(MessagesEvent::Revealed(ix));
+        } else if !core_message_id(id).is_some_and(|id| self.command(Command::JumpTo(id))) {
+            cx.emit(MessagesEvent::RevealFailed);
         }
     }
 
@@ -409,7 +423,7 @@ impl Messages {
                 let before: HashMap<_, _> = self
                     .messages
                     .iter()
-                    .filter_map(picture_of)
+                    .flat_map(pictures_of)
                     .map(|picture| (picture.0.id, picture.clone()))
                     .collect();
                 for change in window.changes {
@@ -419,7 +433,7 @@ impl Messages {
                 let after: std::collections::HashSet<_> = self
                     .messages
                     .iter()
-                    .filter_map(picture_of)
+                    .flat_map(pictures_of)
                     .map(|picture| picture.0.id)
                     .collect();
                 for (id, picture) in before {
@@ -442,6 +456,13 @@ impl Messages {
                 }
             }
             Update::Failed(message) => self.error = Some(message.into()),
+            Update::Reveal(id) => {
+                // Looked up now: changes ahead of it may have moved it.
+                let ix =
+                    id.and_then(|id| self.messages.iter().position(|message| message.id == id));
+                cx.emit(ix.map_or(MessagesEvent::RevealFailed, MessagesEvent::Revealed));
+                return;
+            }
         }
         // Whatever was asked for has been answered.
         self.loading_older = false;
@@ -450,11 +471,19 @@ impl Messages {
     }
 }
 
-fn picture_of(message: &Message) -> Option<&Picture> {
-    match &message.body {
-        MessageBody::Attachment(attachment) => attachment.image.as_ref(),
+/// What the message has on the GPU when drawn.
+fn pictures_of(message: &Message) -> impl Iterator<Item = &Picture> {
+    let attachment = match &message.body {
+        MessageBody::Attachment(attachment) => Some(attachment),
         _ => None,
-    }
+    };
+    attachment.into_iter().flat_map(|attachment| {
+        let animation = attachment.animation.as_ref();
+        attachment
+            .image
+            .iter()
+            .chain(animation.map(|animation| &animation.picture))
+    })
 }
 
 /// Applies updates in batches, so a burst costs one redraw.
@@ -531,11 +560,14 @@ enum Command {
     LoadOlder,
     LoadNewer,
     JumpToBottom,
+    JumpTo(CoreMessageId),
 }
 
 pub(super) enum Update {
     Window(WindowUpdate),
     Failed(String),
+    /// Show this message, now in the window; `None`: it can't be.
+    Reveal(Option<MessageId>),
 }
 
 pub(super) struct WindowUpdate {
@@ -700,6 +732,9 @@ struct Worker {
     /// Decoded previews shown in the window, so a reload (a reaction, a
     /// status change) doesn't decode again.
     pictures: HashMap<CoreAttachmentId, Picture>,
+    /// Likewise the animations, and which images were found still or too
+    /// large (`None`), to not decode those again either.
+    animations: HashMap<CoreAttachmentId, Option<Animation>>,
     tx: mpsc::Sender<Update>,
 }
 
@@ -721,6 +756,7 @@ pub(super) fn start(
         window: Window::default(),
         names: HashMap::new(),
         pictures: HashMap::new(),
+        animations: HashMap::new(),
         tx,
     };
     let task = tokio::spawn(async move {
@@ -748,6 +784,7 @@ impl Worker {
                     Some(Command::LoadOlder) => self.load_older().await,
                     Some(Command::LoadNewer) => self.load_newer().await,
                     Some(Command::JumpToBottom) => self.load_bottom(true).await,
+                    Some(Command::JumpTo(id)) => self.jump_to(id).await,
                     None => return,
                 },
                 _ = pending.wake.notified() => self.changed(pending.take()).await,
@@ -771,6 +808,7 @@ impl Worker {
             .filter_map(|key| key.attachment)
             .collect();
         self.pictures.retain(|id, _| shown.contains(id));
+        self.animations.retain(|id, _| shown.contains(id));
         // Pictures that left made room: draw those refused for want of it.
         changes.extend(self.fill_pictures().await);
         let update = Update::Window(WindowUpdate {
@@ -833,6 +871,47 @@ impl Worker {
             }
             Err(err) => self.fail("load messages", err).await,
         }
+    }
+
+    /// Makes sure the window holds `id`, a message of this chat, and says
+    /// to show it. As upstream's `handle_jump_to_message`.
+    async fn jump_to(&mut self, id: CoreMessageId) -> Result<(), Closed> {
+        let shown = model_message_id(id);
+        if self.window.position(&id).is_some() {
+            return self.reveal(Some(shown)).await;
+        }
+        let target = match self.user.message(id).await {
+            // The core finds a message by its id alone.
+            Ok(Some(message)) if message.chat_id() == self.chat => message,
+            Ok(_) => {
+                warn!("the message to jump to isn't in this chat");
+                return self.reveal(None).await;
+            }
+            Err(err) => {
+                error!("failed to load the message to jump to: {err:#}");
+                return self.reveal(None).await;
+            }
+        };
+        let around = self
+            .user
+            .messages_around(self.chat, target.timestamp().into(), id, PAGE)
+            .await;
+        match around {
+            Ok((messages, has_older, has_newer)) => {
+                let items = self.convert_all(messages).await;
+                let changes = self.window.replace(items, has_older, has_newer);
+                self.send(changes, None, false).await?;
+                self.reveal(Some(shown)).await
+            }
+            Err(err) => {
+                error!("failed to load the messages around a jump: {err:#}");
+                self.reveal(None).await
+            }
+        }
+    }
+
+    async fn reveal(&self, id: Option<MessageId>) -> Result<(), Closed> {
+        self.tx.send(Update::Reveal(id)).await.map_err(|_| Closed)
     }
 
     async fn load_older(&mut self) -> Result<(), Closed> {
@@ -924,6 +1003,7 @@ impl Worker {
                 }
                 DbEntityId::Attachment(id) => {
                     self.pictures.remove(id);
+                    self.animations.remove(id);
                     attachments_changed.push(*id);
                 }
                 _ => {}
@@ -1082,6 +1162,20 @@ impl Worker {
         items
     }
 
+    /// The attachment's animation, decoded once, while there is room.
+    async fn animation(&mut self, id: CoreAttachmentId) -> Option<Animation> {
+        if let Some(known) = self.animations.get(&id) {
+            return known.clone();
+        }
+        let decoded = self.animations.values().flatten().count();
+        if decoded >= attachments::MAX_ANIMATIONS {
+            return None;
+        }
+        let animation = attachments::animation(&self.user, id).await;
+        self.animations.insert(id, animation.clone());
+        animation
+    }
+
     async fn name(&mut self, user: &CoreUserId) -> SharedString {
         if let Some(name) = self.names.get(user) {
             return name.clone();
@@ -1138,8 +1232,11 @@ impl Worker {
                             )
                             .await
                             {
-                                Some((id, shown)) => {
+                                Some((id, mut shown)) => {
                                     attachment = Some(id);
+                                    if shown.image.is_some() {
+                                        shown.animation = self.animation(id).await;
+                                    }
                                     match &shown.image {
                                         Some(picture) => {
                                             self.pictures.insert(id, picture.clone());
@@ -1203,6 +1300,7 @@ impl Worker {
             ),
             _ => (None, None, None),
         };
+        let reply_target = quotes.filter(|_| in_chat).map(model_message_id);
         // A deleted or hidden message's reactions aren't shown either.
         let (reactions, more_reactions) =
             if matches!(body, MessageBody::Text { .. } | MessageBody::Attachment(_)) {
@@ -1243,6 +1341,7 @@ impl Worker {
             status,
             edited,
             reply_to,
+            reply_target,
             reactions,
             more_reactions,
             deleted,

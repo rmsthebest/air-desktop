@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::error;
 
-use crate::model::{self, ChatId, ChatSummary, Mute, OneToOne, Side, Stage, name_line};
+use crate::model::{self, ChatId, ChatSummary, Mute, OneToOne, Request, Side, Stage, name_line};
 use crate::runtime::{Tokio, TokioTask};
 use crate::session::avatars::{self, Avatars};
 use crate::session::pending::Pending;
@@ -353,6 +353,23 @@ fn mute(muted: &ChatMuted) -> Mute {
     }
 }
 
+/// When `chat`'s open request expires; nothing for one that ended.
+pub(super) async fn request_expires(
+    user: &CoreUser,
+    chat: &Chat,
+    request: Option<Request>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match request? {
+        Request::Incoming | Request::Outgoing => user
+            .contact_request_expires_at(chat)
+            .await
+            .inspect_err(|err| error!("failed to load a request's expiry: {err:#}"))
+            .ok()
+            .flatten(),
+        Request::Closed => None,
+    }
+}
+
 /// Loads what the list shows for a chat. Port of `load_chat_details`, minus
 /// what the list doesn't show yet.
 async fn load_chat(
@@ -409,12 +426,15 @@ async fn load_chat(
         }
         None => None,
     };
+    let request = one_to_one.and_then(OneToOne::request);
+    let request_expires = request_expires(user, &chat, request).await;
     let summary = ChatSummary {
         id: model_id(&chat.id),
         // Peer-controlled: titles and names arrive unvalidated.
         title: name_line(&title),
         is_group,
-        request: one_to_one.and_then(OneToOne::request),
+        request,
+        request_expires,
         is_self_chat,
         one_to_one,
         preview: preview::preview(
@@ -703,6 +723,7 @@ mod tests {
             title: title.to_string().into(),
             is_group: false,
             request: None,
+            request_expires: None,
             is_self_chat: false,
             one_to_one: None,
             preview: None,

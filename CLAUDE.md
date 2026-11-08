@@ -50,6 +50,11 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     unchecked text, so each is cut to one visible grapheme, look-alikes
     merge (each reactor counted once per label), at most 12 kinds show,
     the user's own always; alerts use the same label.
+    `o` on a reply jumps to its original (`Messages::jump_to_message`:
+    only a message of this chat; the window is replaced around it when it
+    isn't loaded; only what then shows counts as read), a click on the
+    quote too. Messages of only 1–5 emoji show large
+    (`model::is_jumbo_emoji`).
     `set_reaction` adds or retracts as the view decided (detached, like
     sends; the core ignores a repeated add). The picker
     (`+`, then 1–6) is a bar under the list, not part of a list item, so
@@ -70,6 +75,8 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     internal errors are logged and reported generically. A new account's
     privacy-pass tokens arrive in the background, so the first username
     or contact request can fail and succeed on retry.
+    `model::expires_label` shows an open request's countdown from the
+    core's `contact_request_expires_at`, redrawn every 20 s.
   - `pending.rs`: the merged change set both workers wake on.
   - `groups.rs`: create / invite / remove / rename / leave / delete, run
     detached like contact operations, and the `Members` entity (an open
@@ -118,7 +125,13 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     gone original removes the message). `v` views an image: the
     downloaded original decoded once more, under larger limits (4096²
     edge, 80 MiB, 32 MiB file; kept ≤ 2048²), in a dialog whose closing
-    drops the texture. Sending: `:attach <path>`, the file
+    drops the texture. An image the core says moves also decodes its
+    original (GIF, WebP, APNG; ≤ 8 MiB) by `decode_animation`: 1024² canvas,
+    240 frames, 32 MiB of frames, 6 per window, delays under 20 ms slowed
+    to 100 ms; past any limit it stays still. gpui plays the frames; the
+    view swaps to the still preview after 3 loops (`limit_animation_loops`
+    setting, on by default), and `p` plays it again.
+    Sending: `:attach <path>`, the file
     dialog (`AttachFile`) or dropping files on the chat (confirmed
     first); several files go one after another.
   - `alerts.rs`: desktop notifications ("alerts"; database notifications

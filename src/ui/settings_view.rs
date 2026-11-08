@@ -36,6 +36,7 @@ pub enum SettingsEvent {
     Theme(String),
     Keymap(KeymapMode),
     Notifications(Notifications),
+    LimitAnimationLoops(bool),
     /// Type a new display name, starting from this one.
     EditDisplayName(SharedString),
     /// Pick a new picture (file dialog).
@@ -74,6 +75,7 @@ pub enum Row {
     DarkTheme(String),
     Keymap(KeymapMode),
     Notifications(Notifications),
+    LimitAnimationLoops(bool),
     DisplayName(SharedString),
     /// The user's picture: whether there is one.
     Picture(bool),
@@ -122,6 +124,7 @@ pub fn rows(settings: &Settings, account: Option<&AccountRows>) -> Vec<Row> {
         Row::DarkTheme(settings.dark_theme.clone()),
         Row::Keymap(settings.keymap_mode),
         Row::Notifications(settings.notifications),
+        Row::LimitAnimationLoops(settings.limit_animation_loops),
     ];
     if let Some(account) = account {
         rows.push(Row::DisplayName(account.display_name.clone()));
@@ -209,6 +212,7 @@ pub fn change(row: &Row, forward: bool, themes: &Themes) -> Option<SettingsEvent
             SettingsEvent::Notifications(step(&[Full, Private, Off], current, forward)?)
         }
         // On or off: either way flips it.
+        Row::LimitAnimationLoops(on) => SettingsEvent::LimitAnimationLoops(!on),
         Row::ReadReceipts(on) => SettingsEvent::ReadReceipts(!(*on)?),
         Row::DeleteExpiredRequests(on) => SettingsEvent::DeleteExpiredRequests(!(*on)?),
         // Text and lists aren't stepped: only the forward key (enter,
@@ -433,6 +437,16 @@ impl SettingsView {
                     Notifications::Full => "Who wrote and what",
                     Notifications::Private => "Private (no names or text)",
                     Notifications::Off => "Off",
+                }
+                .into(),
+                "← →",
+            ),
+            Row::LimitAnimationLoops(on) => (
+                "Animated images",
+                if *on {
+                    "Stop after a few loops"
+                } else {
+                    "Keep looping"
                 }
                 .into(),
                 "← →",

@@ -99,6 +99,8 @@
       "delete": "air::DeleteMessage",
       "shift-d": "air::DeleteMessageForEveryone",
       "i": "air::ShowMessageDetails",
+      "o": "air::JumpToReplied",
+      "p": "air::ReplayAnimation",
       "shift-r": "air::RetryUpload",
       "v": "air::ViewImage"
     }

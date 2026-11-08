@@ -800,6 +800,9 @@ impl Workspace {
             SettingsEvent::Notifications(level) => {
                 update_settings(window, cx, |settings| settings.notifications = level)
             }
+            SettingsEvent::LimitAnimationLoops(on) => {
+                update_settings(window, cx, |settings| settings.limit_animation_loops = on)
+            }
             SettingsEvent::EditDisplayName(name) => {
                 self.prompt(&format!("name {name}"), window, cx)
             }
@@ -3605,7 +3608,9 @@ mod tests {
         assert_eq!(notifications(cx), Notifications::Off);
         // Without an account the list ends with the app's settings.
         cx.simulate_keystrokes("end");
-        assert!(matches!(row(cx), Some(Row::Notifications(_))));
+        assert!(matches!(row(cx), Some(Row::LimitAnimationLoops(true))));
+        cx.simulate_keystrokes("right");
+        assert!(cx.update(|_, cx| !SettingsStore::get(cx).limit_animation_loops));
 
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
@@ -3893,6 +3898,7 @@ mod tests {
             title: "Ada".into(),
             is_group: false,
             request: None,
+            request_expires: None,
             is_self_chat: false,
             one_to_one,
             preview: None,
@@ -3928,6 +3934,7 @@ mod tests {
             title: "chat".into(),
             is_group,
             request: None,
+            request_expires: None,
             is_self_chat,
             one_to_one: None,
             preview: None,

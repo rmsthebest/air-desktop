@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::Duration;
 
 use aircoreclient::clients::CoreUser;
 use aircoreclient::db::notification::{DbEntityId, DbNotification, DbOperation};
@@ -21,11 +22,16 @@ use aircoreclient::{
 };
 use futures_util::StreamExt as _;
 use gpui::SharedString;
+use image::AnimationDecoder as _;
+use image::ImageDecoder as _;
+use image::codecs::gif::GifDecoder;
+use image::codecs::png::PngDecoder;
+use image::codecs::webp::WebPDecoder;
 use mimi_content::MimiContent;
 use mimi_content::content_container::{Disposition, NestedPart};
 use tracing::{debug, error, info, warn};
 
-use crate::model::{self, Attachment, AttachmentState, Picture};
+use crate::model::{self, Animation, Attachment, AttachmentState, Picture};
 use crate::session::Session;
 use crate::session::contacts::{Failure, on_tokio};
 use crate::session::messages::core_chat_id;
@@ -189,6 +195,7 @@ pub(super) async fn load(
         size: declared.size,
         state,
         image,
+        animation: None,
     };
     Some((id, attachment))
 }
@@ -285,6 +292,127 @@ fn decode_within(bytes: &[u8], edge: u32, alloc: u64, kept: (u32, u32)) -> Optio
     }
     let frame = image::Frame::new(pixels);
     Some(Picture(Arc::new(gpui::RenderImage::new(vec![frame]))))
+}
+
+/// Frames of an animation at most.
+const MAX_ANIMATION_FRAMES: usize = 240;
+
+/// Memory an animation's frames may take, as BGRA: past it, the image stays
+/// still. A preview-box GIF of about 80 frames.
+const MAX_ANIMATION_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Animations decoded per window at most (bounds them to 192 MiB, with
+/// their copies on the GPU); past that, images stay still.
+pub(super) const MAX_ANIMATIONS: usize = 6;
+
+/// The shortest frame delay played. Shorter ones, 0 above all, are played
+/// slower, as browsers do: a peer's file must not make every frame a redraw.
+const MIN_FRAME_DELAY: Duration = Duration::from_millis(20);
+const SLOWED_FRAME_DELAY: Duration = Duration::from_millis(100);
+
+/// The frames of a stored image the core found animated, for one already
+/// drawn as a preview (so never the original of a failed thumbnail). `None`
+/// when it is still, too large, or any of it can't be read.
+pub(super) async fn animation(user: &CoreUser, id: AttachmentId) -> Option<Animation> {
+    if !matches!(user.attachment_is_animated(id).await, Ok(Some(true))) {
+        return None;
+    }
+    let bytes = match user.load_attachment(id).await {
+        Ok(
+            AttachmentContent::Ready(bytes)
+            | AttachmentContent::Uploading(bytes)
+            | AttachmentContent::UploadFailed(bytes),
+        ) if bytes.len() <= MAX_PREVIEW_BYTES => bytes,
+        Ok(_) => return None,
+        Err(err) => {
+            error!("failed to load an attachment: {err:#}");
+            return None;
+        }
+    };
+    match tokio::task::spawn_blocking(move || decode_animation(&bytes)).await {
+        Ok(animation) => animation,
+        Err(err) => {
+            error!("animation decode panicked: {err}");
+            None
+        }
+    }
+}
+
+/// Decodes an animated GIF, WebP or PNG under limits, by our own decoder.
+fn decode_animation(bytes: &[u8]) -> Option<Animation> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_PREVIEW_EDGE);
+    limits.max_image_height = Some(MAX_PREVIEW_EDGE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    let reader = Cursor::new(bytes);
+    let frames = match image::guess_format(bytes).ok()? {
+        image::ImageFormat::Gif => {
+            let mut decoder = GifDecoder::new(reader).ok()?;
+            decoder.set_limits(limits).ok()?;
+            decoder.into_frames()
+        }
+        image::ImageFormat::WebP => {
+            let mut decoder = WebPDecoder::new(reader).ok()?;
+            decoder.set_limits(limits).ok()?;
+            if !decoder.has_animation() {
+                return None;
+            }
+            decoder.into_frames()
+        }
+        image::ImageFormat::Png => {
+            let decoder = PngDecoder::with_limits(reader, limits).ok()?;
+            if !decoder.is_apng().ok()? {
+                return None;
+            }
+            decoder.apng().ok()?.into_frames()
+        }
+        _ => return None,
+    };
+    collect_frames(frames)
+}
+
+/// The frames as gpui draws them, kept no larger than a preview. Stops as
+/// soon as a limit is passed.
+fn collect_frames(frames: image::Frames<'_>) -> Option<Animation> {
+    let mut kept = Vec::new();
+    let mut bytes = 0;
+    let mut loop_time = Duration::ZERO;
+    for frame in frames {
+        if kept.len() == MAX_ANIMATION_FRAMES {
+            return None;
+        }
+        let frame = frame.ok()?;
+        let delay = match Duration::from(frame.delay()) {
+            delay if delay < MIN_FRAME_DELAY => SLOWED_FRAME_DELAY,
+            delay => delay,
+        };
+        let image = image::DynamicImage::ImageRgba8(frame.into_buffer());
+        let (width, height) = MAX_KEPT;
+        let image = if image.width() > width || image.height() > height {
+            image.thumbnail(width, height)
+        } else {
+            image
+        };
+        let mut pixels = image.into_rgba8();
+        bytes += u64::from(pixels.width()) * u64::from(pixels.height()) * 4;
+        if bytes > MAX_ANIMATION_BYTES {
+            return None;
+        }
+        for pixel in pixels.pixels_mut() {
+            pixel.0.swap(0, 2);
+        }
+        loop_time += delay;
+        kept.push(image::Frame::from_parts(
+            pixels,
+            0,
+            0,
+            image::Delay::from_saturating_duration(delay),
+        ));
+    }
+    (kept.len() > 1).then(|| Animation {
+        picture: Picture(Arc::new(gpui::RenderImage::new(kept))),
+        loop_time,
+    })
 }
 
 /// Longest edge of an image the viewer decodes: Air's clients send images
@@ -695,6 +823,64 @@ mod tests {
             .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::WebP)
             .unwrap();
         bytes
+    }
+
+    /// A GIF of `frames` frames, each `delay_ms` long.
+    fn gif(width: u32, height: u32, frames: usize, delay_ms: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+        let frames = (0..frames).map(|n| {
+            let pixel = image::Rgba([(n % 256) as u8, 20, 30, 255]);
+            image::Frame::from_parts(
+                image::RgbaImage::from_pixel(width, height, pixel),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(delay_ms, 1),
+            )
+        });
+        encoder.encode_frames(frames).unwrap();
+        drop(encoder);
+        bytes
+    }
+
+    #[test]
+    fn animations_decode_with_their_loop_time() {
+        let animation = decode_animation(&gif(4, 4, 3, 50)).unwrap();
+        assert_eq!(animation.picture.0.frame_count(), 3);
+        assert_eq!(animation.loop_time, Duration::from_millis(150));
+    }
+
+    #[test]
+    fn a_peers_animation_is_bounded() {
+        // The canvas, the frame count, and the total all have a limit:
+        // past any, the image stays still.
+        assert!(decode_animation(&gif(MAX_PREVIEW_EDGE + 1, 4, 2, 50)).is_none());
+        assert!(decode_animation(&gif(1, 1, MAX_ANIMATION_FRAMES, 50)).is_some());
+        assert!(decode_animation(&gif(1, 1, MAX_ANIMATION_FRAMES + 1, 50)).is_none());
+        let (width, height) = MAX_KEPT;
+        let frame = u64::from(width * height * 4);
+        let too_many = (MAX_ANIMATION_BYTES / frame + 1) as usize;
+        assert!(too_many < MAX_ANIMATION_FRAMES);
+        assert!(decode_animation(&gif(width, height, too_many, 50)).is_none());
+        // Kept no larger than a preview.
+        let large = decode_animation(&gif(1000, 1000, 2, 50)).unwrap();
+        assert!(large.picture.size().0 <= width && large.picture.size().1 <= height);
+    }
+
+    #[test]
+    fn a_zero_delay_never_redraws_every_frame() {
+        let animation = decode_animation(&gif(1, 1, 2, 0)).unwrap();
+        assert_eq!(animation.loop_time, SLOWED_FRAME_DELAY * 2);
+    }
+
+    #[test]
+    fn still_or_broken_images_are_no_animation() {
+        assert!(decode_animation(&gif(4, 4, 1, 50)).is_none());
+        assert!(decode_animation(&webp(4, 4)).is_none());
+        let mut truncated = gif(4, 4, 5, 50);
+        truncated.truncate(truncated.len() / 2);
+        assert!(decode_animation(&truncated).is_none());
+        assert!(decode_animation(b"not an image").is_none());
     }
 
     fn part(disposition: Disposition, url: &str, filename: &str) -> NestedPart {

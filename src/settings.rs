@@ -65,6 +65,8 @@ pub struct Settings {
     pub details_open: bool,
     pub chat_list_width: f32,
     pub notifications: Notifications,
+    /// Animated images stop by themselves after a few loops.
+    pub limit_animation_loops: bool,
 }
 
 impl Default for Settings {
@@ -77,6 +79,7 @@ impl Default for Settings {
             details_open: true,
             chat_list_width: 320.,
             notifications: Notifications::Full,
+            limit_animation_loops: true,
         }
     }
 }

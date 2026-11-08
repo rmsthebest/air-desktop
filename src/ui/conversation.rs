@@ -10,9 +10,10 @@
 //! is in view is measured from the drawn items themselves (see `Probes`).
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Instant;
 
 use gpui::{
     Bounds, ClipboardItem, EventEmitter, ExternalPaths, FollowMode, ImageSource, KeyContext,
@@ -31,18 +32,19 @@ use gpui_kit::{
 use crate::actions::{
     AcceptRequest, BlockContact, CancelCompose, ClearCursor, CursorDown, CursorFirst, CursorLast,
     CursorUp, DeclineRequest, DeleteChat, DeleteMessage, DeleteMessageForEveryone, EditLastMessage,
-    EditMessage, HalfPageDown, HalfPageUp, OpenLinks, PickReaction, React, ReplyToMessage,
-    RetractRequest, RetryUpload, SaveAttachment, SearchReaction, ShowMessageDetails, ToggleDetails,
-    UnblockContact, ViewImage, YankMessage,
+    EditMessage, HalfPageDown, HalfPageUp, JumpToReplied, OpenLinks, PickReaction, React,
+    ReplayAnimation, ReplyToMessage, RetractRequest, RetryUpload, SaveAttachment, SearchReaction,
+    ShowMessageDetails, ToggleDetails, UnblockContact, ViewImage, YankMessage,
 };
 use crate::markdown::Block;
 use crate::model::{
     Attachment, AttachmentState, ChatSummary, DeleteFor, EditHistory, Message, MessageBody,
-    MessageStatus, QUICK_REACTIONS, Quote, Reaction, Request, format_day, format_message_time,
-    move_cursor, starts_day, starts_group,
+    MessageId, MessageStatus, QUICK_REACTIONS, Quote, Reaction, Request, format_day,
+    format_message_time, move_cursor, starts_day, starts_group,
 };
 use crate::session::composer::{Composer, ComposerEvent};
 use crate::session::messages::{Messages, MessagesEvent};
+use crate::settings::SettingsStore;
 use crate::ui::key_context;
 use crate::ui::markdown_view;
 use crate::ui::widgets::avatar;
@@ -51,6 +53,8 @@ use crate::ui::widgets::avatar;
 /// monitors.
 const MAX_CONTENT_WIDTH: f32 = 760.;
 const HALF_PAGE: isize = 10;
+/// How often an open request's countdown is redrawn. As upstream.
+const COUNTDOWN_TICK: std::time::Duration = std::time::Duration::from_secs(20);
 /// Within this many messages of a loaded end, the next page is requested.
 const PAGE_AHEAD: usize = 10;
 
@@ -71,6 +75,9 @@ pub struct Conversation {
     /// Not on screen (the settings screen is in its place): nothing it
     /// last showed counts as seen.
     hidden: bool,
+    /// When each animation in view started playing, to freeze it past its
+    /// loops. Only drawn ones count; forgotten with the chat.
+    animations: RefCell<HashMap<gpui_kit::ImageId, Instant>>,
     /// Message under the normal-mode cursor.
     cursor: Option<usize>,
     /// The reaction picker is open, for the message under the cursor.
@@ -91,6 +98,8 @@ pub struct Conversation {
     viewing: Option<gpui::Task<()>>,
     /// The composer's text as last seen, to tell what an edit typed.
     typed: String,
+    /// Redraws the open request's countdown.
+    request_tick: Option<gpui::Task<()>>,
 }
 
 /// The part of the history in view.
@@ -207,6 +216,7 @@ impl Conversation {
             probes: Rc::default(),
             shown: None,
             hidden: false,
+            animations: RefCell::default(),
             cursor: None,
             reacting: false,
             focus_handle: cx.focus_handle(),
@@ -218,6 +228,7 @@ impl Conversation {
             details: None,
             viewing: None,
             typed: String::new(),
+            request_tick: None,
         }
     }
 
@@ -256,22 +267,31 @@ impl Conversation {
         self.compose = Some(compose);
         self.list.reset(messages.read(cx).messages().len());
         self._messages_subscription =
-            Some(cx.subscribe_in(&messages, window, |this, _, event, _, cx| {
-                match event {
-                    MessagesEvent::Opened => this.scroll_to_start(cx),
-                    MessagesEvent::Spliced { old, count, paged } => {
-                        this.splice(old.clone(), *count, *paged, cx)
+            Some(
+                cx.subscribe_in(&messages, window, |this, _, event, window, cx| {
+                    match event {
+                        MessagesEvent::Revealed(ix) => this.set_cursor(Some(*ix), cx),
+                        MessagesEvent::RevealFailed => {
+                            crate::ui::show_refusal("Couldn't show that message".into(), window, cx)
+                        }
+                        MessagesEvent::Opened => this.scroll_to_start(cx),
+                        MessagesEvent::Spliced { old, count, paged } => {
+                            this.splice(old.clone(), *count, *paged, cx)
+                        }
+                        MessagesEvent::ScrolledToBottom => this.list.scroll_to_end(),
                     }
-                    MessagesEvent::ScrolledToBottom => this.list.scroll_to_end(),
-                }
-                cx.notify();
-            }));
+                    cx.notify();
+                }),
+            );
         let loaded = messages.read(cx).is_loaded();
+        self.keep_countdown_current(&chat, cx);
         self.chat = Some(chat);
         self.messages = Some(messages);
         self.cursor = None;
         self.reacting = false;
         self.shown = None;
+        self.animations.borrow_mut().clear();
+        self.request_tick = None;
         self.probes.borrow_mut().shown = None;
         if loaded {
             self.scroll_to_start(cx);
@@ -319,8 +339,25 @@ impl Conversation {
         if !chat.composes() && self.composer_focus(cx).contains_focused(window, cx) {
             self.focus_handle.focus(window, cx);
         }
+        self.keep_countdown_current(&chat, cx);
         self.chat = Some(chat);
         cx.notify();
+    }
+
+    /// Redraws while an open request's countdown shows, as upstream.
+    fn keep_countdown_current(&mut self, chat: &ChatSummary, cx: &mut Context<Self>) {
+        if chat.request_expires.is_none() {
+            self.request_tick = None;
+        } else if self.request_tick.is_none() {
+            self.request_tick = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(COUNTDOWN_TICK).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
     }
 
     /// Whether the open chat has a composer: nothing is replied to or
@@ -596,6 +633,62 @@ impl Conversation {
             self.list.scroll_to_reveal_item(ix);
         }
         cx.notify();
+    }
+
+    /// Whether the attachment draws its animation now. Its loops count from
+    /// the first time it is drawn.
+    pub(crate) fn plays(&self, attachment: &Attachment, cx: &App) -> bool {
+        let Some(animation) = &attachment.animation else {
+            return false;
+        };
+        let limited = SettingsStore::get(cx).limit_animation_loops;
+        let mut animations = self.animations.borrow_mut();
+        let started = animations
+            .entry(animation.picture.0.id)
+            .or_insert_with(Instant::now);
+        animation.plays(started.elapsed(), limited)
+    }
+
+    /// Plays the animation under the cursor from the start.
+    fn replay_animation(
+        &mut self,
+        _: &ReplayAnimation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let animation = match self.cursor_message(cx).map(|message| &message.body) {
+            Some(MessageBody::Attachment(attachment)) => attachment.animation.as_ref(),
+            Some(_) => None,
+            None => return,
+        };
+        match animation {
+            Some(animation) => {
+                let id = animation.picture.0.id;
+                self.animations.borrow_mut().remove(&id);
+                cx.notify();
+            }
+            None => crate::ui::show_refusal("That isn't an animation".into(), window, cx),
+        }
+    }
+
+    /// Jumps from the reply under the cursor to the message it quotes.
+    fn jump_to_replied(&mut self, _: &JumpToReplied, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(message) = self.cursor_message(cx) else {
+            return;
+        };
+        match (message.reply_target.clone(), message.reply_to.is_some()) {
+            (Some(target), _) => self.jump_to(&target, cx),
+            (None, true) => {
+                crate::ui::show_refusal("The original message isn't here".into(), window, cx)
+            }
+            (None, false) => crate::ui::show_refusal("That isn't a reply".into(), window, cx),
+        }
+    }
+
+    fn jump_to(&mut self, target: &MessageId, cx: &mut Context<Self>) {
+        if let Some(messages) = &self.messages {
+            messages.update(cx, |messages, cx| messages.jump_to_message(target, cx));
+        }
     }
 
     fn cursor_message<'a>(&self, cx: &'a App) -> Option<&'a Message> {
@@ -1034,6 +1127,10 @@ impl Conversation {
         let under_cursor = self.cursor == Some(ix);
 
         let body = match &message.body {
+            MessageBody::Text { source, .. } if crate::model::is_jumbo_emoji(source) => div()
+                .text_3xl()
+                .child(source.trim().to_string())
+                .into_any_element(),
             MessageBody::Text { markdown, .. } => {
                 markdown_view::render(markdown, message.id.0.clone(), cx)
             }
@@ -1042,7 +1139,10 @@ impl Conversation {
                 .opacity(0.8)
                 .child(text.clone())
                 .into_any_element(),
-            MessageBody::Attachment(attachment) => render_attachment(attachment, under_cursor),
+            MessageBody::Attachment(attachment) => {
+                let moving = self.plays(attachment, cx);
+                render_attachment(attachment, moving, under_cursor)
+            }
         };
         let mut footer = format_message_time(message.sent_at);
         if message.edited {
@@ -1086,12 +1186,21 @@ impl Conversation {
                     .border_color(cursor_color(list_focused, cx))
             })
             .shadow_xs()
-            .children(
-                message
-                    .reply_to
-                    .as_ref()
-                    .map(|quote| render_quote(quote, cx)),
-            )
+            .children(message.reply_to.as_ref().map(|quote| {
+                let shown = render_quote(quote, cx);
+                match message.reply_target.clone() {
+                    Some(target) => div()
+                        .id(("quote", ix))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.focus_handle.focus(window, cx);
+                            this.jump_to(&target, cx);
+                        }))
+                        .child(shown)
+                        .into_any_element(),
+                    None => shown,
+                }
+            }))
             .child(body)
             .child(div().text_xs().opacity(0.7).text_right().child(footer));
         let reactions = (!message.reactions.is_empty())
@@ -1323,6 +1432,8 @@ impl Render for Conversation {
                     .track_focus(&self.focus_handle)
                     .on_action(cx.listener(|this, _: &CursorDown, _, cx| this.move_cursor(1, cx)))
                     .on_action(cx.listener(|this, _: &CursorUp, _, cx| this.move_cursor(-1, cx)))
+                    .on_action(cx.listener(Self::jump_to_replied))
+                    .on_action(cx.listener(Self::replay_animation))
                     .on_action(
                         cx.listener(|this, _: &HalfPageDown, _, cx| {
                             this.move_cursor(HALF_PAGE, cx)
@@ -1374,7 +1485,7 @@ impl Render for Conversation {
             .child(match chat.request {
                 // A blocked request's sender too: the block outlives it.
                 _ if chat.blocked() => render_blocked(&chat.title, cx),
-                Some(request) => render_request(request, &chat.title, cx),
+                Some(request) => render_request(request, &chat.title, chat.request_expires, cx),
                 None if chat.ended() => render_ended(&chat.title, cx),
                 None if chat.group_ended => render_group_ended(cx),
                 None => self
@@ -1465,11 +1576,21 @@ fn in_composer_place(card: gpui::Div) -> AnyElement {
 
 /// Takes the composer's place in a chat whose contact request is open:
 /// nothing can be sent before both sides are connected.
-fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElement {
+fn render_request(
+    request: Request,
+    title: &SharedString,
+    expires: Option<chrono::DateTime<chrono::Utc>>,
+    cx: &App,
+) -> AnyElement {
     let muted = cx.theme().muted_foreground;
+    let expiry = expires
+        .and_then(|expires| crate::model::expires_label(expires, chrono::Utc::now()))
+        .map_or(String::new(), |label| format!(" {label}."));
     let card = match request {
         Request::Incoming => card(cx)
-            .child(card_text(format!("{title} wants to connect with you.")))
+            .child(card_text(format!(
+                "{title} wants to connect with you.{expiry}"
+            )))
             .child(card_button(
                 "block-request",
                 "Block",
@@ -1492,7 +1613,7 @@ fn render_request(request: Request, title: &SharedString, cx: &App) -> AnyElemen
         Request::Outgoing => card(cx)
             .child(
                 card_text(format!(
-                    "Waiting for {title} to accept your contact request."
+                    "Waiting for {title} to accept your contact request.{expiry}"
                 ))
                 .text_color(muted),
             )
@@ -1766,7 +1887,7 @@ fn render_blocked(title: &SharedString, cx: &App) -> AnyElement {
 /// A file as a card (name, size, what is happening to it), and an image's
 /// preview above it. The preview's size is known before it is drawn, so
 /// the list measures the message once.
-fn render_attachment(attachment: &Attachment, under_cursor: bool) -> AnyElement {
+fn render_attachment(attachment: &Attachment, moving: bool, under_cursor: bool) -> AnyElement {
     let state = match attachment.state {
         AttachmentState::Uploading => "sending",
         AttachmentState::UploadFailed => "not sent",
@@ -1780,6 +1901,9 @@ fn render_attachment(attachment: &Attachment, under_cursor: bool) -> AnyElement 
         _ if !under_cursor => None,
         AttachmentState::DownloadFailed => Some("s to retry"),
         AttachmentState::Pending => Some("s to download now"),
+        state if state.is_local() && attachment.animation.is_some() => {
+            Some("s to save · p to replay")
+        }
         state if state.is_local() => Some("s to save"),
         _ => None,
     };
@@ -1795,8 +1919,15 @@ fn render_attachment(attachment: &Attachment, under_cursor: bool) -> AnyElement 
     v_flex()
         .gap_1()
         .children(attachment.image.as_ref().map(|picture| {
+            let shown = attachment
+                .animation
+                .as_ref()
+                .filter(|_| moving)
+                .map_or(picture, |animation| &animation.picture);
             let (width, height) = crate::model::fit(picture.size(), crate::model::PREVIEW_BOX);
-            img(ImageSource::Render(picture.0.clone()))
+            // gpui keeps the playing frame by the element's id.
+            img(ImageSource::Render(shown.0.clone()))
+                .id(("picture", shown.0.id.0))
                 .w(px(width as f32))
                 .h(px(height as f32))
                 .rounded_md()
@@ -1860,6 +1991,73 @@ mod tests {
 
     use super::*;
     use crate::model::{MessageId, UserId};
+
+    #[gpui::test]
+    fn a_reply_moves_the_cursor_to_what_it_quotes(cx: &mut gpui::TestAppContext) {
+        let (window, conversation) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::settings::SettingsStore::open(None, cx);
+            crate::theme::init(None, cx).unwrap();
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| Conversation::new(window, cx))
+            })
+            .unwrap()
+        });
+        let cx = gpui::VisualTestContext::from_window(window, cx).into_mut();
+        let id = |n: &str| MessageId(n.to_string().into());
+        let message = |n: &str| {
+            let sender = (UserId("u".into()), "Ada".into(), false);
+            Message::text(id(n), sender, n, Utc::now())
+        };
+        let quote = Some(Quote {
+            sender: "Ada".into(),
+            text: "quoted".into(),
+        });
+        let history = vec![
+            message("original"),
+            message("plain"),
+            Message {
+                reply_to: quote.clone(),
+                reply_target: Some(id("original")),
+                ..message("reply")
+            },
+            Message {
+                reply_to: quote.clone(),
+                reply_target: Some(id("not loaded")),
+                ..message("far reply")
+            },
+            Message {
+                reply_to: quote,
+                ..message("orphan")
+            },
+        ];
+        let messages = cx.new(|_| Messages::fixed(history));
+        let chat = crate::model::mock::chats().remove(0);
+        conversation.update_in(cx, |conversation, window, cx| {
+            conversation.show(chat, messages, cx.new(|_| Composer::fixed()), window, cx)
+        });
+        crate::ui::take_told();
+        let mut jump_from = |ix: usize| {
+            conversation.update_in(cx, |conversation, window, cx| {
+                conversation.set_cursor(Some(ix), cx);
+                conversation.jump_to_replied(&JumpToReplied, window, cx);
+            });
+            cx.run_until_parked();
+            let cursor = conversation.read_with(cx, |conversation, _| conversation.cursor());
+            (cursor, crate::ui::take_told())
+        };
+
+        assert_eq!(jump_from(2), (Some(0), vec![]));
+        // Nothing to go to: the cursor stays, and the user is told why.
+        let told = |what: &str| vec![what.to_string()];
+        assert_eq!(jump_from(1), (Some(1), told("That isn't a reply")));
+        assert_eq!(
+            jump_from(4),
+            (Some(4), told("The original message isn't here"))
+        );
+        // Fixed messages can't load more; a live window would.
+        assert_eq!(jump_from(3), (Some(3), told("Couldn't show that message")));
+    }
 
     #[gpui::test]
     fn a_chat_opens_at_its_unread_divider(cx: &mut gpui::TestAppContext) {

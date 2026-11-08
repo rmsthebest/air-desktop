@@ -72,6 +72,13 @@ async fn seam_contact_from_group_again_after_expiry() {
     assert!(err.contains("already sent"), "{err}");
 
     let request = request_chat(&alice, &bob_id).await.unwrap();
+    // The chat list's countdown: the core's 30 days, while it is open.
+    let open = alice.chat(&request).await.unwrap();
+    let left = super::chats::request_expires(&alice, &open, Some(crate::model::Request::Outgoing))
+        .await
+        .unwrap()
+        - chrono::Utc::now();
+    assert!(left > chrono::Duration::days(29) && left <= chrono::Duration::days(30));
     alice
         .backdate_contact_request(request, chrono::Duration::days(31))
         .await

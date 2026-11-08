@@ -184,6 +184,134 @@ impl Seam<'_> {
     }
 }
 
+/// A peer's GIF arrives as an animation (the core tells it moves, we decode
+/// the original), plays, freezes past its loops, and `p` plays it again.
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_a_gif_plays_then_freezes_until_replayed(cx: &mut TestAppContext) {
+    let mut seam = start(cx);
+    let (bob, chat, bob_name) = seam.contact();
+    let mut gif = Vec::new();
+    let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+    let frames = (0..2u8).map(|n| {
+        image::Frame::from_parts(
+            image::RgbaImage::from_pixel(8, 8, image::Rgba([n * 200, 20, 30, 255])),
+            0,
+            0,
+            image::Delay::from_numer_denom_ms(30, 1),
+        )
+    });
+    encoder.encode_frames(frames).unwrap();
+    drop(encoder);
+    let tokio = seam.tokio();
+    let user = seam.user.clone();
+    tokio
+        .block_on(
+            seam.backend()
+                .send_attachment(chat, &bob, &[&user], &gif, "moves.gif"),
+        )
+        .unwrap();
+    seam.open(&bob_name);
+    seam.until("the animation", |workspace, cx| {
+        workspace.read_with(cx, |workspace, cx| {
+            shown_attachment(workspace, cx).is_some_and(|a| a.animation.is_some())
+        })
+    });
+    seam.cx.simulate_keystrokes("end");
+    let plays = |seam: &mut Seam<'_>| {
+        seam.workspace.read_with(seam.cx, |workspace, cx| {
+            let attachment = shown_attachment(workspace, cx).unwrap();
+            workspace.conversation.read(cx).plays(&attachment, cx)
+        })
+    };
+    assert!(plays(&mut seam), "it starts playing");
+    // Two 30 ms frames, three times.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!plays(&mut seam), "it froze past its loops");
+    seam.cx.simulate_keystrokes("p");
+    assert!(plays(&mut seam), "`p` plays it again");
+}
+
+/// The attachment of the open chat's newest message.
+fn shown_attachment(workspace: &Workspace, cx: &App) -> Option<crate::model::Attachment> {
+    let conversation = workspace.conversation.read(cx);
+    let messages = conversation.messages_entity()?.read(cx).messages();
+    match &messages.last()?.body {
+        crate::model::MessageBody::Attachment(attachment) => Some(attachment.clone()),
+        _ => None,
+    }
+}
+
+/// `o` on a reply loads the window around its original when that isn't
+/// loaded, and the cursor lands on it.
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_a_reply_jumps_to_an_original_outside_the_window(cx: &mut TestAppContext) {
+    let mut seam = start(cx);
+    let (_bob, chat, bob_name) = seam.contact();
+    let tokio = seam.tokio();
+    let user = seam.user.clone();
+    tokio.block_on(async move {
+        let send = |text: String, reply_to: Option<aircommon::identifiers::MimiId>, n: u8| {
+            let user = user.clone();
+            async move {
+                let mut content = mimi_content::MimiContent::simple_markdown_message(text, [n; 16]);
+                content.in_reply_to = reply_to.map(Into::into);
+                Box::pin(user.send_message(
+                    chat,
+                    content,
+                    None,
+                    aircoreclient::clients::MarkChatAsRead::Yes,
+                ))
+                .await
+                .unwrap()
+            }
+        };
+        let original = send("the original".into(), None, 0).await.id();
+        let mimi_id = loop {
+            let stored = user.message(original).await.unwrap().unwrap();
+            if let Some(id) = stored.message().mimi_id() {
+                break *id;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        // More than a page: opening at the newest leaves the original out.
+        for n in 1..=70 {
+            send(format!("filler {n}"), None, n).await;
+        }
+        send("the reply".into(), Some(mimi_id), 71).await;
+    });
+    seam.open(&bob_name);
+    seam.until("the reply", |workspace, cx| {
+        workspace.read_with(cx, |workspace, cx| {
+            let conversation = workspace.conversation.read(cx);
+            conversation.messages_entity().is_some_and(|messages| {
+                let messages = messages.read(cx).messages();
+                messages
+                    .last()
+                    .is_some_and(|message| message.plain_text() == "the reply")
+                    && !messages
+                        .iter()
+                        .any(|message| message.plain_text() == "the original")
+            })
+        })
+    });
+    seam.cx.simulate_keystrokes("end");
+    seam.cx.simulate_keystrokes("o");
+    seam.until("the original under the cursor", |workspace, cx| {
+        workspace.read_with(cx, |workspace, cx| {
+            let conversation = workspace.conversation.read(cx);
+            let Some(messages) = conversation.messages_entity() else {
+                return false;
+            };
+            conversation
+                .cursor()
+                .and_then(|ix| messages.read(cx).messages().get(ix).cloned())
+                .is_some_and(|message| message.plain_text() == "the original")
+        })
+    });
+}
+
 /// An image still opening when the user opens another chat never shows
 /// over it, and `v` there opens that chat's own (gates 21c and 21d).
 #[gpui::test]

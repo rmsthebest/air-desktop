@@ -1526,3 +1526,37 @@ one is named:
   narrowed to the reminder and its dismissal.
 
 These fixes go to the next gate (milestone 23's range starts at `af2959c`).
+
+## Milestone 23 — release readiness: open lists closed
+
+From milestone 20's "still open" list, each with a seam test seen to fail on
+broken code (12 changes, all caught; the suite then passed three times running):
+- gates 4-7: `Session` batching (`seam_a_burst_of_changes_arrives_batched`); the
+  message window's paging and in-flight flags
+  (`seam_the_message_window_pages_both_ways`).
+- gate 7: a draft fills only an empty composer
+  (`seam_a_draft_fills_only_an_empty_composer`, which does reach the view's
+  guard).
+- gate 16: a new safety code request replaces a pending one
+  (`seam_a_new_safety_code_request_replaces_a_pending_one`).
+- gate 15e: the devices "look again" probe
+  (`seam_a_change_during_a_self_chat_lookup_looks_again`; the lookup is held by
+  a stand-in task, so that the lookup then runs again stays with `after_probe`'s
+  unit test).
+- gate 12e: `retry` of a stale download
+  (`seam_a_stale_download_is_fetched_unless_claimed`).
+- gates 13-14: attention with the settings open was closed at gate 24.
+
+Still open from those lists: flush on drop and initial-load backoff (gates 4-7).
+Needing a file-dialog or atlas seam: `pick_picture` after the chat changed, a
+confirmed drop's chat, `Members` releasing textures.
+
+The data directory lock closes the accepted gap of two instances on one
+directory. The refused instance stays open on its message until closed.
+
+Package, from `just release-check` at `9f690a0`: tests pass, no build or home
+paths in the binary, and it starts with two instances (the second refused,
+which the window test checks; nobody looked at either window, and the package
+wasn't installed). namcap wasn't run (not installed here). `depends` comes from
+`readelf -d` and the libraries mapped in a running process.
+

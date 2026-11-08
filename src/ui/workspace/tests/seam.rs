@@ -694,7 +694,8 @@ fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
                 .filter_map(|message| message.plain_text().strip_prefix('m')?.parse().ok())
                 .collect();
             let (Some(first), Some(last)) = (numbers.first(), numbers.last()) else {
-                return 1..=0;
+                // Empty: nothing shows yet.
+                return std::ops::RangeInclusive::new(1, 0);
             };
             let expected: Vec<usize> = (*first..=*last).collect();
             assert_eq!(numbers, expected, "out of order or with a gap");

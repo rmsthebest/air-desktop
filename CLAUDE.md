@@ -345,7 +345,8 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 - Config dir: XDG (`~/.config/air-desktop`), override with
   `AIR_DESKTOP_CONFIG_DIR`. Data dir (account DBs): XDG data dir, override
   with `AIR_DESKTOP_DATA_DIR`; kept 0700, files tightened to 0600 after the
-  core opens or creates them (`paths.rs`).
+  core opens or creates them, and locked (`flock`) so a second instance is
+  refused with a message (`paths.rs`).
 
 ## GPUI gotchas seen here
 - Dialogs (palette) render outside the workspace tree: actions dispatched
@@ -360,6 +361,9 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 ## Commands
 - `just check` — fmt check, clippy `-D warnings`, tests.
 - `just seam` — the account seam tests (ignored by default): see Testing.
+- `just release-check` — builds the package from HEAD's tree as a tagged
+  tarball would be (`packaging/aur/`). `depends` comes from `readelf -d` and
+  what a running process maps: Vulkan and Wayland are loaded at runtime.
 - `cargo run` — run the app.
 - `gpui` is an alias for `gpui_kit` (`extern crate` in main.rs) so GPUI
   derive macros resolve; tests use `#[gpui::test]`.
@@ -411,6 +415,8 @@ a panic unwinds). Test-only accessors they need are
 Count toasts with `ui::take_told` (all of them), and before asserting that
 something was dropped, assert it started (`act_then_open`'s `started`). `window.dispatch_action` is deferred to the end of the
 update while `ChatList::open` selects at once: to act, then switch chats
-before a result lands, use separate updates (`Seam::act_then_open`). A
+before a result lands, use separate updates (`Seam::act_then_open`). Seed a
+user's own messages with `outbound_service().run_once()` after each send: one
+waiting for the service moves when the server stamps it. A
 loaded (not freshly made) account would look for its server by domain, so
 `AppRoot::with_account` starts on a harness user directly.

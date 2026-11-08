@@ -58,7 +58,8 @@ out; desktop notifications stay Linux-only, as is the package.
     large emoji-only messages, and a contact request's expiry countdown.
 22. **App and support screens** (done). About and licenses, help, logs, debug info,
     the update-required screen and reminder, and a username suggestion.
-23. **Release readiness**. A PKGBUILD from tagged releases for the AUR, a
+23. **Release readiness** (done, but for the release itself: it needs the
+    public repository's URL and a first tag). A PKGBUILD from tagged releases for the AUR, a
     `.desktop` file and icon, a data-directory lock, and the tests still
     open in the review log.
 24. **Translations and interface scale**. Move the UI's strings to a

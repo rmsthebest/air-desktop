@@ -1485,3 +1485,44 @@ must differ a lot: the sending core merges look-alikes.
 
 The gate's own range was PASS and these fixes go to the next gate (milestone
 22's range starts at `032c51f`).
+
+## Gate 24 — milestone 22 (`032c51f..af2959c`): PASS
+
+By reading only: the reviewer built and ran nothing, and the findings weren't
+reproduced. Fixed, each with a test that was seen to fail on the old code where
+one is named:
+
+- Medium: the update screen hung on the connection status, which the listener
+  overwrites (a refused version could turn into "offline"). The server's word
+  is its own state now (`VersionStatus`, upstream's transitions), kept across
+  connection changes; only the server accepting a listen ends a refusal. An
+  announced date stands until the status the server sends first on every
+  stream, so the reminder doesn't blink. Tests:
+  `a_refused_version_stays_refused_until_the_server_accepts_it`,
+  `seam_the_update_screen_replaces_the_workspace`.
+- Medium: focus went to the settings rows while an info page showed (`:about`,
+  `:link <code>`, Escape; Helix `ctrl-w w`), so keys acted on rows out of sight.
+  One `focus_settings_pane` at every site. Tests:
+  `the_next_pane_is_the_info_page_shown`,
+  `seam_leaving_a_link_returns_to_the_page_under_it`.
+- Medium: "memory only" logs also went to stdout, which a launcher sends to the
+  journal. Stdout only for a terminal or with `RUST_LOG` set. No test: `main`'s
+  own wiring, the condition is one line.
+- Low: the update screen now ends attention as the settings do, and re-reports
+  on change (`seam_what_hides_the_chat_ends_attention`, which also covers
+  attention with settings open from the open list below).
+- Low: a log line drops invisible characters, and one event is one line
+  whatever a logged value holds. `the_layer_keeps_one_plain_line_per_event`
+  goes through the layer as installed.
+- Low: logs are cleared when the device is reset.
+- Low: a failed debug-info load no longer blames the connection (not tested:
+  it needs a core failure on a local read).
+- Low: `build.rs` asks git only for this repository's own `.git`: a tarball in
+  an AUR clone would have shown the clone's commit.
+- Low: the debug page without an account says so instead of loading forever.
+- Low: misplaced comments; the about text names `airprotos`.
+- Tests: logs open at the newest through the real path; the bounded-line test's
+  cut now lands inside a character; `seam_the_server_can_end_this_version` is
+  narrowed to the reminder and its dismissal.
+
+These fixes go to the next gate (milestone 23's range starts at `af2959c`).

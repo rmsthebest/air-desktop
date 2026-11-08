@@ -389,40 +389,90 @@ fn shown_attachment(workspace: &Workspace, cx: &App) -> Option<crate::model::Att
 #[gpui::test]
 #[ignore = "needs Postgres and MinIO (Air's compose file)"]
 fn seam_the_server_can_end_this_version(cx: &mut TestAppContext) {
-    use crate::session::queue::ConnectionStatus;
+    use crate::session::queue::VersionStatus;
     let mut seam = start(cx);
-    let set = |seam: &mut Seam<'_>, status, days: Option<i64>| {
-        let expires = days.map(|days| chrono::Utc::now() + chrono::Duration::days(days));
+    let set = |seam: &mut Seam<'_>, version| {
         seam.workspace.update(seam.cx, |workspace, cx| {
             let session = workspace.session().cloned().unwrap();
-            session.update(cx, |session, cx| {
-                session.set_version_state(status, expires, cx)
-            });
+            session.update(cx, |session, cx| session.set_version_state(version, cx));
         });
         seam.cx.run_until_parked();
     };
+    let expires =
+        |days| VersionStatus::ExpiresAt(chrono::Utc::now() + chrono::Duration::days(days));
     let reminds = |seam: &mut Seam<'_>| {
         seam.workspace.read_with(seam.cx, |workspace, cx| {
             workspace.update_reminder(cx).is_some()
         })
     };
-    set(&mut seam, ConnectionStatus::Connected, None);
     assert!(!reminds(&mut seam));
-    set(&mut seam, ConnectionStatus::Connected, Some(30));
+    set(&mut seam, expires(30));
     assert!(reminds(&mut seam));
     seam.cx.dispatch_action(DismissUpdateReminder);
     seam.cx.run_until_parked();
     assert!(!reminds(&mut seam), "dismissed");
-    set(&mut seam, ConnectionStatus::Connected, Some(60));
+    set(&mut seam, expires(60));
     assert!(reminds(&mut seam), "a new date reminds again");
+}
 
-    let required = |seam: &mut Seam<'_>| {
-        seam.workspace
-            .read_with(seam.cx, |workspace, cx| workspace.update_required(cx))
+/// A chat behind the settings or the update screen isn't being looked at,
+/// so its alerts aren't held back; showing it again counts again.
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_what_hides_the_chat_ends_attention(cx: &mut TestAppContext) {
+    use crate::session::queue::VersionStatus;
+    let mut seam = start(cx);
+    let (_peer, _, name) = seam.contact();
+    seam.open(&name);
+    let session = seam.workspace.read_with(seam.cx, |workspace, _| {
+        workspace.session().cloned().unwrap()
+    });
+    let looked_at = |seam: &mut Seam<'_>| {
+        seam.cx.run_until_parked();
+        session.read_with(seam.cx, |session, _| {
+            session.attention().open_chat.is_some()
+        })
     };
-    assert!(!required(&mut seam));
-    set(&mut seam, ConnectionStatus::UnsupportedVersion, None);
-    assert!(required(&mut seam));
+    assert!(looked_at(&mut seam));
+    let set = |seam: &mut Seam<'_>, version| {
+        session.update(seam.cx, |session, cx| {
+            session.set_version_state(version, cx)
+        })
+    };
+    set(&mut seam, VersionStatus::Unsupported);
+    assert!(!looked_at(&mut seam), "behind the update screen");
+    set(&mut seam, VersionStatus::Supported);
+    assert!(looked_at(&mut seam), "shown again");
+    seam.workspace.update_in(seam.cx, |workspace, window, cx| {
+        workspace.open_settings(&OpenSettings, window, cx)
+    });
+    assert!(!looked_at(&mut seam), "behind the settings");
+}
+
+/// Linking over an info page, then leaving the link, lands on the page: it
+/// is what shows, and the rows under it would take the keys unseen.
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_leaving_a_link_returns_to_the_page_under_it(cx: &mut TestAppContext) {
+    let seam = start(cx);
+    seam.workspace.update_in(seam.cx, |workspace, window, cx| {
+        workspace.show_info(crate::about::Page::About, window, cx);
+        workspace.start_link("1234 5678 9", window, cx);
+    });
+    seam.cx.run_until_parked();
+    let (link, info) = seam.workspace.read_with(seam.cx, |workspace, cx| {
+        (
+            workspace.link_pane().unwrap().clone(),
+            workspace.info.as_ref().unwrap().0.focus_handle(cx),
+        )
+    });
+    link.update(seam.cx, |_, cx| cx.emit(LinkViewEvent::Close));
+    seam.cx.run_until_parked();
+    seam.workspace.read_with(seam.cx, |workspace, _| {
+        assert!(workspace.link_pane().is_none());
+    });
+    seam.cx
+        .update(|window, _| assert!(info.is_focused(window), "the page has the keys"));
 }
 
 /// `:debug-info` shows this account's id, from the core.

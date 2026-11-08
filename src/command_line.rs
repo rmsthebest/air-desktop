@@ -17,8 +17,9 @@ pub enum Command {
     Shortcuts,
     /// Send a contact request to a username, as typed.
     AddContact(String),
-    /// Register a username, as typed.
+    /// A page of the about, licenses, logs and debug info screen.
     Info(crate::about::Page),
+    /// Register a username, as typed.
     AddUsername(String),
     RemoveUsername(String),
     /// Accept or decline the open chat's contact request.

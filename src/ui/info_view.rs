@@ -97,19 +97,24 @@ impl InfoView {
                 }
             }
             Page::Logs => {
-                self.logs = crate::logs::latest().into_iter().map(Into::into).collect();
-                // The newest are what is being looked for.
-                self.selected = self.logs.len().saturating_sub(1);
-                self.list_scroll
-                    .scroll_to_item(self.selected, ScrollStrategy::Bottom);
+                self.show_logs(crate::logs::latest());
             }
             Page::Debug => self.load_debug(cx),
         }
         cx.notify();
     }
 
+    fn show_logs(&mut self, lines: Vec<String>) {
+        self.logs = lines.into_iter().map(Into::into).collect();
+        // The newest are what is being looked for.
+        self.selected = self.logs.len().saturating_sub(1);
+        self.list_scroll
+            .scroll_to_item(self.selected, ScrollStrategy::Bottom);
+    }
+
     fn load_debug(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
+            self.debug = Some(Err("That needs an account".into()));
             return;
         };
         self.debug = None;
@@ -294,7 +299,7 @@ impl InfoView {
             .child(div().text_sm().text_color(theme.muted_foreground).child(
                 "A keyboard-first desktop client for the Air messenger. Free software under \
                  the GNU Affero General Public License, version 3 or later, with no warranty. \
-                 It is made with Air's own crates (aircoreclient, aircommon, airapiclient), \
+                 It is made with Air's own crates (aircoreclient, aircommon, airapiclient, airprotos), \
                  under the same license.",
             ));
         let mut rows = v_flex().gap_0p5();
@@ -542,12 +547,20 @@ mod tests {
         view.read_with(cx, |view, _| assert!(!view.rows().contains(&Row::Debug)));
     }
 
+    /// Without an account the debug page says so, rather than loading on.
+    #[gpui::test]
+    fn the_debug_page_without_an_account_refuses(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open(Page::Debug, cx);
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.debug, Some(Err(_))));
+        });
+    }
+
     #[gpui::test]
     fn logs_open_at_the_newest_and_copy_as_shown(cx: &mut gpui::TestAppContext) {
         let (view, cx) = open(Page::Logs, cx);
         view.update(cx, |view, cx| {
-            view.logs = vec!["first".into(), "second".into()];
-            view.select(isize::MAX, cx);
+            view.show_logs(vec!["first".into(), "second".into()]);
             assert_eq!(view.selected, 1);
             assert_eq!(view.text().as_deref(), Some("first\nsecond"));
             view.select(isize::MIN, cx);

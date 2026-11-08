@@ -174,6 +174,8 @@ impl AppRoot {
         } else {
             "This device was unlinked from your account, and its data deleted.".into()
         };
+        // They are about the account going away.
+        crate::logs::clear();
         self.screen = Screen::TearingDown;
         cx.notify();
         let db_path = self.db_path.clone();
@@ -267,6 +269,7 @@ impl Render for AppRoot {
             Screen::Onboarding { view, .. } => view.clone().into_any_element(),
             Screen::Ready { workspace, .. } if workspace.read(cx).update_required(cx) => {
                 v_flex()
+                    .debug_selector(|| "update-required".into())
                     .size_full()
                     .items_center()
                     .justify_center()
@@ -362,11 +365,16 @@ mod tests {
             }
         }
 
-        /// Deleting the account runs once at a time; done, the device is
-        /// reset and onboarding says why (`tear_down`'s routing).
-        #[gpui::test]
-        #[ignore = "needs Postgres and MinIO (Air's compose file)"]
-        fn seam_a_deleted_account_lands_on_onboarding(cx: &mut TestAppContext) {
+        /// The app root on a new persisted account.
+        fn start(
+            cx: &mut TestAppContext,
+        ) -> (
+            Backend,
+            std::path::PathBuf,
+            gpui::AnyWindowHandle,
+            Entity<AppRoot>,
+            Entity<Session>,
+        ) {
             cx.executor().allow_parking();
             cx.update(|cx| {
                 gpui_kit::init(cx);
@@ -381,8 +389,8 @@ mod tests {
                 (backend, user)
             });
             let dir = backend.temp_dir().to_path_buf();
-            let _backend = Backend(Some(backend), tokio.clone());
-            let (_, root) = cx.update(|cx| {
+            let backend = Backend(Some(backend), tokio);
+            let (window, root) = cx.update(|cx| {
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
                     cx.new(|cx| AppRoot::with_account(dir.clone(), user, window, cx))
                 })
@@ -392,6 +400,41 @@ mod tests {
                 Screen::Ready { workspace, .. } => workspace.read(cx).session().cloned().unwrap(),
                 _ => panic!("the workspace shows"),
             });
+            (backend, dir, window, root, session)
+        }
+
+        /// A refused version replaces the workspace with the update screen,
+        /// and it goes away when the server accepts this version again.
+        #[gpui::test]
+        #[ignore = "needs Postgres and MinIO (Air's compose file)"]
+        fn seam_the_update_screen_replaces_the_workspace(cx: &mut TestAppContext) {
+            use crate::session::queue::VersionStatus;
+            let (_backend, _, window, _root, session) = start(cx);
+            let cx = gpui::VisualTestContext::from_window(window, cx).into_mut();
+            let shows = |cx: &mut gpui::VisualTestContext| {
+                cx.run_until_parked();
+                cx.debug_bounds("update-required").is_some()
+            };
+            assert!(!shows(cx));
+            session.update(cx, |session, cx| {
+                session.set_version_state(VersionStatus::Unsupported, cx)
+            });
+            assert!(shows(cx));
+            session.update(cx, |session, cx| {
+                session.set_version_state(VersionStatus::Supported, cx)
+            });
+            assert!(!shows(cx));
+        }
+
+        /// Deleting the account runs once at a time; done, the device is
+        /// reset and onboarding says why (`tear_down`'s routing).
+        #[gpui::test]
+        #[ignore = "needs Postgres and MinIO (Air's compose file)"]
+        fn seam_a_deleted_account_lands_on_onboarding(cx: &mut TestAppContext) {
+            const LOGGED: &[u8] = b"seam_a_deleted_account_lands_on_onboarding";
+            let (_backend, dir, _, root, session) = start(cx);
+            std::io::Write::write_all(&mut crate::logs::Writer, LOGGED).unwrap();
+            let tokio = cx.update(|cx| Tokio::handle(cx));
             let (first, second) = session.update(cx, |session, cx| {
                 (session.delete_account(cx), session.delete_account(cx))
             });
@@ -422,7 +465,13 @@ mod tests {
                 notice.as_deref(),
                 Some("Your Air account was deleted. This device has been reset.")
             );
-            // Its data went with it.
+            // Its logs and its data went with it.
+            let logged = String::from_utf8_lossy(LOGGED);
+            assert!(
+                !crate::logs::latest()
+                    .iter()
+                    .any(|line| line.contains(&*logged))
+            );
             let records = tokio
                 .block_on(
                     aircoreclient::clients::store::ClientRecord::load_all_from_air_db(

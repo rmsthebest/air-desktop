@@ -35,6 +35,7 @@ const DEFAULT_LOG_FILTER: &str = "warn,air_desktop=info";
 compile_error!("the `seam` feature is for tests only; build releases without it");
 
 fn main() {
+    use std::io::IsTerminal as _;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     tracing_subscriber::registry()
@@ -42,12 +43,13 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        // Logs can name contacts, and a launcher's stdout ends up in the
+        // journal: only someone who is reading gets them there.
         .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(|| logs::Writer),
+            (std::io::stdout().is_terminal() || std::env::var_os("RUST_LOG").is_some())
+                .then(tracing_subscriber::fmt::layer),
         )
+        .with(logs::layer())
         .init();
 
     // The `seam` feature (tests only) puts the core in test mode: fewer

@@ -32,6 +32,8 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     desktop has no push token, so no admission sessions).
   - `queue.rs`: QS listener with upstream's reconnect/backoff; processing
     the queue's Empty sentinel is what starts the core's outbound service.
+    `VersionStatus` is the server's word on this version, kept apart from
+    the connection status: only a listen it accepts ends a refusal.
   - `Session` entity: owns `CoreUser`, runs the listener, forwards
     `db_notifications` to the UI as batched `SessionEvent::Changed`.
   - `chats.rs`: port of `ChatsDataSource`. A tokio worker owns what was
@@ -251,7 +253,8 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   has us offer the source, so set it before a release. `just
   regenerate-licenses` (needs cargo-about) rewrites `assets/licenses.json`
   after `Cargo.lock` changes; a test fails until then. Logs stay in memory
-  (1000 lines), as they can name contacts.
+  (1000 lines, one per event, cleared on a device reset), as they can name
+  contacts; stdout gets them only on a terminal or with `RUST_LOG` set.
 - `src/username.rs` — port of upstream's suggestion, prefilled for a first
   username only. The server refusing this version replaces the workspace
   (`Workspace::update_required`, in `app_root`); an announced end shows a banner

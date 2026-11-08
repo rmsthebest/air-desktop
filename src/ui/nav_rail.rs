@@ -81,10 +81,6 @@ fn account_badge(account: Account, cx: &App) -> AnyElement {
         ConnectionStatus::Connected => (theme.success, "connected"),
         ConnectionStatus::Connecting => (theme.warning, "connecting…"),
         ConnectionStatus::Offline => (theme.danger, "offline, retrying"),
-        ConnectionStatus::UnsupportedVersion => (
-            theme.danger,
-            "this version is no longer supported; please update",
-        ),
     };
     let (color, tooltip) = match account.version_expires {
         Some(at) if account.status == ConnectionStatus::Connected => (

@@ -1237,7 +1237,7 @@ pub fn initials(name: &str) -> String {
         .collect()
 }
 
-fn is_invisible(c: char) -> bool {
+pub(crate) fn is_invisible(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{00AD}'                      // soft hyphen

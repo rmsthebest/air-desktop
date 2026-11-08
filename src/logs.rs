@@ -18,17 +18,22 @@ struct Buffer {
 }
 
 impl Buffer {
-    fn push(&mut self, text: &str) {
-        for line in text.lines().filter(|line| !line.is_empty()) {
-            if self.lines.len() == MAX_LINES {
-                self.lines.pop_front();
-            }
-            self.lines.push_back(bounded(line));
+    /// One event is one line, whatever a logged value holds: a name with a
+    /// line break in it can't pass for another event.
+    fn push(&mut self, event: &str) {
+        let line = bounded(event.trim_end());
+        if line.is_empty() {
+            return;
         }
+        if self.lines.len() == MAX_LINES {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
     }
 }
 
-/// One bounded line of plain text.
+/// One bounded line of plain text: what logs show can't reorder or hide
+/// itself, as for peer text elsewhere.
 fn bounded(line: &str) -> String {
     let mut end = line.len().min(MAX_LINE_BYTES);
     while !line.is_char_boundary(end) {
@@ -36,7 +41,14 @@ fn bounded(line: &str) -> String {
     }
     line[..end]
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_whitespace() || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .filter(|c| !crate::model::is_invisible(*c))
         .collect()
 }
 
@@ -44,6 +56,22 @@ fn bounded(line: &str) -> String {
 pub fn latest() -> Vec<String> {
     let buffer = LATEST.lock().unwrap_or_else(|err| err.into_inner());
     buffer.lines.iter().cloned().collect()
+}
+
+/// Forgets the lines kept: they are about an account that is going away.
+pub fn clear() {
+    let mut buffer = LATEST.lock().unwrap_or_else(|err| err.into_inner());
+    buffer.lines.clear();
+}
+
+/// The layer that keeps the lines.
+pub fn layer<S>() -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(|| Writer)
 }
 
 /// Where the log layer writes: each event arrives as one write.
@@ -86,11 +114,33 @@ mod tests {
     #[test]
     fn a_line_is_bounded_and_plain() {
         let mut buffer = buffer();
-        buffer.push(&"é".repeat(MAX_LINE_BYTES));
-        assert!(buffer.lines[0].len() <= MAX_LINE_BYTES);
-        buffer.push("a\u{1b}[31mb\nsecond\n\n");
-        assert_eq!(buffer.lines[1], "a [31mb");
-        assert_eq!(buffer.lines[2], "second");
+        // The cut lands inside a character.
+        buffer.push(&format!("a{}", "é".repeat(MAX_LINE_BYTES)));
+        assert_eq!(buffer.lines[0].len(), MAX_LINE_BYTES - 1);
+        buffer.push("a\u{1b}[31mb\nnext\u{2028}event\n\n");
+        assert_eq!(buffer.lines[1], "a [31mb next event");
+        buffer.push("\u{202e}gnp.exe\u{200b}\n");
+        assert_eq!(buffer.lines[2], "gnp.exe");
+        buffer.push("\n");
         assert_eq!(buffer.lines.len(), 3);
+    }
+
+    /// One event through the layer as `main` installs it: one line, no
+    /// terminal colours.
+    #[test]
+    fn the_layer_keeps_one_plain_line_per_event() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        const MARK: &str = "the_layer_keeps_one_plain_line_per_event";
+        let subscriber = tracing_subscriber::registry().with(layer());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(name = "two\nlines", "{MARK}");
+        });
+        let lines: Vec<_> = latest()
+            .into_iter()
+            .filter(|line| line.contains(MARK))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("WARN"), "{lines:?}");
+        assert!(!lines[0].contains('['), "no colour codes: {lines:?}");
     }
 }

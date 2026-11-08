@@ -54,7 +54,7 @@ use crate::model::ChatId;
 use crate::runtime::{Tokio, TokioTask};
 use crate::settings::SettingsStore;
 use alerts::{Alerts, Attention};
-use queue::QueueEvent;
+use queue::{QueueState, VersionStatus};
 
 /// Database changes buffered for the UI. Peers control how many arrive, so
 /// beyond this the forwarder stops queueing and flags a full reload.
@@ -90,12 +90,6 @@ pub struct DeletionAborted;
 /// Clicks waiting for the UI. A handful at most: the user clicks one
 /// notification at a time.
 const CLICKS_BUFFER: usize = 8;
-
-#[derive(Clone, Copy, PartialEq)]
-struct QueueState {
-    status: ConnectionStatus,
-    version_expires: Option<DateTime<Utc>>,
-}
 
 pub struct Session {
     user: CoreUser,
@@ -160,7 +154,7 @@ impl Session {
         cx.new(|cx| {
             let initial = QueueState {
                 status: ConnectionStatus::Connecting,
-                version_expires: None,
+                version: VersionStatus::Supported,
             };
             let (state_tx, state_rx) = watch::channel(initial);
 
@@ -192,10 +186,7 @@ impl Session {
             let queue = Tokio::spawn(
                 cx,
                 queue::run(user.clone(), alerts.clone(), move |event| {
-                    state_tx.send_modify(|state| match event {
-                        QueueEvent::Status(status) => state.status = status,
-                        QueueEvent::VersionExpires(at) => state.version_expires = at,
-                    })
+                    state_tx.send_modify(|state| state.apply(event))
                 }),
             );
 
@@ -343,8 +334,12 @@ impl Session {
     /// What the debug page shows of this account.
     pub fn debug_info(&self, cx: &App) -> impl Future<Output = Result<DebugInfo, String>> + use<> {
         let user = self.user.clone();
-        contacts::on_tokio(cx, "load the debug info", async move {
-            let info = user.user_debug_info().await?;
+        const WHAT: &str = "load the debug info";
+        contacts::on_tokio(cx, WHAT, async move {
+            let info = user
+                .user_debug_info()
+                .await
+                .map_err(|err| contacts::Failure::from(err).local(WHAT))?;
             Ok(DebugInfo {
                 user_id: info.user_id,
                 timed_tasks: info.timed_tasks.len(),
@@ -357,20 +352,28 @@ impl Session {
 
     /// Pretends the server said this about the version (seam tests).
     #[cfg(all(test, feature = "seam"))]
-    pub fn set_version_state(
-        &mut self,
-        status: ConnectionStatus,
-        expires: Option<DateTime<Utc>>,
-        cx: &mut Context<Self>,
-    ) {
-        self.queue_state.status = status;
-        self.queue_state.version_expires = expires;
+    pub fn set_version_state(&mut self, version: VersionStatus, cx: &mut Context<Self>) {
+        self.queue_state.version = version;
         cx.notify();
+    }
+
+    /// What the alerts were last told (seam tests).
+    #[cfg(all(test, feature = "seam"))]
+    pub fn attention(&self) -> Attention {
+        *self.attention.borrow()
+    }
+
+    /// Whether the server refuses this version: nothing works until updated.
+    pub fn version_refused(&self) -> bool {
+        self.queue_state.version == VersionStatus::Unsupported
     }
 
     /// When the server stops accepting this version, if it announced it.
     pub fn version_expires(&self) -> Option<DateTime<Utc>> {
-        self.queue_state.version_expires
+        match self.queue_state.version {
+            VersionStatus::ExpiresAt(at) => Some(at),
+            _ => None,
+        }
     }
 
     /// Tells the alerts what the user is looking at: the open chat, and

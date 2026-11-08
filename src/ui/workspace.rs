@@ -351,8 +351,12 @@ impl Workspace {
             }),
         ];
         if let Some(session) = &session {
-            // Account name and connection status are shown in the rail.
-            subscriptions.push(cx.observe(session, |_, _, cx| cx.notify()));
+            // Account name and connection status are shown in the rail; a
+            // refused version hides the chat, or shows it again.
+            subscriptions.push(cx.observe_in(session, window, |this, _, window, cx| {
+                this.report_attention(window, cx);
+                cx.notify();
+            }));
             subscriptions.push(cx.subscribe_in(
                 session,
                 window,
@@ -413,12 +417,14 @@ impl Workspace {
     fn report_attention(&self, window: &Window, cx: &mut App) {
         let Some(session) = &self.session else { return };
         let active = window.is_window_active();
-        // Behind the settings screen, the chat isn't being looked at.
+        // Behind the settings or the update screen, the chat isn't being
+        // looked at.
+        let hidden = self.settings_open || self.update_required(cx);
         let open = self
             .conversation
             .read(cx)
             .chat()
-            .filter(|_| !self.settings_open)
+            .filter(|_| !hidden)
             .map(|chat| chat.id.clone());
         session.update(cx, |session, _| {
             session.set_attention(active, open.as_ref())
@@ -547,12 +553,18 @@ impl Workspace {
         self.conversation
             .update(cx, |conversation, _| conversation.set_hidden(true));
         self.report_attention(window, cx);
+        self.focus_settings_pane(window, cx);
+        cx.notify();
+    }
+
+    /// Focuses what the settings screen shows: a link in progress, a page
+    /// of the info screen, or the rows.
+    fn focus_settings_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
         match (self.link_pane(), &self.info) {
             (Some(view), _) => view.focus_handle(cx).focus(window, cx),
             (None, Some((view, _))) => view.focus_handle(cx).focus(window, cx),
             (None, None) => self.settings_view.focus_handle(cx).focus(window, cx),
         }
-        cx.notify();
     }
 
     /// Shows a page of the info screen in place of the settings rows. Not
@@ -569,7 +581,7 @@ impl Workspace {
                 let closed = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
                     let InfoEvent::Close = event;
                     this.info = None;
-                    this.settings_view.focus_handle(cx).focus(window, cx);
+                    this.focus_settings_pane(window, cx);
                     cx.notify();
                 });
                 self.info = Some((view, closed));
@@ -580,9 +592,9 @@ impl Workspace {
 
     /// Whether the server refuses this version: nothing works until updated.
     pub fn update_required(&self, cx: &App) -> bool {
-        self.session.as_ref().is_some_and(|session| {
-            session.read(cx).status() == crate::session::queue::ConnectionStatus::UnsupportedVersion
-        })
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.read(cx).version_refused())
     }
 
     fn dismiss_update_reminder(
@@ -670,7 +682,7 @@ impl Workspace {
                 LinkViewEvent::Confirm(name) => this.confirm_link(name.clone(), window, cx),
                 LinkViewEvent::Close => {
                     this.close_link_pane(cx);
-                    this.settings_view.focus_handle(cx).focus(window, cx);
+                    this.focus_settings_pane(window, cx);
                 }
             });
         let receive = cx.spawn_in(window, async move |this, cx| {
@@ -1070,7 +1082,7 @@ impl Workspace {
 
     fn focus_next_pane(&mut self, _: &FocusNextPane, window: &mut Window, cx: &mut Context<Self>) {
         if self.chat_list.focus_handle(cx).is_focused(window) && self.settings_open {
-            self.settings_view.focus_handle(cx).focus(window, cx);
+            self.focus_settings_pane(window, cx);
         } else if self.chat_list.focus_handle(cx).is_focused(window) {
             self.focus_messages(&FocusMessages, window, cx);
         } else {
@@ -3685,6 +3697,29 @@ mod tests {
                 .map(|(line, _)| line.read(cx).value(cx))
         });
         assert_eq!(prompt.as_deref(), Some("safety-code "));
+    }
+
+    /// Moving between panes reaches the page shown, not the rows under it.
+    #[gpui::test]
+    fn the_next_pane_is_the_info_page_shown(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.show_info(crate::about::Page::About, window, cx)
+        });
+        cx.run_until_parked();
+        let info = workspace.read_with(cx, |workspace, cx| {
+            workspace.info.as_ref().unwrap().0.focus_handle(cx)
+        });
+        let on_it = |cx: &mut VisualTestContext| cx.update(|window, _| info.is_focused(window));
+        assert!(on_it(cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_chat_list(&FocusChatList, window, cx);
+        });
+        assert!(!on_it(cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_next_pane(&FocusNextPane, window, cx);
+        });
+        assert!(on_it(cx));
     }
 
     #[gpui::test]

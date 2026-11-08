@@ -33,17 +33,59 @@ pub enum ConnectionStatus {
     Connected,
     /// Waiting before the next connection attempt.
     Offline,
-    /// The server no longer accepts this client version.
-    UnsupportedVersion,
+}
+
+/// The server's word on this client version. Kept apart from the connection,
+/// which goes on changing while the version is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionStatus {
+    Supported,
+    /// It stops accepting this version then.
+    ExpiresAt(DateTime<Utc>),
+    /// It no longer accepts this version.
+    Unsupported,
+}
+
+impl VersionStatus {
+    /// What an announcement means now, as upstream.
+    fn announced(expires: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Self {
+        match expires {
+            Some(at) if now < at => Self::ExpiresAt(at),
+            Some(_) => Self::Unsupported,
+            None => Self::Supported,
+        }
+    }
 }
 
 /// What the listener reports to the session.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QueueEvent {
     Status(ConnectionStatus),
-    /// The server announced when it stops accepting this client version
-    /// (`None`: no expiry announced, or the announcement was withdrawn).
-    VersionExpires(Option<DateTime<Utc>>),
+    /// The server let us listen: this version isn't refused (any announced
+    /// date stands until the status it sends first on every stream).
+    VersionAccepted,
+    Version(VersionStatus),
+}
+
+/// What the session knows of the listener.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct QueueState {
+    pub(super) status: ConnectionStatus,
+    pub(super) version: VersionStatus,
+}
+
+impl QueueState {
+    pub(super) fn apply(&mut self, event: QueueEvent) {
+        match event {
+            QueueEvent::Status(status) => self.status = status,
+            QueueEvent::VersionAccepted => {
+                if self.version == VersionStatus::Unsupported {
+                    self.version = VersionStatus::Supported;
+                }
+            }
+            QueueEvent::Version(version) => self.version = version,
+        }
+    }
 }
 
 /// How a stream session ended.
@@ -53,8 +95,6 @@ enum Ended {
     Stopped { uptime: Duration },
     /// Could not connect.
     Failed,
-    /// The server rejects this client version.
-    Unsupported,
 }
 
 /// Decides how long to wait before reconnecting.
@@ -78,15 +118,9 @@ impl Reconnect {
 /// Runs until dropped (the session aborts it), reconnecting with backoff.
 pub async fn run(user: CoreUser, mut alerts: Alerts, report: impl Fn(QueueEvent) + Send) {
     let mut reconnect = Reconnect::default();
-    let mut unsupported = false;
     loop {
-        // Keep "unsupported" on screen while retrying: it only changes when
-        // the server accepts us again.
-        if !unsupported {
-            report(QueueEvent::Status(ConnectionStatus::Connecting));
-        }
+        report(QueueEvent::Status(ConnectionStatus::Connecting));
         let ended = listen_once(&user, &mut alerts, &report).await;
-        unsupported = ended == Ended::Unsupported;
         let delay = reconnect.delay(&ended);
         if !delay.is_zero() {
             info!(retry_in = ?delay, "queue stream ended ({ended:?})");
@@ -102,14 +136,16 @@ async fn listen_once(
 ) -> Ended {
     let status = |status| report(QueueEvent::Status(status));
     let (stream, responder) = match user.listen_queue().await {
-        Ok(listening) => listening,
+        Ok(listening) => {
+            report(QueueEvent::VersionAccepted);
+            listening
+        }
         Err(err) => {
             warn!("could not listen to queue: {err}");
+            status(ConnectionStatus::Offline);
             if err.is_unsupported_version() {
-                status(ConnectionStatus::UnsupportedVersion);
-                return Ended::Unsupported;
+                report(QueueEvent::Version(VersionStatus::Unsupported));
             } else {
-                status(ConnectionStatus::Offline);
                 // As upstream: a deletion past the QS client can't listen
                 // anymore, which is what would otherwise resume it.
                 if let Err(err) = user.resume_account_deletion().await {
@@ -200,12 +236,10 @@ async fn handle_event(
             let expires = version
                 .expires_at
                 .and_then(|at| DateTime::from_timestamp(at.seconds, 0));
-            report(match expires {
-                Some(at) if at <= Utc::now() => {
-                    QueueEvent::Status(ConnectionStatus::UnsupportedVersion)
-                }
-                expires => QueueEvent::VersionExpires(expires),
-            });
+            report(QueueEvent::Version(VersionStatus::announced(
+                expires,
+                Utc::now(),
+            )));
         }
         _ => {}
     }
@@ -231,6 +265,50 @@ async fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_announced_date_counts_until_it_passes() {
+        let now = Utc::now();
+        let later = now + chrono::Duration::seconds(1);
+        assert_eq!(
+            VersionStatus::announced(None, now),
+            VersionStatus::Supported
+        );
+        assert_eq!(
+            VersionStatus::announced(Some(later), now),
+            VersionStatus::ExpiresAt(later)
+        );
+        assert_eq!(
+            VersionStatus::announced(Some(now), now),
+            VersionStatus::Unsupported
+        );
+    }
+
+    /// The update screen hangs on this: losing the connection must not end
+    /// a refusal, while the server accepting us again must.
+    #[test]
+    fn a_refused_version_stays_refused_until_the_server_accepts_it() {
+        let at = Utc::now();
+        let mut state = QueueState {
+            status: ConnectionStatus::Connecting,
+            version: VersionStatus::Unsupported,
+        };
+        for status in [ConnectionStatus::Offline, ConnectionStatus::Connecting] {
+            state.apply(QueueEvent::Status(status));
+            assert_eq!(state.version, VersionStatus::Unsupported);
+        }
+        state.apply(QueueEvent::VersionAccepted);
+        assert_eq!(state.version, VersionStatus::Supported);
+
+        // An announced date isn't dropped by a reconnect, only by the
+        // server's next word, so the reminder doesn't blink.
+        state.apply(QueueEvent::Version(VersionStatus::ExpiresAt(at)));
+        state.apply(QueueEvent::Status(ConnectionStatus::Offline));
+        state.apply(QueueEvent::VersionAccepted);
+        assert_eq!(state.version, VersionStatus::ExpiresAt(at));
+        state.apply(QueueEvent::Version(VersionStatus::Supported));
+        assert_eq!(state.version, VersionStatus::Supported);
+    }
 
     #[test]
     fn reconnect_backs_off_until_a_stream_was_healthy() {

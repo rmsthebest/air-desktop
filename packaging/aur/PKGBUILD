@@ -8,7 +8,11 @@ arch=(x86_64)
 # Set with the public repository, as `repository` in Cargo.toml.
 url='https://FILL_IN_REPOSITORY/air-desktop'
 license=(AGPL-3.0-or-later)
-depends=()
+# What the binary links, then what it loads at runtime: readelf can't see the
+# last four. It draws through Vulkan, and needs a font (none is bundled).
+depends=(gcc-libs glibc libxcb libxkbcommon libxkbcommon-x11
+         vulkan-icd-loader vulkan-driver wayland ttf-font)
+optdepends=('xdg-desktop-portal: file dialogs and opening links')
 makedepends=(rustup)
 # makepkg's LTO flags reach the C code that Rust crates build.
 options=(!lto)
@@ -28,7 +32,10 @@ _env() {
   # target-cpu=native on a Ryzen 9 7945HX (Zen 4). CachyOS's makepkg.conf sets
   # it. x86-64-v3 and the default are fine.
   RUSTFLAGS=${RUSTFLAGS//-C target-cpu=native/}
-  export RUSTFLAGS=${RUSTFLAGS//-Ctarget-cpu=native/}
+  RUSTFLAGS=${RUSTFLAGS//-Ctarget-cpu=native/}
+  # Panic messages hold source paths: no build directory or home in the binary.
+  export RUSTFLAGS+=" --remap-path-prefix=$srcdir=/build"
+  RUSTFLAGS+=" --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
 }
 
 prepare() {

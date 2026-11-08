@@ -191,18 +191,7 @@ impl Seam<'_> {
 fn seam_a_gif_plays_then_freezes_until_replayed(cx: &mut TestAppContext) {
     let mut seam = start(cx);
     let (bob, chat, bob_name) = seam.contact();
-    let mut gif = Vec::new();
-    let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
-    let frames = (0..2u8).map(|n| {
-        image::Frame::from_parts(
-            image::RgbaImage::from_pixel(8, 8, image::Rgba([n * 200, 20, 30, 255])),
-            0,
-            0,
-            image::Delay::from_numer_denom_ms(30, 1),
-        )
-    });
-    encoder.encode_frames(frames).unwrap();
-    drop(encoder);
+    let gif = small_gif();
     let tokio = seam.tokio();
     let user = seam.user.clone();
     tokio
@@ -230,6 +219,67 @@ fn seam_a_gif_plays_then_freezes_until_replayed(cx: &mut TestAppContext) {
     assert!(!plays(&mut seam), "it froze past its loops");
     seam.cx.simulate_keystrokes("p");
     assert!(plays(&mut seam), "`p` plays it again");
+}
+
+/// The newest images get the animation slots, whatever their order of
+/// arrival.
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_the_newest_gifs_get_the_animation_slots(cx: &mut TestAppContext) {
+    let mut seam = start(cx);
+    let (bob, chat, bob_name) = seam.contact();
+    let gif = small_gif();
+    let tokio = seam.tokio();
+    let user = seam.user.clone();
+    for n in 0..8 {
+        tokio
+            .block_on(seam.backend().send_attachment(
+                chat,
+                &bob,
+                &[&user],
+                &gif,
+                &format!("moves-{n}.gif"),
+            ))
+            .unwrap();
+    }
+    seam.open(&bob_name);
+    seam.until(
+        "the newest six moving, the oldest two still",
+        |workspace, cx| {
+            workspace.read_with(cx, |workspace, cx| {
+                let conversation = workspace.conversation.read(cx);
+                let Some(messages) = conversation.messages_entity() else {
+                    return false;
+                };
+                let moving: Vec<bool> = messages
+                    .read(cx)
+                    .messages()
+                    .iter()
+                    .filter_map(|message| match &message.body {
+                        crate::model::MessageBody::Attachment(a) => Some(a.animation.is_some()),
+                        _ => None,
+                    })
+                    .collect();
+                moving == [false, false, true, true, true, true, true, true]
+            })
+        },
+    );
+}
+
+fn small_gif() -> Vec<u8> {
+    let mut gif = Vec::new();
+    let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+    let frames = (0..2u8).map(|n| {
+        image::Frame::from_parts(
+            image::RgbaImage::from_pixel(8, 8, image::Rgba([n * 200, 20, 30, 255])),
+            0,
+            0,
+            image::Delay::from_numer_denom_ms(30, 1),
+        )
+    });
+    encoder.encode_frames(frames).unwrap();
+    drop(encoder);
+    gif
 }
 
 /// The attachment of the open chat's newest message.
@@ -267,6 +317,11 @@ fn seam_a_reply_jumps_to_an_original_outside_the_window(cx: &mut TestAppContext)
                 .unwrap()
             }
         };
+        // Older ones too: its place in the loaded window is then in the
+        // middle, where a reveal needs the heights it doesn't have yet.
+        for n in 100..170 {
+            send(format!("older {n}"), None, n).await;
+        }
         let original = send("the original".into(), None, 0).await.id();
         let mimi_id = loop {
             let stored = user.message(original).await.unwrap().unwrap();
@@ -304,10 +359,16 @@ fn seam_a_reply_jumps_to_an_original_outside_the_window(cx: &mut TestAppContext)
             let Some(messages) = conversation.messages_entity() else {
                 return false;
             };
-            conversation
-                .cursor()
-                .and_then(|ix| messages.read(cx).messages().get(ix).cloned())
-                .is_some_and(|message| message.plain_text() == "the original")
+            let Some(cursor) = conversation.cursor() else {
+                return false;
+            };
+            let on_it = messages
+                .read(cx)
+                .messages()
+                .get(cursor)
+                .is_some_and(|message| message.plain_text() == "the original");
+            // On it, and on screen: the cursor alone proves neither.
+            on_it && conversation.is_in_view(cursor)
         })
     });
 }

@@ -301,21 +301,34 @@ const MAX_ANIMATION_FRAMES: usize = 240;
 /// still. A preview-box GIF of about 80 frames.
 const MAX_ANIMATION_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Animations decoded per window at most (bounds them to 192 MiB, with
-/// their copies on the GPU); past that, images stay still.
+/// Animations decoded per window at most, failed decodes included: bounds
+/// them to 192 MiB (with their copies on the GPU), and the decoding a peer's
+/// files can ask for when a chat opens. Past that, images stay still.
 pub(super) const MAX_ANIMATIONS: usize = 6;
 
 /// The shortest frame delay played. Shorter ones, 0 above all, are played
-/// slower, as browsers do: a peer's file must not make every frame a redraw.
+/// slower, as browsers do. It sets how fast frames change, not how often
+/// the window redraws: gpui redraws at display rate while one is drawn,
+/// which `Animation::plays` bounds.
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(20);
 const SLOWED_FRAME_DELAY: Duration = Duration::from_millis(100);
 
+/// What a stored image turned out to be, for its animation.
+#[derive(Clone)]
+pub(super) enum Moving {
+    /// It doesn't move: costs nothing, so takes no slot.
+    Still,
+    /// It should, but is too large or can't be read. Decoding it cost as
+    /// much as an animation, so it holds a slot too.
+    Refused,
+    Animated(Animation),
+}
+
 /// The frames of a stored image the core found animated, for one already
-/// drawn as a preview (so never the original of a failed thumbnail). `None`
-/// when it is still, too large, or any of it can't be read.
-pub(super) async fn animation(user: &CoreUser, id: AttachmentId) -> Option<Animation> {
+/// drawn as a preview (so never the original of a failed thumbnail).
+pub(super) async fn animation(user: &CoreUser, id: AttachmentId) -> Moving {
     if !matches!(user.attachment_is_animated(id).await, Ok(Some(true))) {
-        return None;
+        return Moving::Still;
     }
     let bytes = match user.load_attachment(id).await {
         Ok(
@@ -323,17 +336,18 @@ pub(super) async fn animation(user: &CoreUser, id: AttachmentId) -> Option<Anima
             | AttachmentContent::Uploading(bytes)
             | AttachmentContent::UploadFailed(bytes),
         ) if bytes.len() <= MAX_PREVIEW_BYTES => bytes,
-        Ok(_) => return None,
+        Ok(_) => return Moving::Still,
         Err(err) => {
             error!("failed to load an attachment: {err:#}");
-            return None;
+            return Moving::Still;
         }
     };
     match tokio::task::spawn_blocking(move || decode_animation(&bytes)).await {
-        Ok(animation) => animation,
+        Ok(Some(animation)) => Moving::Animated(animation),
+        Ok(None) => Moving::Refused,
         Err(err) => {
             error!("animation decode panicked: {err}");
-            None
+            Moving::Refused
         }
     }
 }
@@ -868,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_delay_never_redraws_every_frame() {
+    fn a_zero_delay_plays_slowed() {
         let animation = decode_animation(&gif(1, 1, 2, 0)).unwrap();
         assert_eq!(animation.loop_time, SLOWED_FRAME_DELAY * 2);
     }

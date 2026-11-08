@@ -1383,3 +1383,51 @@ Fixed (low):
 Fixed (low): a release built with the `seam` feature only refused to
 start; it now fails to compile (`compile_error!` without
 `debug_assertions`), and the startup exit stays for debug builds.
+
+## Gate 23 — milestone 21, messaging gaps (`30d9b99..1227884`): BLOCK
+
+Fixed (high):
+- A peer's "😀" + a million newlines + "😀" counted as emoji-only and went
+  to layout whole, bypassing markdown's size cap: 14.8 s first draw, about
+  6.7 s per redraw. Now at most 256 bytes, one line, spaces only.
+- A jump moved the cursor but not the view: following the tail snapped it
+  back, and a replaced window's items had no heights for the reveal. Jumps
+  scroll by index; cursor moves off screen pause following. The seam test
+  checked only the cursor, and its target sat at index 0, where a broken
+  reveal lands correctly: it now has older messages before the target and
+  checks it is in view (fails without the fix).
+
+Fixed (medium):
+- `show` cancelled the countdown timer it had just started.
+- Failed animation decodes had no budget and ran inside `convert`, holding
+  up the window. Decoding runs after the update is sent; a failed decode
+  holds a slot.
+- Slots went to the oldest images and weren't given back. Newest first now,
+  after pruning; older ones lose theirs. `seam_the_newest_gifs_get_the_animation_slots`.
+- A 240-frame GIF of long delays could keep the window redrawing for days,
+  and a comment claimed slow frames reduced redraws (gpui redraws at display
+  rate while one is drawn). Limited play stops at 30 s too; comment fixed.
+
+Fixed (low): `expires_label` rounded from whole seconds; `p` on a playing
+animation doesn't restart it (comment corrected, not behaviour).
+
+Not reproduced as stated: "about 5 Gpx per chat open" from failed decodes.
+Frames kept are at least about a quarter of the source's pixels, so the
+32 MiB limit stops a decode near 30 Mpx; with the 6 slots, under 200 Mpx.
+
+Accepted (low):
+- Slots go to the window's newest images, not the ones in view: after a jump
+  into old history, images there can stay still.
+- The worker takes no commands while decoding, so a jump can wait for up to
+  6 bounded decodes.
+- No seam test of a failed decode holding a slot: the harness sends what the
+  core accepts, and a file the core can't read gets no preview at all.
+- With the limit setting off, a looping image redraws at display rate for as
+  long as it is in view (the user's choice).
+- Frozen animations show the still preview (usually the first frame), where
+  upstream keeps the last.
+
+Incident: the reviewer ran probes with `CARGO_TARGET_DIR` set to the project's
+`target/`, then ran `cargo clean -p air-desktop --profile dev` to undo it,
+deleting 65.6 GiB of rebuildable artifacts (80G to 23G). No tracked file
+changed. Gate briefs now say to build elsewhere and never clean.

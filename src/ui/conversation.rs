@@ -270,7 +270,15 @@ impl Conversation {
             Some(
                 cx.subscribe_in(&messages, window, |this, _, event, window, cx| {
                     match event {
-                        MessagesEvent::Revealed(ix) => this.set_cursor(Some(*ix), cx),
+                        MessagesEvent::Revealed(ix) => {
+                            this.set_cursor(Some(*ix), cx);
+                            // By index: it stops following the tail, and the
+                            // items of a replaced window have no heights yet.
+                            this.list.scroll_to(ListOffset {
+                                item_ix: *ix,
+                                offset_in_item: px(0.),
+                            });
+                        }
                         MessagesEvent::RevealFailed => {
                             crate::ui::show_refusal("Couldn't show that message".into(), window, cx)
                         }
@@ -291,7 +299,6 @@ impl Conversation {
         self.reacting = false;
         self.shown = None;
         self.animations.borrow_mut().clear();
-        self.request_tick = None;
         self.probes.borrow_mut().shown = None;
         if loaded {
             self.scroll_to_start(cx);
@@ -423,6 +430,13 @@ impl Conversation {
     #[cfg(test)]
     pub fn messages_entity(&self) -> Option<&Entity<Messages>> {
         self.messages.as_ref()
+    }
+
+    /// Whether the message at `ix` was on screen in the last frame (seam
+    /// tests).
+    #[cfg(all(test, feature = "seam"))]
+    pub fn is_in_view(&self, ix: usize) -> bool {
+        self.shown.as_ref().is_some_and(|s| s.range.contains(&ix))
     }
 
     /// Whether an image is being opened (seam tests).
@@ -629,6 +643,12 @@ impl Conversation {
         // Follows the cursor, while there is something to react to.
         self.reacting &= self.reactable(cx).is_some();
         if let Some(ix) = cursor {
+            // Off screen, following the tail would undo the reveal. On the
+            // newest message, the view may go on following.
+            let in_view = self.shown.as_ref().is_some_and(|s| s.range.contains(&ix));
+            if !in_view && ix + 1 < self.messages(cx).len() {
+                self.list.pause_following_tail();
+            }
             // Revealing it pages in more, as scrolling does.
             self.list.scroll_to_reveal_item(ix);
         }
@@ -649,7 +669,8 @@ impl Conversation {
         animation.plays(started.elapsed(), limited)
     }
 
-    /// Plays the animation under the cursor from the start.
+    /// Gives the animation under the cursor its loops again. A stopped one
+    /// plays from the start; a playing one goes on from where it is.
     fn replay_animation(
         &mut self,
         _: &ReplayAnimation,
@@ -1919,11 +1940,7 @@ fn render_attachment(attachment: &Attachment, moving: bool, under_cursor: bool) 
     v_flex()
         .gap_1()
         .children(attachment.image.as_ref().map(|picture| {
-            let shown = attachment
-                .animation
-                .as_ref()
-                .filter(|_| moving)
-                .map_or(picture, |animation| &animation.picture);
+            let shown = attachment.drawn(moving).unwrap_or(picture);
             let (width, height) = crate::model::fit(picture.size(), crate::model::PREVIEW_BOX);
             // gpui keeps the playing frame by the element's id.
             img(ImageSource::Render(shown.0.clone()))
@@ -2057,6 +2074,88 @@ mod tests {
         );
         // Fixed messages can't load more; a live window would.
         assert_eq!(jump_from(3), (Some(3), told("Couldn't show that message")));
+    }
+
+    #[gpui::test]
+    fn a_jump_shows_its_target_even_when_following_the_tail(cx: &mut gpui::TestAppContext) {
+        let (window, conversation) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::settings::SettingsStore::open(None, cx);
+            crate::theme::init(None, cx).unwrap();
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| Conversation::new(window, cx))
+            })
+            .unwrap()
+        });
+        let cx = gpui::VisualTestContext::from_window(window, cx).into_mut();
+        cx.update(|window, _| window.activate_window());
+        let start = Utc::now() - chrono::Duration::hours(1);
+        let history: Vec<_> = (0..200)
+            .map(|n| {
+                let sender = (UserId("u".into()), "Ada".into(), false);
+                let id = MessageId(format!("m{n}").into());
+                let at = start + chrono::Duration::seconds(n);
+                Message::text(id, sender, &format!("message {n}"), at)
+            })
+            .collect();
+        let messages = cx.new(|_| Messages::fixed(history));
+        let chat = crate::model::mock::chats().remove(0);
+        conversation.update_in(cx, |conversation, window, cx| {
+            conversation.show(chat, messages, cx.new(|_| Composer::fixed()), window, cx)
+        });
+        cx.run_until_parked();
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            conversation
+                .read_with(cx, |c, _| c.shown.clone())
+                .unwrap()
+                .range
+        };
+        assert!(shown(cx).contains(&199), "it opens at the newest");
+
+        conversation.update(cx, |conversation, cx| {
+            conversation.jump_to(&MessageId("m10".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(shown(cx).contains(&10), "the jump showed {:?}", shown(cx));
+        assert_eq!(conversation.read_with(cx, |c, _| c.cursor), Some(10));
+
+        // A cursor move off screen isn't undone by following the tail either.
+        conversation.update(cx, |conversation, cx| {
+            conversation.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(shown(cx).contains(&199));
+        conversation.update(cx, |conversation, cx| conversation.set_cursor(Some(20), cx));
+        cx.run_until_parked();
+        assert!(shown(cx).contains(&20), "the move showed {:?}", shown(cx));
+    }
+
+    #[gpui::test]
+    fn an_open_requests_countdown_keeps_redrawing(cx: &mut gpui::TestAppContext) {
+        let (window, conversation) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::settings::SettingsStore::open(None, cx);
+            crate::theme::init(None, cx).unwrap();
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| Conversation::new(window, cx))
+            })
+            .unwrap()
+        });
+        let cx = gpui::VisualTestContext::from_window(window, cx).into_mut();
+        let mut show = |expires| {
+            let chat = ChatSummary {
+                request_expires: expires,
+                ..crate::model::mock::chats().remove(0)
+            };
+            conversation.update_in(cx, |conversation, window, cx| {
+                let messages = cx.new(|_| Messages::fixed(Vec::new()));
+                conversation.show(chat, messages, cx.new(|_| Composer::fixed()), window, cx);
+                conversation.request_tick.is_some()
+            })
+        };
+        assert!(show(Some(Utc::now() + chrono::Duration::days(1))));
+        assert!(!show(None), "a chat with no request has no timer");
     }
 
     #[gpui::test]

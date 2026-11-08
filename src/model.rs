@@ -513,11 +513,26 @@ pub struct Animation {
 /// Times an animation plays by itself when limited. As upstream.
 const MAX_AUTO_LOOPS: u32 = 3;
 
+/// How long an animation plays by itself when limited, however long its
+/// loops: gpui redraws the conversation at display rate while one is drawn,
+/// whatever its frame delays, and a peer chooses those.
+const MAX_AUTO_PLAY: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Animation {
-    /// Whether it still plays, `played` after it started: past its loops
-    /// it freezes, when `limited`.
+    /// Whether it still plays, `played` after it started: past its loops or
+    /// [`MAX_AUTO_PLAY`] it freezes, when `limited`.
     pub fn plays(&self, played: std::time::Duration, limited: bool) -> bool {
-        !limited || played < self.loop_time * MAX_AUTO_LOOPS
+        !limited || played < MAX_AUTO_PLAY.min(self.loop_time.saturating_mul(MAX_AUTO_LOOPS))
+    }
+}
+
+impl Attachment {
+    /// What the view draws: the animation while `moving`, else the still.
+    pub fn drawn(&self, moving: bool) -> Option<&Picture> {
+        let animation = self.animation.as_ref().filter(|_| moving);
+        animation
+            .map(|animation| &animation.picture)
+            .or(self.image.as_ref())
     }
 }
 
@@ -1014,7 +1029,7 @@ pub fn expires_label(expires: DateTime<Utc>, now: DateTime<Utc>) -> Option<Strin
         format!("Expires in {count} {unit}{plural}")
     };
     let round_up = |unit: chrono::Duration| {
-        let (remaining, unit) = (remaining.num_seconds(), unit.num_seconds());
+        let (remaining, unit) = (remaining.num_milliseconds(), unit.num_milliseconds());
         (remaining + unit - 1) / unit
     };
     if remaining <= chrono::Duration::zero() {
@@ -1039,11 +1054,20 @@ pub fn expires_label(expires: DateTime<Utc>, now: DateTime<Utc>) -> Option<Strin
 /// Most emoji a message can have and still show large. As upstream.
 const MAX_JUMBO_EMOJI: usize = 5;
 
-/// Whether a message is only a few emoji (and spaces), which show large.
+/// Longest message that can show large: drawn as it came, on the UI thread
+/// at every redraw, so a peer's text must not reach layout unbounded.
+const MAX_JUMBO_BYTES: usize = 256;
+
+/// Whether a message is only a few emoji on one line, which show large.
+/// Spaces only: a line break (or any other whitespace) makes it a plain
+/// message, whose rendering has its own limits.
 pub fn is_jumbo_emoji(source: &str) -> bool {
     use unicode_segmentation::UnicodeSegmentation as _;
+    if source.len() > MAX_JUMBO_BYTES {
+        return false;
+    }
     let mut count = 0;
-    for grapheme in source.graphemes(true).filter(|g| !g.trim().is_empty()) {
+    for grapheme in source.graphemes(true).filter(|g| *g != " ") {
         count += 1;
         if count > MAX_JUMBO_EMOJI || emojis::get(grapheme).is_none() {
             return false;
@@ -1380,6 +1404,10 @@ mod tests {
         );
         assert_eq!(label(Duration::seconds(60)), says("Expires in 1 minute"));
         assert_eq!(label(Duration::seconds(61)), says("Expires in 2 minutes"));
+        assert_eq!(
+            label(Duration::milliseconds(60_500)),
+            says("Expires in 2 minutes")
+        );
         // Rounding up reads as the next unit, never "60 minutes".
         assert_eq!(label(Duration::seconds(3599)), says("Expires in 1 hour"));
         assert_eq!(label(Duration::hours(1)), says("Expires in 1 hour"));
@@ -1396,6 +1424,15 @@ mod tests {
         for plain in ["", "  ", "hi", "😀 hi", "😀😀😀😀😀😀", "*😀*", "1"] {
             assert!(!is_jumbo_emoji(plain), "{plain}");
         }
+        // A peer's text reaches layout only bounded, and on one line.
+        for huge in [
+            format!("😀{}😀", "\n".repeat(1_000_000)),
+            format!("😀{}😀", " ".repeat(1_000_000)),
+            "😀\n😀".to_string(),
+            "😀\u{2028}😀".to_string(),
+        ] {
+            assert!(!is_jumbo_emoji(&huge), "{}", huge.len());
+        }
     }
 
     #[test]
@@ -1408,6 +1445,28 @@ mod tests {
         assert!(animation.plays(Span::from_millis(5999), true));
         assert!(!animation.plays(Span::from_secs(6), true));
         assert!(animation.plays(Span::from_secs(600), false));
+
+        // Slow frames don't keep the window redrawing for days.
+        let slow = Animation {
+            loop_time: Span::from_secs(157_000),
+            ..animation.clone()
+        };
+        assert!(slow.plays(Span::from_secs(29), true));
+        assert!(!slow.plays(Span::from_secs(30), true));
+
+        // What is drawn follows: the still once it stops.
+        let still = Picture(Arc::new(gpui_kit::RenderImage::new(Vec::new())));
+        let attachment = Attachment {
+            id: AttachmentId(uuid::Uuid::nil()),
+            name: "f".into(),
+            description: None,
+            size: 1,
+            state: AttachmentState::Ready,
+            image: Some(still.clone()),
+            animation: Some(animation.clone()),
+        };
+        assert_eq!(attachment.drawn(true), Some(&animation.picture));
+        assert_eq!(attachment.drawn(false), Some(&still));
     }
 
     fn message(sender_id: &str, sender_name: &str) -> Message {

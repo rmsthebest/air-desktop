@@ -53,8 +53,9 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     `o` on a reply jumps to its original (`Messages::jump_to_message`:
     only a message of this chat; the window is replaced around it when it
     isn't loaded; only what then shows counts as read), a click on the
-    quote too. Messages of only 1–5 emoji show large
-    (`model::is_jumbo_emoji`).
+    quote too; it scrolls by index, as a replaced window has no heights
+    yet. Messages of only 1–5 emoji on one line (≤ 256 bytes) show large
+    (`model::is_jumbo_emoji`), drawn from the source, so its bound matters.
     `set_reaction` adds or retracts as the view decided (detached, like
     sends; the core ignores a repeated add). The picker
     (`+`, then 1–6) is a bar under the list, not part of a list item, so
@@ -127,10 +128,14 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     edge, 80 MiB, 32 MiB file; kept ≤ 2048²), in a dialog whose closing
     drops the texture. An image the core says moves also decodes its
     original (GIF, WebP, APNG; ≤ 8 MiB) by `decode_animation`: 1024² canvas,
-    240 frames, 32 MiB of frames, 6 per window, delays under 20 ms slowed
-    to 100 ms; past any limit it stays still. gpui plays the frames; the
-    view swaps to the still preview after 3 loops (`limit_animation_loops`
-    setting, on by default), and `p` plays it again.
+    240 frames, 32 MiB of frames, delays under 20 ms slowed to 100 ms; past
+    any limit it stays still. After each update is sent, the worker gives
+    the window's 6 newest such images the slots (`fill_animations`; a failed
+    decode holds one too, older ones lose theirs). gpui plays the frames
+    and redraws at display rate meanwhile, whatever the delays: the view
+    swaps to the still preview after 3 loops or 30 s
+    (`limit_animation_loops` setting, on by default), and `p` gives it its
+    loops again.
     Sending: `:attach <path>`, the file
     dialog (`AttachFile`) or dropping files on the chat (confirmed
     first); several files go one after another.

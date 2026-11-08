@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::markdown;
 use crate::model::{
-    Animation, ChatId, Message, MessageBody, MessageId, MessageStatus, Picture, Quote, UserId,
+    ChatId, Message, MessageBody, MessageId, MessageStatus, Picture, Quote, UserId,
 };
 use crate::runtime::{Tokio, TokioTask};
 use crate::session::attachments;
@@ -632,6 +632,8 @@ struct Key {
     awaits: Option<MimiId>,
     /// Its attachment, to refresh it as the download goes.
     attachment: Option<CoreAttachmentId>,
+    /// It shows a preview, so it may have an animation too.
+    previewed: bool,
     /// Its preview wasn't decoded for want of room (see
     /// [`attachments::MAX_PICTURES`]): reloaded once there is.
     undrawn: bool,
@@ -732,9 +734,9 @@ struct Worker {
     /// Decoded previews shown in the window, so a reload (a reaction, a
     /// status change) doesn't decode again.
     pictures: HashMap<CoreAttachmentId, Picture>,
-    /// Likewise the animations, and which images were found still or too
-    /// large (`None`), to not decode those again either.
-    animations: HashMap<CoreAttachmentId, Option<Animation>>,
+    /// What previewed images turned out to be, so nothing decodes twice.
+    /// Filled after each update, newest first (see `fill_animations`).
+    animations: HashMap<CoreAttachmentId, attachments::Moving>,
     tx: mpsc::Sender<Update>,
 }
 
@@ -795,7 +797,19 @@ impl Worker {
         }
     }
 
+    /// Sends the update, then decodes the animations it brought into view.
     async fn send(
+        &mut self,
+        changes: Vec<Change<Message>>,
+        first_unread: Option<Option<MessageId>>,
+        scroll_to_bottom: bool,
+    ) -> Result<(), Closed> {
+        self.publish(changes, first_unread, scroll_to_bottom)
+            .await?;
+        self.fill_animations().await
+    }
+
+    async fn publish(
         &mut self,
         mut changes: Vec<Change<Message>>,
         first_unread: Option<Option<MessageId>>,
@@ -900,8 +914,10 @@ impl Worker {
             Ok((messages, has_older, has_newer)) => {
                 let items = self.convert_all(messages).await;
                 let changes = self.window.replace(items, has_older, has_newer);
-                self.send(changes, None, false).await?;
-                self.reveal(Some(shown)).await
+                self.publish(changes, None, false).await?;
+                // Shown before any animation decodes.
+                self.reveal(Some(shown)).await?;
+                self.fill_animations().await
             }
             Err(err) => {
                 error!("failed to load the messages around a jump: {err:#}");
@@ -1092,6 +1108,58 @@ impl Worker {
         edits
     }
 
+    /// Gives the newest previewed images the animation slots: decodes what
+    /// has a slot and hasn't been looked at, and takes the slot from older
+    /// ones past [`attachments::MAX_ANIMATIONS`]. Runs after an update is
+    /// sent, so a peer's files never hold up the messages; each result goes
+    /// out as it lands.
+    async fn fill_animations(&mut self) -> Result<(), Closed> {
+        use attachments::Moving;
+        let previews: Vec<_> = self
+            .window
+            .keys
+            .iter()
+            .rev()
+            .filter(|key| key.previewed)
+            .filter_map(|key| Some((key.id, key.attachment?)))
+            .collect();
+        let mut slots = 0;
+        for (message, attachment) in previews {
+            let room = slots < attachments::MAX_ANIMATIONS;
+            let changed = match self.animations.get(&attachment) {
+                Some(Moving::Still) => false,
+                Some(Moving::Refused) if room => {
+                    slots += 1;
+                    false
+                }
+                Some(Moving::Animated(_)) if room => {
+                    slots += 1;
+                    false
+                }
+                // Forgotten: if it gets a slot again, it decodes again.
+                Some(moving) => {
+                    let animated = matches!(moving, Moving::Animated(_));
+                    self.animations.remove(&attachment);
+                    animated
+                }
+                None if room => {
+                    let moving = attachments::animation(&self.user, attachment).await;
+                    let animated = matches!(moving, Moving::Animated(_));
+                    slots += usize::from(!matches!(moving, Moving::Still));
+                    self.animations.insert(attachment, moving);
+                    animated
+                }
+                None => false,
+            };
+            if changed && let Ok(Some(stored)) = self.user.message(message).await {
+                let (key, item) = self.convert(stored).await;
+                let edits = self.window.patch(key, item).into_iter().collect();
+                self.publish(edits, None, false).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Reloads the messages showing any of `attachments`.
     async fn reload_with(&mut self, attachments: &[CoreAttachmentId]) -> Vec<Change<Message>> {
         let ids: Vec<_> = self
@@ -1162,20 +1230,6 @@ impl Worker {
         items
     }
 
-    /// The attachment's animation, decoded once, while there is room.
-    async fn animation(&mut self, id: CoreAttachmentId) -> Option<Animation> {
-        if let Some(known) = self.animations.get(&id) {
-            return known.clone();
-        }
-        let decoded = self.animations.values().flatten().count();
-        if decoded >= attachments::MAX_ANIMATIONS {
-            return None;
-        }
-        let animation = attachments::animation(&self.user, id).await;
-        self.animations.insert(id, animation.clone());
-        animation
-    }
-
     async fn name(&mut self, user: &CoreUserId) -> SharedString {
         if let Some(name) = self.names.get(user) {
             return name.clone();
@@ -1207,6 +1261,7 @@ impl Worker {
         };
         let mut attachment = None;
         let mut undrawn = false;
+        let mut previewed = false;
         let body = if deleted {
             MessageBody::Notice("Message deleted".into())
         } else if message.status() == CoreStatus::Hidden {
@@ -1234,8 +1289,11 @@ impl Worker {
                             {
                                 Some((id, mut shown)) => {
                                     attachment = Some(id);
-                                    if shown.image.is_some() {
-                                        shown.animation = self.animation(id).await;
+                                    previewed = shown.image.is_some();
+                                    if let Some(attachments::Moving::Animated(animation)) =
+                                        self.animations.get(&id)
+                                    {
+                                        shown.animation = Some(animation.clone());
                                     }
                                     match &shown.image {
                                         Some(picture) => {
@@ -1329,6 +1387,7 @@ impl Worker {
                 _ => None,
             },
             attachment,
+            previewed,
             undrawn,
         };
         let item = Message {
@@ -1392,6 +1451,7 @@ mod tests {
             quotes: None,
             awaits: None,
             attachment: None,
+            previewed: false,
             undrawn: false,
         }
     }

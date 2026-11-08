@@ -12,6 +12,11 @@ use airserver_test_harness::utils::setup::TestBackend;
 use super::*;
 use crate::runtime::Tokio;
 
+/// The recipients a test's peer names when sending: none, so the session's
+/// own listener receives it (the harness draining the same queue would race
+/// with it).
+const NOBODY: &[&CoreUser] = &[];
+
 /// A backend and a workspace signed in as its first user.
 struct Seam<'a> {
     /// The runtime the core and the backend run on: a test's own steps
@@ -136,11 +141,10 @@ impl Seam<'_> {
     /// `peer` sends the user a picture in `chat`.
     fn send_picture(&mut self, peer: &CoreUser, chat: aircoreclient::ChatId) {
         let tokio = self.tokio();
-        let user = self.user.clone();
         tokio
             .block_on(
                 self.backend()
-                    .send_attachment(chat, peer, &[&user], &webp(), "red.webp"),
+                    .send_attachment(chat, peer, NOBODY, &webp(), "red.webp"),
             )
             .unwrap();
     }
@@ -193,11 +197,10 @@ fn seam_a_gif_plays_then_freezes_until_replayed(cx: &mut TestAppContext) {
     let (bob, chat, bob_name) = seam.contact();
     let gif = small_gif();
     let tokio = seam.tokio();
-    let user = seam.user.clone();
     tokio
         .block_on(
             seam.backend()
-                .send_attachment(chat, &bob, &[&user], &gif, "moves.gif"),
+                .send_attachment(chat, &bob, NOBODY, &gif, "moves.gif"),
         )
         .unwrap();
     seam.open(&bob_name);
@@ -230,13 +233,12 @@ fn seam_the_newest_gifs_get_the_animation_slots(cx: &mut TestAppContext) {
     let (bob, chat, bob_name) = seam.contact();
     let gif = small_gif();
     let tokio = seam.tokio();
-    let user = seam.user.clone();
     for n in 0..8 {
         tokio
             .block_on(seam.backend().send_attachment(
                 chat,
                 &bob,
-                &[&user],
+                NOBODY,
                 &gif,
                 &format!("moves-{n}.gif"),
             ))
@@ -268,12 +270,92 @@ fn seam_the_newest_gifs_get_the_animation_slots(cx: &mut TestAppContext) {
     tokio
         .block_on(
             seam.backend()
-                .send_attachment(chat, &bob, &[&user], &gif, "moves-8.gif"),
+                .send_attachment(chat, &bob, NOBODY, &gif, "moves-8.gif"),
         )
         .unwrap();
     seam.until("the slot passed on", |workspace, cx| {
         moving(workspace, cx) == [false, false, false, true, true, true, true, true, true]
     });
+}
+
+/// An image we refuse to play holds a slot, as it was read and decoded: the
+/// limit on work per window holds, with a stock client's files. So six of
+/// them keep the rest of a chat still, and five don't.
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_refused_animations_hold_their_slots(cx: &mut TestAppContext) {
+    let mut seam = start(cx);
+    let (bob, bob_chat, bob_name) = seam.contact();
+    let (carol, carol_chat, carol_name) = seam.contact();
+    let small = small_gif();
+    // Past the frame limit, each frame unlike the last, as the sender's core
+    // merges frames that look alike: a frame's pixels spell out its number.
+    let mut refused = Vec::new();
+    let mut encoder = image::codecs::gif::GifEncoder::new(&mut refused);
+    let frames = (0..300u32).map(|n| {
+        let image = image::RgbaImage::from_fn(16, 16, |x, y| {
+            let bit = (n >> ((x + y) % 9)) & 1;
+            image::Rgba([(bit * 255) as u8, 0, 0, 255])
+        });
+        image::Frame::from_parts(image, 0, 0, image::Delay::from_numer_denom_ms(30, 1))
+    });
+    encoder.encode_frames(frames).unwrap();
+    drop(encoder);
+    let tokio = seam.tokio();
+    let mut send = |peer: &CoreUser, chat, file: &Vec<u8>| {
+        tokio
+            .block_on(
+                seam.backend()
+                    .send_attachment(chat, peer, NOBODY, file, "moves.gif"),
+            )
+            .unwrap();
+    };
+    send(&bob, bob_chat, &small);
+    send(&carol, carol_chat, &small);
+    for _ in 0..5 {
+        send(&bob, bob_chat, &refused);
+        send(&carol, carol_chat, &refused);
+    }
+    send(&carol, carol_chat, &refused);
+
+    let shown = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        workspace.read_with(cx, |workspace, cx| {
+            let conversation = workspace.conversation.read(cx);
+            let Some(messages) = conversation.messages_entity() else {
+                return (0, 0);
+            };
+            let attachments = || {
+                messages
+                    .read(cx)
+                    .messages()
+                    .iter()
+                    .filter_map(|message| match &message.body {
+                        crate::model::MessageBody::Attachment(a) => Some(a),
+                        _ => None,
+                    })
+            };
+            (
+                attachments().filter(|a| a.image.is_some()).count(),
+                attachments().filter(|a| a.animation.is_some()).count(),
+            )
+        })
+    };
+    seam.open(&bob_name);
+    seam.until("the small one moving past five refused", |workspace, cx| {
+        shown(workspace, cx) == (6, 1)
+    });
+
+    seam.open(&carol_name);
+    seam.until("all seven previewed", |workspace, cx| {
+        shown(workspace, cx).0 == 7
+    });
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        seam.cx.run_until_parked();
+        let moving = shown(&seam.workspace, seam.cx).1;
+        assert_eq!(moving, 0, "six refused files leave no slot");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn small_gif() -> Vec<u8> {

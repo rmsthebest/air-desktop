@@ -302,8 +302,9 @@ const MAX_ANIMATION_FRAMES: usize = 240;
 const MAX_ANIMATION_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Animations decoded per window at most, failed decodes included: bounds
-/// them to 192 MiB (with their copies on the GPU), and the decoding a peer's
-/// files can ask for when a chat opens. Past that, images stay still.
+/// them to 192 MiB (with their copies on the GPU) once `fill_animations`
+/// settles, and the decoding a peer's files can ask for when a chat opens.
+/// Past that, images stay still, so a peer can use up the slots of a chat.
 pub(super) const MAX_ANIMATIONS: usize = 6;
 
 /// The shortest frame delay played. Shorter ones, 0 above all, are played
@@ -316,8 +317,8 @@ const SLOWED_FRAME_DELAY: Duration = Duration::from_millis(100);
 /// What a stored image turned out to be, for its animation.
 #[derive(Clone)]
 pub(super) enum Moving {
-    /// It doesn't move, or its content isn't here: little was read, so it
-    /// takes no slot.
+    /// It doesn't move, or its content isn't here: nothing to play or decode,
+    /// so it takes no slot.
     Still,
     /// It should, but is too large or can't be read. Reading and decoding
     /// it cost as much as an animation, so it holds a slot too.
@@ -352,8 +353,9 @@ pub(super) async fn animation(user: &CoreUser, id: AttachmentId) -> Moving {
     }
 }
 
-/// What a moving image's bytes, read whole, come to. Air's clients re-encode
-/// images when sending, so an oversize one takes a modified client.
+/// What a moving image's bytes, read whole, come to. The core sets no limit
+/// like ours on what it sends: a stock client's long or large GIF is refused
+/// here, and stays still.
 fn moving(bytes: &[u8]) -> Moving {
     if bytes.len() > MAX_PREVIEW_BYTES {
         return Moving::Refused;
@@ -897,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn what_was_read_whole_holds_a_slot_even_refused() {
+    fn an_oversize_or_broken_animation_is_refused() {
         let small = gif(4, 4, 2, 50);
         assert!(matches!(moving(&small), Moving::Animated(_)));
         // Valid past its end, so only the size refuses it.

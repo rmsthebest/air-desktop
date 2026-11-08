@@ -1019,7 +1019,12 @@ impl Worker {
                 }
                 DbEntityId::Attachment(id) => {
                     self.pictures.remove(id);
-                    self.animations.remove(id);
+                    // A stored file's bytes don't change: what they decoded
+                    // to stands, and a playing image keeps playing. Only
+                    // "still" can be out of date (its content wasn't here).
+                    if matches!(self.animations.get(id), Some(attachments::Moving::Still)) {
+                        self.animations.remove(id);
+                    }
                     attachments_changed.push(*id);
                 }
                 _ => {}
@@ -1132,8 +1137,8 @@ impl Worker {
                 Some(Moving::Refused) => {
                     self.animations.remove(&attachment);
                 }
-                // Forgotten only once the view can be told, so what it holds
-                // never goes past the bound; else tried again next time.
+                // Forgotten only once the view can be told; else tried again
+                // next time.
                 Some(Moving::Animated(_)) => match self.user.message(message).await {
                     Ok(stored) => {
                         self.animations.remove(&attachment);
@@ -1149,7 +1154,11 @@ impl Worker {
                     if animated {
                         match self.user.message(message).await {
                             Ok(stored) => self.publish_reloaded(stored).await?,
-                            Err(err) => error!("failed to reload a message: {err:#}"),
+                            // The view can't have it: decoded again next time.
+                            Err(err) => {
+                                self.animations.remove(&attachment);
+                                error!("failed to reload a message: {err:#}");
+                            }
                         }
                     }
                 }

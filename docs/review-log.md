@@ -1420,8 +1420,8 @@ Accepted (low):
   into old history, images there can stay still.
 - The worker takes no commands while decoding, so a jump can wait for up to
   6 bounded decodes.
-- No seam test of a failed decode holding a slot: the harness sends what the
-  core accepts, and a file the core can't read gets no preview at all.
+- No seam test of a failed decode holding a slot, on the belief that the
+  harness couldn't send one (wrong: see gate 23c, which adds it).
 - With the limit setting off, a looping image redraws at display rate for as
   long as it is in view (the user's choice).
 - Frozen animations show the still preview (usually the first frame), where
@@ -1451,6 +1451,37 @@ Fixed (low):
 Accepted (low):
 - The freeze isn't checked at draw level: the tests see `plays`, not which
   picture `render_attachment` chose. Reading only.
-- The refusal of an oversize animation is a unit test of `moving`, not a seam
-  test: Air's core re-encodes images when sending, so the harness can't send
-  one (a padded GIF arrives as a small WebP). Only a modified client can.
+- The refusal of an oversize animation is a unit test of `moving`. (The
+  reason first given here, that only a modified client can send one, was
+  wrong: see gate 23c.)
+
+## Gate 23c — gate 23b fixes (`8c35a18..032c51f`): PASS
+
+Corrected (medium): the code and this log said an oversize animation takes a
+modified client, and waived a seam test for that reason. The reviewer's probes
+through the real core show otherwise: a 21.9 MB GIF arrives as a 13.4 MB
+animated WebP with a preview, and a 241-frame GIF as a 46 KB one we refuse. The
+core has no limit like ours. `seam_refused_animations_hold_their_slots` covers
+it (six refused keep a small GIF still, five don't).
+
+Accepted (medium): with a stock client, a peer can send six such files to keep
+the other images of a chat's window still, and an ordinary long GIF stays still
+without saying why. The bounds on memory and reads hold.
+
+Fixed (low):
+- A failed reload after a decode left the worker holding frames the view never
+  got: forgotten now, so it decodes again next time.
+- A change to an attachment cleared its cached decode, so a file decoded twice
+  in one chat open, and a playing one would restart. A stored file's bytes
+  don't change: only "still" is cleared now. Covered by reading (no test: the
+  double decode depends on when notifications land).
+- Comments: the 6-animation bound holds once `fill_animations` settles (up to
+  12 while newer ones decode); "still" doesn't mean little was read.
+
+Fixed (test): peers' sends in the workspace seam tests named the user as a
+recipient, so the harness drained the queue the session's listener reads, and
+could panic on finding nothing. They name nobody now. The refused file's frames
+must differ a lot: the sending core merges look-alikes.
+
+The gate's own range was PASS and these fixes go to the next gate (milestone
+22's range starts at `032c51f`).

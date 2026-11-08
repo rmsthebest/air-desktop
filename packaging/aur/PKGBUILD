@@ -6,7 +6,7 @@ pkgrel=1
 pkgdesc='Keyboard-first desktop client for the Air messenger'
 arch=(x86_64)
 # Set with the public repository, as `repository` in Cargo.toml.
-url='https://FILL_IN_REPOSITORY/air-desktop'
+url='https://github.com/rmsthebest/air-desktop'
 license=(AGPL-3.0-or-later)
 # What the binary links, then what it loads at runtime: readelf can't see the
 # last four. It draws through Vulkan, and needs a font (none is bundled).

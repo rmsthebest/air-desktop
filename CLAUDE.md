@@ -249,8 +249,7 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 - `src/about.rs`, `src/logs.rs`, `src/ui/info_view.rs` — about, licenses, logs
   and debug info (`:about`, `:licenses`, `:logs`, `:debug-info`, a settings
   row), in place of the settings rows. `Cargo.toml`'s `repository` is the
-  source and issue link, shown as "not published yet" while empty: the AGPL
-  has us offer the source, so set it before a release. `just
+  source and issue link: the AGPL has us offer the source. `just
   regenerate-licenses` (needs cargo-about) rewrites `assets/licenses.json`
   after `Cargo.lock` changes; a test fails until then. Logs stay in memory
   (1000 lines, one per event, cleared on a device reset), as they can name
@@ -364,6 +363,8 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 - `just release-check` — builds the package from HEAD's tree as a tagged
   tarball would be (`packaging/aur/`). `depends` comes from `readelf -d` and
   what a running process maps: Vulkan and Wayland are loaded at runtime.
+- CI: `.github/workflows/package.yml` runs `packaging/ci-build.sh`, which runs
+  `just release-check` in a clean Arch container and uploads the package.
 - `just release-ready` — before tagging: fails while the source link or a
   placeholder in the package files is missing.
 - `cargo run` — run the app.

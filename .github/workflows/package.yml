@@ -1,0 +1,39 @@
+name: Package
+
+on:
+  push:
+    branches: [trunk]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  arch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      # A build takes about 15 GB; a runner starts with little more free.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the package
+        run: >
+          docker run --rm -v "$PWD:/src" -w /src archlinux:base-devel
+          packaging/ci-build.sh
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: air-desktop-arch-x86_64
+          path: target/release-check/*.pkg.tar.zst
+          if-no-files-found: error

@@ -2,7 +2,7 @@ pkgbase = air-desktop
 	pkgdesc = Keyboard-first desktop client for the Air messenger
 	pkgver = 0.1.0
 	pkgrel = 1
-	url = https://FILL_IN_REPOSITORY/air-desktop
+	url = https://github.com/rmsthebest/air-desktop
 	arch = x86_64
 	license = AGPL-3.0-or-later
 	makedepends = rustup
@@ -17,7 +17,7 @@ pkgbase = air-desktop
 	depends = ttf-font
 	optdepends = xdg-desktop-portal: file dialogs and opening links
 	options = !lto
-	source = air-desktop-0.1.0.tar.gz::https://FILL_IN_REPOSITORY/air-desktop/archive/refs/tags/v0.1.0.tar.gz
+	source = air-desktop-0.1.0.tar.gz::https://github.com/rmsthebest/air-desktop/archive/refs/tags/v0.1.0.tar.gz
 	sha256sums = FILL_IN_FROM_THE_TAGGED_TARBALL
 
 pkgname = air-desktop

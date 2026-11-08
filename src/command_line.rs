@@ -18,6 +18,7 @@ pub enum Command {
     /// Send a contact request to a username, as typed.
     AddContact(String),
     /// Register a username, as typed.
+    Info(crate::about::Page),
     AddUsername(String),
     RemoveUsername(String),
     /// Accept or decline the open chat's contact request.
@@ -139,6 +140,26 @@ const SPECS: &[Spec] = &[
         names: &["details"],
         arg: Arg::None,
         help: "Toggle the details pane",
+    },
+    Spec {
+        names: &["about"],
+        arg: Arg::None,
+        help: "About this app: version, source, reporting a problem",
+    },
+    Spec {
+        names: &["licenses"],
+        arg: Arg::None,
+        help: "The licenses of the crates this is made of",
+    },
+    Spec {
+        names: &["logs"],
+        arg: Arg::None,
+        help: "The latest log lines, kept in memory only",
+    },
+    Spec {
+        names: &["debug-info"],
+        arg: Arg::None,
+        help: "This account's debug info",
     },
     Spec {
         names: &["keymap"],
@@ -344,6 +365,10 @@ pub fn parse(input: &str) -> Result<Command, String> {
             _ => return Err(":appearance takes system, light or dark".into()),
         }),
         "details" => Command::ToggleDetails,
+        "about" => Command::Info(crate::about::Page::About),
+        "licenses" => Command::Info(crate::about::Page::Licenses),
+        "logs" => Command::Info(crate::about::Page::Logs),
+        "debug-info" => Command::Info(crate::about::Page::Debug),
         "keymap" => Command::Keymap(match normalize(arg).as_str() {
             "standard" => KeymapMode::Standard,
             "helix" => KeymapMode::Helix,

@@ -1,10 +1,12 @@
 // GPUI's derive macros emit `gpui::` paths; gpui-kit documents this alias.
 extern crate gpui_kit as gpui;
 
+mod about;
 mod actions;
 mod command_line;
 mod emoji;
 mod keymap;
+mod logs;
 mod markdown;
 mod model;
 mod notifier;
@@ -14,6 +16,7 @@ mod session;
 mod settings;
 mod theme;
 mod ui;
+mod username;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
@@ -32,10 +35,18 @@ const DEFAULT_LOG_FILTER: &str = "warn,air_desktop=info";
 compile_error!("the `seam` feature is for tests only; build releases without it");
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(|| logs::Writer),
         )
         .init();
 

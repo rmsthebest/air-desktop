@@ -56,7 +56,7 @@ out; desktop notifications stay Linux-only, as is the package.
 
 21. **Messaging gaps** (done). Jump to a replied-to message, animated images,
     large emoji-only messages, and a contact request's expiry countdown.
-22. **App and support screens**. About and licenses, help, logs, debug info,
+22. **App and support screens** (done). About and licenses, help, logs, debug info,
     the update-required screen and reminder, and a username suggestion.
 23. **Release readiness**. A PKGBUILD from tagged releases for the AUR, a
     `.desktop` file and icon, a data-directory lock, and the tests still

@@ -67,6 +67,9 @@ pub struct Settings {
     pub notifications: Notifications,
     /// Animated images stop by themselves after a few loops.
     pub limit_animation_loops: bool,
+    /// The announced end of this version whose reminder was dismissed (Unix
+    /// seconds): a later date reminds again.
+    pub dismissed_version_expiry: Option<i64>,
 }
 
 impl Default for Settings {
@@ -80,6 +83,7 @@ impl Default for Settings {
             chat_list_width: 320.,
             notifications: Notifications::Full,
             limit_animation_loops: true,
+            dismissed_version_expiry: None,
         }
     }
 }

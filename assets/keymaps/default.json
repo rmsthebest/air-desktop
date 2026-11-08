@@ -50,6 +50,21 @@
     }
   },
   {
+    "context": "Info",
+    "bindings": {
+      "down": "air::SelectNext",
+      "up": "air::SelectPrev",
+      "j": "air::SelectNext",
+      "k": "air::SelectPrev",
+      "home": "air::SelectFirst",
+      "end": "air::SelectLast",
+      "enter": "air::SettingNext",
+      "y": "air::CopyInfo",
+      "secondary-c": "air::CopyInfo",
+      "escape": "air::CloseSettings"
+    }
+  },
+  {
     "context": "Settings",
     "bindings": {
       "down": "air::SelectNext",

@@ -45,6 +45,7 @@ image = { version = "0.25", default-features = false, features = ["webp", "jpeg"
 qrcode = { version = "0.14.1", default-features = false }
 # Emoji names and GitHub shortcodes, for the emoji picker and `:smile:`
 # in the composer. Data only.
+deunicode = "1"
 emojis = "=0.6.4"
 # Air's markdown flavour; previews are flattened from it.
 pulldown-cmark = { version = "0.13", default-features = false }

@@ -37,6 +37,7 @@ pub enum SettingsEvent {
     Keymap(KeymapMode),
     Notifications(Notifications),
     LimitAnimationLoops(bool),
+    OpenAbout,
     /// Type a new display name, starting from this one.
     EditDisplayName(SharedString),
     /// Pick a new picture (file dialog).
@@ -76,6 +77,7 @@ pub enum Row {
     Keymap(KeymapMode),
     Notifications(Notifications),
     LimitAnimationLoops(bool),
+    About,
     DisplayName(SharedString),
     /// The user's picture: whether there is one.
     Picture(bool),
@@ -125,6 +127,7 @@ pub fn rows(settings: &Settings, account: Option<&AccountRows>) -> Vec<Row> {
         Row::Keymap(settings.keymap_mode),
         Row::Notifications(settings.notifications),
         Row::LimitAnimationLoops(settings.limit_animation_loops),
+        Row::About,
     ];
     if let Some(account) = account {
         rows.push(Row::DisplayName(account.display_name.clone()));
@@ -218,6 +221,7 @@ pub fn change(row: &Row, forward: bool, themes: &Themes) -> Option<SettingsEvent
         // Text and lists aren't stepped: only the forward key (enter,
         // right) acts on them, so stepping back never starts a removal.
         _ if !forward => return None,
+        Row::About => SettingsEvent::OpenAbout,
         Row::DisplayName(name) => SettingsEvent::EditDisplayName(name.clone()),
         Row::Picture(_) => SettingsEvent::SetPicture,
         Row::Username(name) => SettingsEvent::RemoveUsername(name.clone()),
@@ -450,6 +454,11 @@ impl SettingsView {
                 }
                 .into(),
                 "← →",
+            ),
+            Row::About => (
+                "About",
+                crate::about::version(),
+                "enter for source, licenses, logs",
             ),
             Row::DisplayName(name) => ("Display name", name.to_string(), "enter to change"),
             Row::Picture(true) => ("Picture", "Set".into(), "enter to change, delete removes"),

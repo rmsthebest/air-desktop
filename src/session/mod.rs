@@ -133,6 +133,28 @@ impl EventEmitter<OpenFromAlert> for Session {}
 impl EventEmitter<Unlinked> for Session {}
 impl EventEmitter<DeletionAborted> for Session {}
 
+/// What the debug page shows of an account.
+#[derive(Debug, Clone)]
+pub struct DebugInfo {
+    pub user_id: String,
+    pub timed_tasks: usize,
+    pub add_username_tokens: u32,
+    pub invite_code_tokens: u32,
+    pub connect_tokens: u32,
+}
+
+impl DebugInfo {
+    pub fn rows(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("User ID", self.user_id.clone()),
+            ("Timed tasks", self.timed_tasks.to_string()),
+            ("Add-username tokens", self.add_username_tokens.to_string()),
+            ("Invite-code tokens", self.invite_code_tokens.to_string()),
+            ("Connection-request tokens", self.connect_tokens.to_string()),
+        ]
+    }
+}
+
 impl Session {
     pub fn start(user: CoreUser, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
@@ -316,6 +338,34 @@ impl Session {
 
     pub fn status(&self) -> ConnectionStatus {
         self.queue_state.status
+    }
+
+    /// What the debug page shows of this account.
+    pub fn debug_info(&self, cx: &App) -> impl Future<Output = Result<DebugInfo, String>> + use<> {
+        let user = self.user.clone();
+        contacts::on_tokio(cx, "load the debug info", async move {
+            let info = user.user_debug_info().await?;
+            Ok(DebugInfo {
+                user_id: info.user_id,
+                timed_tasks: info.timed_tasks.len(),
+                add_username_tokens: info.add_username_token_count,
+                invite_code_tokens: info.invitation_code_token_count,
+                connect_tokens: info.connect_username_token_count,
+            })
+        })
+    }
+
+    /// Pretends the server said this about the version (seam tests).
+    #[cfg(all(test, feature = "seam"))]
+    pub fn set_version_state(
+        &mut self,
+        status: ConnectionStatus,
+        expires: Option<DateTime<Utc>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.queue_state.status = status;
+        self.queue_state.version_expires = expires;
+        cx.notify();
     }
 
     /// When the server stops accepting this version, if it announced it.

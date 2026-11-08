@@ -384,6 +384,66 @@ fn shown_attachment(workspace: &Workspace, cx: &App) -> Option<crate::model::Att
     }
 }
 
+/// The server's word on this version: an announced end reminds until
+/// dismissed (a new date reminds again), a refusal stops everything.
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_the_server_can_end_this_version(cx: &mut TestAppContext) {
+    use crate::session::queue::ConnectionStatus;
+    let mut seam = start(cx);
+    let set = |seam: &mut Seam<'_>, status, days: Option<i64>| {
+        let expires = days.map(|days| chrono::Utc::now() + chrono::Duration::days(days));
+        seam.workspace.update(seam.cx, |workspace, cx| {
+            let session = workspace.session().cloned().unwrap();
+            session.update(cx, |session, cx| {
+                session.set_version_state(status, expires, cx)
+            });
+        });
+        seam.cx.run_until_parked();
+    };
+    let reminds = |seam: &mut Seam<'_>| {
+        seam.workspace.read_with(seam.cx, |workspace, cx| {
+            workspace.update_reminder(cx).is_some()
+        })
+    };
+    set(&mut seam, ConnectionStatus::Connected, None);
+    assert!(!reminds(&mut seam));
+    set(&mut seam, ConnectionStatus::Connected, Some(30));
+    assert!(reminds(&mut seam));
+    seam.cx.dispatch_action(DismissUpdateReminder);
+    seam.cx.run_until_parked();
+    assert!(!reminds(&mut seam), "dismissed");
+    set(&mut seam, ConnectionStatus::Connected, Some(60));
+    assert!(reminds(&mut seam), "a new date reminds again");
+
+    let required = |seam: &mut Seam<'_>| {
+        seam.workspace
+            .read_with(seam.cx, |workspace, cx| workspace.update_required(cx))
+    };
+    assert!(!required(&mut seam));
+    set(&mut seam, ConnectionStatus::UnsupportedVersion, None);
+    assert!(required(&mut seam));
+}
+
+/// `:debug-info` shows this account's id, from the core.
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_debug_info_comes_from_the_core(cx: &mut TestAppContext) {
+    let mut seam = start(cx);
+    let id = seam.user.user_id().uuid().to_string();
+    seam.workspace.update_in(seam.cx, |workspace, window, cx| {
+        workspace.show_info(crate::about::Page::Debug, window, cx)
+    });
+    seam.until("the debug info", move |workspace, cx| {
+        workspace.read_with(cx, |workspace, cx| {
+            let (view, _) = workspace.info.as_ref().unwrap();
+            view.read(cx)
+                .shown_text()
+                .is_some_and(|text| text.contains(&id))
+        })
+    });
+}
+
 /// `o` on a reply loads the window around its original when that isn't
 /// loaded, and the cursor lands on it.
 #[gpui::test]

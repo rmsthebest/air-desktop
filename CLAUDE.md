@@ -244,6 +244,18 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
     which would remove the current picture. Profile updates cost the
     server's per-address rate limit one request per group: the e2e
     retries them slowly (`patiently`).
+- `src/about.rs`, `src/logs.rs`, `src/ui/info_view.rs` — about, licenses, logs
+  and debug info (`:about`, `:licenses`, `:logs`, `:debug-info`, a settings
+  row), in place of the settings rows. `Cargo.toml`'s `repository` is the
+  source and issue link, shown as "not published yet" while empty: the AGPL
+  has us offer the source, so set it before a release. `just
+  regenerate-licenses` (needs cargo-about) rewrites `assets/licenses.json`
+  after `Cargo.lock` changes; a test fails until then. Logs stay in memory
+  (1000 lines), as they can name contacts.
+- `src/username.rs` — port of upstream's suggestion, prefilled for a first
+  username only. The server refusing this version replaces the workspace
+  (`Workspace::update_required`, in `app_root`); an announced end shows a banner
+  above the chat list until dismissed (a later date shows it again).
 - `src/notifier.rs` — shows alerts via `org.freedesktop.Notifications`
   (zbus 5 on async-io, gpui's own copy). Replaces a chat's notification
   instead of stacking, closes it on dismissal, escapes bodies when the

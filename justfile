@@ -13,3 +13,10 @@ run:
 # `seam` feature, so other test builds keep the production core.
 seam:
     cargo test --features seam seam -- --ignored
+
+# Regenerate the dependencies' license list the about screen shows, after
+# Cargo.lock changes (a test fails until then). Needs
+# `cargo install cargo-about --features cli --locked`.
+regenerate-licenses:
+    cargo about generate --offline -c about.toml about.hbs -o assets/licenses.json
+    sha256sum Cargo.lock | cut -d' ' -f1 > assets/licenses.lock

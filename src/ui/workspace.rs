@@ -14,11 +14,12 @@ use std::path::PathBuf;
 
 use crate::actions::{
     self, AcceptRequest, AddContact, AttachFile, BlockContact, DeclineRequest, DeleteChat,
-    FindChat, FocusChatList, FocusComposer, FocusConversation, FocusMessages, FocusNextPane,
-    InsertEmoji, InviteToGroup, JumpBack, JumpForward, LinkDevice, NewGroup, NextChat,
-    NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette, OpenSettings, PickTheme, PrevChat,
-    PrevUnreadChat, ReportSpam, RetractRequest, SelectFirst, SelectLast, ShowSafetyCode,
-    ShowShortcuts, ToggleAppearance, ToggleDetails, ToggleHelixMode, ToggleMute, UnblockContact,
+    DismissUpdateReminder, FindChat, FocusChatList, FocusComposer, FocusConversation,
+    FocusMessages, FocusNextPane, InsertEmoji, InviteToGroup, JumpBack, JumpForward, LinkDevice,
+    NewGroup, NextChat, NextUnreadChat, OpenChatAt, OpenCommandLine, OpenPalette, OpenSettings,
+    PickTheme, PrevChat, PrevUnreadChat, ReportSpam, RetractRequest, SelectFirst, SelectLast,
+    ShowSafetyCode, ShowShortcuts, ToggleAppearance, ToggleDetails, ToggleHelixMode, ToggleMute,
+    UnblockContact,
 };
 use crate::command_line::{self, Candidates, Command, NameMatch, matches_name};
 use crate::model::{
@@ -40,6 +41,7 @@ use crate::ui::chat_list::{ChatList, ChatListEvent};
 use crate::ui::command_line::{CommandLine, CommandLineEvent};
 use crate::ui::conversation::{Conversation, ConversationEvent};
 use crate::ui::details_pane::details_pane;
+use crate::ui::info_view::{InfoEvent, InfoView};
 use crate::ui::link_view::{LinkPhase, LinkView, LinkViewEvent};
 use crate::ui::nav_rail::{Account, nav_rail};
 use crate::ui::palette::{self, Scope};
@@ -69,6 +71,8 @@ pub struct Workspace {
     settings_view: Entity<SettingsView>,
     /// The settings screen is shown in place of the conversation.
     settings_open: bool,
+    /// About, licenses, logs or debug info, in place of the settings rows.
+    info: Option<(Entity<InfoView>, Subscription)>,
     /// A chat opened before it was listed, and how to focus it once it is.
     focus_when_opened: Option<(ChatId, FocusChat)>,
     /// The user's devices (with an account).
@@ -392,6 +396,7 @@ impl Workspace {
             members: None,
             settings_view,
             settings_open: false,
+            info: None,
             focus_when_opened: None,
             devices,
             account_settings,
@@ -542,11 +547,67 @@ impl Workspace {
         self.conversation
             .update(cx, |conversation, _| conversation.set_hidden(true));
         self.report_attention(window, cx);
-        match self.link_pane() {
-            Some(view) => view.focus_handle(cx).focus(window, cx),
-            None => self.settings_view.focus_handle(cx).focus(window, cx),
+        match (self.link_pane(), &self.info) {
+            (Some(view), _) => view.focus_handle(cx).focus(window, cx),
+            (None, Some((view, _))) => view.focus_handle(cx).focus(window, cx),
+            (None, None) => self.settings_view.focus_handle(cx).focus(window, cx),
         }
         cx.notify();
+    }
+
+    /// Shows a page of the info screen in place of the settings rows. Not
+    /// over a link in progress: that one is waiting for the user.
+    fn show_info(&mut self, page: crate::about::Page, window: &mut Window, cx: &mut Context<Self>) {
+        if self.link_pane().is_some() {
+            return show_refusal("Finish linking the device first".into(), window, cx);
+        }
+        match &self.info {
+            Some((view, _)) => view.update(cx, |view, cx| view.open(page, cx)),
+            None => {
+                let session = self.session.clone();
+                let view = cx.new(|cx| InfoView::new(session, page, cx));
+                let closed = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
+                    let InfoEvent::Close = event;
+                    this.info = None;
+                    this.settings_view.focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                });
+                self.info = Some((view, closed));
+            }
+        }
+        self.open_settings(&OpenSettings, window, cx);
+    }
+
+    /// Whether the server refuses this version: nothing works until updated.
+    pub fn update_required(&self, cx: &App) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            session.read(cx).status() == crate::session::queue::ConnectionStatus::UnsupportedVersion
+        })
+    }
+
+    fn dismiss_update_reminder(
+        &mut self,
+        _: &DismissUpdateReminder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let expires = self
+            .session
+            .as_ref()
+            .and_then(|session| session.read(cx).version_expires());
+        if let Some(expires) = expires {
+            update_settings(window, cx, |settings| {
+                settings.dismissed_version_expiry = Some(expires.timestamp());
+            });
+            cx.notify();
+        }
+    }
+
+    /// The date to remind the user of, unless they dismissed that one.
+    fn update_reminder(&self, cx: &App) -> Option<chrono::DateTime<chrono::Utc>> {
+        let expires = self.session.as_ref()?.read(cx).version_expires()?;
+        let dismissed = SettingsStore::get(cx).dismissed_version_expiry;
+        crate::model::shows_update_reminder(expires, dismissed).then_some(expires)
     }
 
     fn hide_settings(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -558,6 +619,7 @@ impl Workspace {
     /// Hides the settings without reporting attention, for a caller that
     /// reports once it has shown what replaces them. Whether they were shown.
     fn unhide_settings(&mut self, cx: &mut Context<Self>) -> bool {
+        self.info = None;
         if !self.settings_open {
             return false;
         }
@@ -803,10 +865,20 @@ impl Workspace {
             SettingsEvent::LimitAnimationLoops(on) => {
                 update_settings(window, cx, |settings| settings.limit_animation_loops = on)
             }
+            SettingsEvent::OpenAbout => self.show_info(crate::about::Page::About, window, cx),
             SettingsEvent::EditDisplayName(name) => {
                 self.prompt(&format!("name {name}"), window, cx)
             }
-            SettingsEvent::AddUsername => self.prompt("username ", window, cx),
+            SettingsEvent::AddUsername => {
+                let initial = match &self.session {
+                    Some(session) => {
+                        let session = session.read(cx);
+                        crate::username::prompt(session.display_name(), session.usernames())
+                    }
+                    None => "username ".to_string(),
+                };
+                self.prompt(&initial, window, cx)
+            }
             SettingsEvent::SetPicture => self.pick_picture(PictureOf::Own, window, cx),
             SettingsEvent::RemovePicture => self.remove_picture(PictureOf::Own, window, cx),
             SettingsEvent::RemoveUsername(username) => {
@@ -1451,6 +1523,7 @@ impl Workspace {
                     NameMatch::Ambiguous(_) => self.open_palette_scoped(Scope::Chats, window, cx),
                 }
             }
+            Command::Info(page) => self.show_info(page, window, cx),
             Command::Appearance(appearance) => self.set_appearance(appearance, window, cx),
             Command::ToggleDetails => self.toggle_details(&ToggleDetails, window, cx),
             Command::Keymap(mode) => self.set_keymap_mode(mode, window, cx),
@@ -2286,11 +2359,13 @@ impl Render for Workspace {
                 usernames: session.usernames().to_vec(),
             }
         });
+        let reminder = self.update_reminder(cx).map(render_update_reminder);
         let theme = cx.theme();
 
         v_flex()
             .key_context(key_context("Workspace", cx))
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::dismiss_update_reminder))
             .on_action(cx.listener(|this, _: &NextChat, _, cx| {
                 this.update_chat_list(cx, |list, cx| list.step(true, cx))
             }))
@@ -2397,12 +2472,18 @@ impl Render for Workspace {
                                 resizable_panel()
                                     .size(px(chat_list_width))
                                     .size_range(px(CHAT_LIST_MIN)..px(CHAT_LIST_MAX))
-                                    .child(self.chat_list.clone()),
+                                    .child(
+                                        v_flex()
+                                            .size_full()
+                                            .children(reminder)
+                                            .child(self.chat_list.clone()),
+                                    ),
                             )
                             .child(resizable_panel().child(if self.settings_open {
-                                match self.link_pane() {
-                                    Some(view) => view.clone().into_any_element(),
-                                    None => self.settings_view.clone().into_any_element(),
+                                match (self.link_pane(), &self.info) {
+                                    (Some(view), _) => view.clone().into_any_element(),
+                                    (None, Some((view, _))) => view.clone().into_any_element(),
+                                    (None, None) => self.settings_view.clone().into_any_element(),
                                 }
                             } else {
                                 self.conversation.clone().into_any_element()
@@ -2438,6 +2519,29 @@ impl Workspace {
     pub fn session(&self) -> Option<&Entity<Session>> {
         self.session.as_ref()
     }
+}
+
+/// Above the chat list while the server has announced an end to this version.
+fn render_update_reminder(expires: chrono::DateTime<chrono::Utc>) -> impl IntoElement {
+    let date = expires.with_timezone(&chrono::Local).format("%Y-%m-%d");
+    h_flex()
+        .flex_none()
+        .gap_2()
+        .p_2()
+        .text_sm()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(format!("Update Air: this version stops working on {date}.")),
+        )
+        .child(
+            gpui_kit::component::button::Button::new("dismiss-update-reminder")
+                .label("Dismiss")
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(DismissUpdateReminder), cx)
+                }),
+        )
 }
 
 #[cfg(test)]
@@ -3608,6 +3712,15 @@ mod tests {
         assert_eq!(notifications(cx), Notifications::Off);
         // Without an account the list ends with the app's settings.
         cx.simulate_keystrokes("end");
+        assert!(matches!(row(cx), Some(Row::About)));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |workspace, _| workspace.info.is_some()));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |workspace, _| workspace.info.is_none()));
+        assert!(matches!(row(cx), Some(Row::About)), "back on its row");
+        cx.simulate_keystrokes("up");
         assert!(matches!(row(cx), Some(Row::LimitAnimationLoops(true))));
         cx.simulate_keystrokes("right");
         assert!(cx.update(|_, cx| !SettingsStore::get(cx).limit_animation_loops));

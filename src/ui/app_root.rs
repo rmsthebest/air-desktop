@@ -28,6 +28,7 @@ enum Screen {
     Ready {
         workspace: Entity<Workspace>,
         _unlinked: Subscription,
+        _version: Subscription,
     },
     /// Deleting the data of an account this device may no longer use.
     TearingDown,
@@ -135,10 +136,13 @@ impl AppRoot {
         let unlinked = cx.subscribe_in(&session, window, move |this, _, event, window, cx| {
             this.tear_down(user.clone(), event, window, cx)
         });
+        // The server refusing this version replaces everything.
+        let version = cx.observe(&session, |_, _, cx| cx.notify());
         let workspace = cx.new(|cx| Workspace::new(Some(session), window, cx));
         self.screen = Screen::Ready {
             workspace,
             _unlinked: unlinked,
+            _version: version,
         };
         if let Some(notice) = notice {
             crate::ui::show_info(notice.to_string(), window, cx);
@@ -261,6 +265,18 @@ impl Render for AppRoot {
                 .child("Opening your account…")
                 .into_any_element(),
             Screen::Onboarding { view, .. } => view.clone().into_any_element(),
+            Screen::Ready { workspace, .. } if workspace.read(cx).update_required(cx) => {
+                v_flex()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(div().text_lg().child("Software update required"))
+                    .child(div().text_sm().text_color(theme.muted_foreground).child(
+                        "Update Air Desktop to keep using Air. Your data stays on this device.",
+                    ))
+                    .into_any_element()
+            }
             Screen::Ready { workspace, .. } => workspace.clone().into_any_element(),
             Screen::TearingDown => div()
                 .size_full()

@@ -1041,6 +1041,12 @@ pub fn expires_label(expires: DateTime<Utc>, now: DateTime<Utc>) -> Option<Strin
     }
 }
 
+/// Whether to remind the user of this announced end of their version: until
+/// they dismiss it. As upstream, a new date reminds again.
+pub fn shows_update_reminder(expires: DateTime<Utc>, dismissed: Option<i64>) -> bool {
+    dismissed != Some(expires.timestamp())
+}
+
 /// Most emoji a message can have and still show large. As upstream.
 const MAX_JUMBO_EMOJI: usize = 5;
 
@@ -1403,6 +1409,15 @@ mod tests {
         assert_eq!(label(Duration::hours(1)), says("Expires in 1 hour"));
         assert_eq!(label(Duration::seconds(86399)), says("Expires in 1 day"));
         assert_eq!(label(Duration::days(30)), says("Expires in 30 days"));
+    }
+
+    #[test]
+    fn a_dismissed_update_reminder_comes_back_only_for_a_new_date() {
+        let date = Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap();
+        assert!(shows_update_reminder(date, None));
+        assert!(!shows_update_reminder(date, Some(date.timestamp())));
+        let later = date + Duration::days(30);
+        assert!(shows_update_reminder(later, Some(date.timestamp())));
     }
 
     #[test]

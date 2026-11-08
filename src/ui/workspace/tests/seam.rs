@@ -652,8 +652,8 @@ fn seam_a_change_during_a_self_chat_lookup_looks_again(cx: &mut TestAppContext) 
 fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
     use crate::session::messages::PAGE;
     const TOTAL: usize = 3 * PAGE;
-    // Sent before the session starts: its outbound service, running beside
-    // these sends, would stamp some of them later, and so reorder them.
+    // Each sent out before the next, and before the session starts: a message
+    // waiting for the outbound service moves when the server stamps it.
     let mut seeded = None;
     let mut seam = start_after(cx, async |backend, user| {
         let bob = backend.add_user().await;
@@ -671,6 +671,7 @@ fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
             ))
             .await
             .unwrap();
+            user.outbound_service().run_once().await;
             oldest.get_or_insert(sent.id());
         }
         seeded = Some((name.to_string(), oldest.unwrap()));

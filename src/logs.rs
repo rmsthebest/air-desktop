@@ -133,13 +133,15 @@ mod tests {
         const MARK: &str = "the_layer_keeps_one_plain_line_per_event";
         let subscriber = tracing_subscriber::registry().with(layer());
         tracing::subscriber::with_default(subscriber, || {
-            tracing::warn!(name = "two\nlines", "{MARK}");
+            // In the message: other fields are written escaped.
+            tracing::warn!("{MARK}\nsecond");
         });
         let lines: Vec<_> = latest()
             .into_iter()
             .filter(|line| line.contains(MARK))
             .collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("second"), "{lines:?}");
         assert!(lines[0].contains("WARN"), "{lines:?}");
         assert!(!lines[0].contains('['), "no colour codes: {lines:?}");
     }

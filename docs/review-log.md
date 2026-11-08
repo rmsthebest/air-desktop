@@ -1547,8 +1547,8 @@ broken code (12 changes, all caught; the suite then passed three times running):
   (`seam_a_stale_download_is_fetched_unless_claimed`).
 - gates 13-14: attention with the settings open was closed at gate 24.
 
-Still open from those lists: flush on drop and initial-load backoff (gates 4-7).
-Needing a file-dialog or atlas seam: `pick_picture` after the chat changed, a
+Left open from those lists: the initial-load backoff (gates 4-7), as a local read
+has no fault to inject. Needing a file-dialog or atlas seam: `pick_picture` after the chat changed, a
 confirmed drop's chat, `Members` releasing textures.
 
 The data directory lock closes the accepted gap of two instances on one
@@ -1559,4 +1559,37 @@ paths in the binary, and it starts with two instances (the second refused,
 which the window test checks; nobody looked at either window, and the package
 wasn't installed). namcap wasn't run (not installed here). `depends` comes from
 `readelf -d` and the libraries mapped in a running process.
+
+## Gate 25 — milestone 23 (`af2959c..443ba5b`): PASS
+
+The reviewer ran the lints and both test layers, and read the rest; none of its
+failure scenarios was reproduced. No BLOCK. Fixed, tests seen to fail on broken
+code where named:
+
+- Medium: nothing stopped a release without the source link the AGPL needs.
+  `just release-ready` fails unless `repository` is set and equals the PKGBUILD's
+  `url`, with no placeholder left. Tried failing and, on filled-in copies,
+  passing. Nothing runs it by itself: it's a step before tagging.
+- Medium: "open lists closed" overstated it; the paged-append view test had
+  dropped off the list, and flush on drop was open. Tests:
+  `seam_a_page_appended_at_the_bottom_stays_below_the_view`,
+  `seam_what_was_seen_is_marked_when_the_chat_closes`. The backoff stays open,
+  as above.
+- Low: logs were cleared before teardown, so its own lines outlived the reset.
+  Cleared after it now; a failed teardown leaves one fixed line. Lines from a
+  detached operation ending later can still appear.
+- Low: a clock running ahead turned an accepted listen into the update screen.
+  Deliberately unlike upstream: a date on an accepted stream is never a refusal.
+  `an_announced_date_is_never_a_refusal`.
+- Low: a data directory lock that fails (the file system refuses) is now a
+  warning toast. Not tested: `flock` can't be made to fail here.
+- Tests: `the_layer_keeps_one_plain_line_per_event` logged its newline in a field,
+  which is escaped anyway, so it tested nothing; it's in the message now.
+  `seam_a_refused_listen_refuses_this_version` covers the real refusal through
+  the listener (the `seam` feature adds `airbackend` and `semver` for its policy).
+  That a later accepted listen ends a refusal stays with the unit test: the
+  policy can't change on a running test server. Dropped a devices assertion that
+  couldn't fail.
+
+These fixes go to the next gate (milestone 24's range starts at `443ba5b`).
 

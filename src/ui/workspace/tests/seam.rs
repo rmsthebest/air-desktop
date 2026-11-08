@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use aircoreclient::clients::CoreUser;
-use airserver_test_harness::utils::setup::TestBackend;
+use airserver_test_harness::utils::setup::{TestBackend, TestBackendParams};
 
 use super::*;
 use crate::runtime::Tokio;
@@ -35,17 +35,25 @@ fn start(cx: &mut TestAppContext) -> Seam<'_> {
     start_after(cx, async |_, _| {})
 }
 
-/// Like [`start`], with `prepare` run on the account before its session
-/// starts.
 fn start_after(
     cx: &mut TestAppContext,
+    prepare: impl AsyncFnOnce(&mut TestBackend, &CoreUser),
+) -> Seam<'_> {
+    start_with(cx, TestBackendParams::default(), prepare)
+}
+
+/// Like [`start`], on a backend with `params`, and with `prepare` run on the
+/// account before its session starts.
+fn start_with(
+    cx: &mut TestAppContext,
+    params: TestBackendParams,
     prepare: impl AsyncFnOnce(&mut TestBackend, &CoreUser),
 ) -> Seam<'_> {
     cx.executor().allow_parking();
     cx.update(|cx| crate::runtime::init(cx).unwrap());
     let tokio = cx.update(|cx| Tokio::handle(cx));
     let (backend, user) = tokio.block_on(async {
-        let mut backend = TestBackend::single().await;
+        let mut backend = TestBackend::single_with_params(params).await;
         let user = backend.add_user().await;
         prepare(&mut backend, &user).await;
         (backend, user)
@@ -639,19 +647,13 @@ fn seam_a_change_during_a_self_chat_lookup_looks_again(cx: &mut TestAppContext) 
     });
     chat_changed(&mut seam);
     seam.cx.run_until_parked();
-    devices.read_with(seam.cx, |devices, _| {
-        assert!(devices.looks_again());
-        assert!(!devices.knows_self_chat(), "the running one isn't replaced");
-    });
+    devices.read_with(seam.cx, |devices, _| assert!(devices.looks_again()));
 }
 
-/// The window pages both ways: one page per request however often it's asked
-/// for, in order, without gaps, up to the newest (gates 4-7).
-#[gpui::test]
-#[ignore = "needs Postgres and MinIO (Air's compose file)"]
-fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
-    use crate::session::messages::PAGE;
-    const TOTAL: usize = 3 * PAGE;
+/// A workspace with a contact's chat of [`HISTORY`] messages from the user,
+/// `m0` onwards, open. Returns `m0`'s id.
+const HISTORY: usize = 3 * crate::session::messages::PAGE;
+fn start_on_history(cx: &mut TestAppContext) -> (Seam<'_>, crate::model::MessageId) {
     // Each sent out before the next, and before the session starts: a message
     // waiting for the outbound service moves when the server stamps it.
     let mut seeded = None;
@@ -660,7 +662,7 @@ fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
         let chat = backend.connect_users(user, &bob).await;
         let name = user.user_profile(bob.user_id()).await.display_name;
         let mut oldest = None;
-        for n in 0..TOTAL {
+        for n in 0..HISTORY {
             let content =
                 mimi_content::MimiContent::simple_markdown_message(format!("m{n}"), [n as u8; 16]);
             let sent = Box::pin(user.send_message(
@@ -682,6 +684,142 @@ fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
         move |workspace, cx| titles(workspace, cx).contains(&bob)
     });
     seam.open(&bob);
+    (
+        seam,
+        crate::model::MessageId(oldest.uuid().to_string().into()),
+    )
+}
+
+impl Seam<'_> {
+    /// The open chat's message list.
+    fn message_list(&self) -> Entity<Messages> {
+        self.workspace.read_with(self.cx, |workspace, cx| {
+            let conversation = workspace.conversation.read(cx);
+            conversation.messages_entity().cloned().unwrap()
+        })
+    }
+
+    fn jump_to(&mut self, id: &crate::model::MessageId) {
+        let list = self.message_list();
+        list.update(self.cx, |list, cx| list.jump_to_message(id, cx));
+    }
+}
+
+/// A page appended while the view follows the end of what is loaded stays
+/// below the view. Following it instead would run through every later page,
+/// marking as seen what the user scrolled past (gates 4-7).
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_a_page_appended_at_the_bottom_stays_below_the_view(cx: &mut TestAppContext) {
+    let (mut seam, oldest) = start_on_history(cx);
+    let list = seam.message_list();
+    let loaded = |seam: &mut Seam<'_>| list.read_with(seam.cx, |list, _| list.messages().len());
+    let newest_loaded = |seam: &mut Seam<'_>| {
+        list.read_with(seam.cx, |list, _| {
+            list.messages().last().unwrap().plain_text()
+        })
+    };
+    seam.until("the newest page", |_, cx| {
+        list.read_with(cx, |list, _| !list.messages().is_empty())
+    });
+    seam.jump_to(&oldest);
+    seam.until("the oldest", |_, cx| {
+        list.read_with(cx, |list, _| {
+            list.messages()
+                .iter()
+                .any(|message| message.plain_text() == "m0")
+        })
+    });
+    seam.settle();
+    let before = loaded(&mut seam);
+    assert_ne!(newest_loaded(&mut seam), format!("m{}", HISTORY - 1));
+
+    seam.workspace.update(seam.cx, |workspace, cx| {
+        workspace
+            .conversation
+            .update(cx, |conversation, cx| conversation.scroll_list_to_end(cx))
+    });
+    seam.until("the next page", |_, cx| {
+        list.read_with(cx, |list, _| list.messages().len() > before)
+    });
+    seam.settle();
+    let now = loaded(&mut seam);
+    seam.workspace.read_with(seam.cx, |workspace, cx| {
+        let conversation = workspace.conversation.read(cx);
+        assert!(conversation.is_in_view(before - 1), "what was shown stays");
+        assert!(
+            !conversation.is_in_view(now - 1),
+            "the new page stays below"
+        );
+    });
+}
+
+/// Leaving a chat within the debounce still marks what was seen (gates 4-7).
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_what_was_seen_is_marked_when_the_chat_closes(cx: &mut TestAppContext) {
+    let mut seam = start(cx);
+    let (peer, chat, name) = seam.contact();
+    let tokio = seam.tokio();
+    tokio.block_on(seam.backend().send_message(chat, &peer, NOBODY));
+    let user = seam.user.clone();
+    let unread = move || tokio.block_on(user.unread_messages_count(chat));
+    seam.until("the message", {
+        let unread = unread.clone();
+        move |_, _| unread() == 1
+    });
+    let id = seam.listed(&name);
+    let session = seam.workspace.read_with(seam.cx, |workspace, _| {
+        workspace.session().cloned().unwrap()
+    });
+    // On its own: a view would mark what it draws, and hold on to it.
+    let list = seam.cx.new(|cx| Messages::open(&session, &id, cx));
+    seam.until("the messages", |_, cx| {
+        list.read_with(cx, |list, _| !list.messages().is_empty())
+    });
+    assert_eq!(unread(), 1, "nothing marks it unasked");
+
+    list.update(seam.cx, |list, cx| {
+        let last = list.messages().len() - 1;
+        list.seen(last, cx);
+    });
+    drop(list);
+    seam.until("the mark", move |_, _| unread() == 0);
+}
+
+/// The server refusing a listen shows as this version refused: the real
+/// refusal, which the update screen hangs on, through the listener.
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_a_refused_listen_refuses_this_version(cx: &mut TestAppContext) {
+    use airbackend::{settings::VersionExpiration, version::VersionPolicy};
+    // Time for the account to be made; then it's refused from the first listen.
+    let expires_on = chrono::Utc::now() + chrono::Duration::seconds(3);
+    let params = TestBackendParams {
+        version_policy: VersionPolicy::new(vec![VersionExpiration {
+            older_than: semver::Version::new(999, 0, 0),
+            expires_on,
+        }]),
+        ..Default::default()
+    };
+    let mut seam = start_with(cx, params, async |_, _| {
+        let left = expires_on - chrono::Utc::now();
+        tokio::time::sleep(left.to_std().unwrap() + Duration::from_millis(100)).await;
+    });
+    seam.until("the refusal", |workspace, cx| {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.session().unwrap().read(cx).version_refused()
+        })
+    });
+}
+
+/// The window pages both ways: one page per request however often it's asked
+/// for, in order, without gaps, up to the newest (gates 4-7).
+#[gpui::test]
+#[ignore = "needs Postgres and MinIO (Air's compose file)"]
+fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
+    use crate::session::messages::PAGE;
+    let (mut seam, oldest) = start_on_history(cx);
     // The numbers of the messages shown, checked to be in order without gaps.
     let shown = |seam: &mut Seam<'_>| -> std::ops::RangeInclusive<usize> {
         seam.workspace.read_with(seam.cx, |workspace, cx| {
@@ -702,16 +840,6 @@ fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
             *first..=*last
         })
     };
-    let messages = |seam: &mut Seam<'_>| {
-        seam.workspace.read_with(seam.cx, |workspace, cx| {
-            workspace
-                .conversation
-                .read(cx)
-                .messages_entity()
-                .cloned()
-                .unwrap()
-        })
-    };
     let wait = |seam: &mut Seam<'_>, what: &str, done: &dyn Fn(usize, usize) -> bool| {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -724,12 +852,12 @@ fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    wait(&mut seam, "the newest page", &|_, last| last == TOTAL - 1);
+    wait(&mut seam, "the newest page", &|_, last| last == HISTORY - 1);
     let first = *shown(&mut seam).start();
     assert!(first > 0, "the oldest are left out");
 
     // Asked for twice, as scrolling does: one page.
-    let list = messages(&mut seam);
+    let list = seam.message_list();
     list.update(seam.cx, |list, _| {
         list.load_older();
         list.load_older();
@@ -739,16 +867,11 @@ fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
     assert_eq!(*shown(&mut seam).start(), first - PAGE, "a page, once");
 
     // Away from the newest, then back up a page at a time.
-    let oldest = crate::model::MessageId(oldest.uuid().to_string().into());
-    seam.workspace.update(seam.cx, |workspace, cx| {
-        let list = workspace.conversation.read(cx).messages_entity().cloned();
-        list.unwrap()
-            .update(cx, |list, cx| list.jump_to_message(&oldest, cx));
-    });
+    seam.jump_to(&oldest);
     wait(&mut seam, "the oldest", &|now, _| now == 0);
     let last = *shown(&mut seam).end();
-    assert!(last < TOTAL - 1, "the newest are left out");
-    let list = messages(&mut seam);
+    assert!(last < HISTORY - 1, "the newest are left out");
+    let list = seam.message_list();
     list.update(seam.cx, |list, _| {
         list.load_newer();
         list.load_newer();
@@ -756,7 +879,7 @@ fn seam_the_message_window_pages_both_ways(cx: &mut TestAppContext) {
     wait(&mut seam, "the newer page", &|_, now| now > last);
     seam.settle();
     assert_eq!(*shown(&mut seam).end(), last + PAGE, "a page, once");
-    while *shown(&mut seam).end() < TOTAL - 1 {
+    while *shown(&mut seam).end() < HISTORY - 1 {
         let before = *shown(&mut seam).end();
         list.update(seam.cx, |list, _| list.load_newer());
         wait(&mut seam, "another page", &|_, now| now > before);

@@ -21,6 +21,20 @@ regenerate-licenses:
     cargo about generate --offline -c about.toml about.hbs -o assets/licenses.json
     sha256sum Cargo.lock | cut -d' ' -f1 > assets/licenses.lock
 
+# Whether this tree can be tagged: the AGPL has us offer the source, and the
+# about page takes the link from Cargo.toml. `release-check` stays usable before
+# there is one; this one doesn't.
+release-ready:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository=$(sed -n 's/^repository = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    url=$(sed -n "s/^url='\(.*\)'/\1/p" packaging/aur/PKGBUILD)
+    [ -n "$repository" ] || { echo "Cargo.toml has no repository"; exit 1; }
+    [ "$repository" = "$url" ] \
+        || { echo "Cargo.toml's repository isn't the PKGBUILD's url: $repository, $url"; exit 1; }
+    ! grep -n FILL_IN packaging/aur/PKGBUILD packaging/aur/.SRCINFO \
+        || { echo "Placeholders left in the package files"; exit 1; }
+
 # Builds the package from HEAD's tree as a tagged tarball would be, tests
 # included, checks the packaging files, and leaves the package in
 # target/release-check. Takes as long as a clean build.

@@ -11,9 +11,9 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
   - copy Air's `Cargo.lock` as a starting point (newer transitive versions
     break the build, e.g. `rsa` for `blind-rsa-signatures`), then re-resolve;
   - re-sync the `[patch]` sections in `Cargo.toml` with Air's root `Cargo.toml`;
-  - bump the optional `airserver_test_harness` dependency to the same rev
-    (only the `seam` feature pulls it in: it turns on the core's
-    `test_utils`, which changes behaviour, so other builds, the e2e tests
+  - bump the optional `airserver_test_harness` and `airbackend` dependencies
+    to the same rev (only the `seam` feature pulls them in: the harness turns
+    on the core's `test_utils`, which changes behaviour, so other builds, the e2e tests
     included, keep the production core).
 - `.cargo/config.toml` sets `SQLX_OFFLINE=true` (Air compiles sqlx queries from
   checked-in metadata).
@@ -364,6 +364,8 @@ License: AGPL-3.0-or-later (links Air's AGPL crates).
 - `just release-check` — builds the package from HEAD's tree as a tagged
   tarball would be (`packaging/aur/`). `depends` comes from `readelf -d` and
   what a running process maps: Vulkan and Wayland are loaded at runtime.
+- `just release-ready` — before tagging: fails while the source link or a
+  placeholder in the package files is missing.
 - `cargo run` — run the app.
 - `gpui` is an alias for `gpui_kit` (`extern crate` in main.rs) so GPUI
   derive macros resolve; tests use `#[gpui::test]`.

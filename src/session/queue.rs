@@ -47,13 +47,13 @@ pub enum VersionStatus {
 }
 
 impl VersionStatus {
-    /// What an announcement means now, as upstream.
-    fn announced(expires: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Self {
-        match expires {
-            Some(at) if now < at => Self::ExpiresAt(at),
-            Some(_) => Self::Unsupported,
-            None => Self::Supported,
-        }
+    /// What an announcement means. The server sent it on a stream it accepted,
+    /// and announces only dates ahead of it: one that looks past here means
+    /// this clock is wrong, not a refusal (upstream refuses, but that would
+    /// replace the workspace of a session that works). When the date really
+    /// comes, the next listen is refused.
+    fn announced(expires: Option<DateTime<Utc>>) -> Self {
+        expires.map_or(Self::Supported, Self::ExpiresAt)
     }
 }
 
@@ -236,10 +236,7 @@ async fn handle_event(
             let expires = version
                 .expires_at
                 .and_then(|at| DateTime::from_timestamp(at.seconds, 0));
-            report(QueueEvent::Version(VersionStatus::announced(
-                expires,
-                Utc::now(),
-            )));
+            report(QueueEvent::Version(VersionStatus::announced(expires)));
         }
         _ => {}
     }
@@ -267,20 +264,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_announced_date_counts_until_it_passes() {
-        let now = Utc::now();
-        let later = now + chrono::Duration::seconds(1);
+    fn an_announced_date_is_never_a_refusal() {
+        let past = Utc::now() - chrono::Duration::days(1);
+        assert_eq!(VersionStatus::announced(None), VersionStatus::Supported);
         assert_eq!(
-            VersionStatus::announced(None, now),
-            VersionStatus::Supported
-        );
-        assert_eq!(
-            VersionStatus::announced(Some(later), now),
-            VersionStatus::ExpiresAt(later)
-        );
-        assert_eq!(
-            VersionStatus::announced(Some(now), now),
-            VersionStatus::Unsupported
+            VersionStatus::announced(Some(past)),
+            VersionStatus::ExpiresAt(past)
         );
     }
 

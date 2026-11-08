@@ -448,6 +448,14 @@ impl Conversation {
         self.shown.as_ref().is_some_and(|s| s.range.contains(&ix))
     }
 
+    /// Scrolls to the end of what is loaded and follows it, as the user
+    /// reaching the bottom does (seam tests).
+    #[cfg(all(test, feature = "seam"))]
+    pub fn scroll_list_to_end(&mut self, cx: &mut Context<Self>) {
+        self.list.scroll_to_end();
+        cx.notify();
+    }
+
     /// Whether an image is being opened (seam tests).
     #[cfg(all(test, feature = "seam"))]
     pub fn is_viewing(&self) -> bool {

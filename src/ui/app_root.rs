@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use aircoreclient::clients::CoreUser;
 use gpui::SharedString;
-use gpui_kit::component::{ActiveTheme as _, v_flex};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, Context, Entity, Focusable as _, IntoElement, Render, Subscription, Window, div,
@@ -65,6 +66,18 @@ impl AppRoot {
             .and_then(|dir| {
                 let db_path = prepare_data_dir(&dir)?;
                 this._data_lock = paths::lock_data_dir(&dir)?;
+                if this._data_lock.is_none() {
+                    // After this update: the window's root isn't there yet.
+                    cx.defer_in(window, |_, window, cx| {
+                        window.push_notification(
+                            Notification::warning(
+                                "This file system can't lock the data directory: \
+                                 don't run Air Desktop twice on it.",
+                            ),
+                            cx,
+                        );
+                    });
+                }
                 Ok(db_path)
             }) {
             Ok(db_path) => {
@@ -180,8 +193,6 @@ impl AppRoot {
         } else {
             "This device was unlinked from your account, and its data deleted.".into()
         };
-        // They are about the account going away.
-        crate::logs::clear();
         self.screen = Screen::TearingDown;
         cx.notify();
         let db_path = self.db_path.clone();
@@ -193,6 +204,11 @@ impl AppRoot {
             let torn_down = task
                 .await
                 .unwrap_or(devices::TornDown::Failed { record_kept: true });
+            // They are about the account that went away, tearing down too.
+            crate::logs::clear();
+            if matches!(torn_down, devices::TornDown::Failed { .. }) {
+                tracing::error!("this device's data couldn't all be deleted");
+            }
             _ = this.update_in(cx, |this, window, cx| {
                 match torn_down {
                     devices::TornDown::Failed { record_kept: true } => {

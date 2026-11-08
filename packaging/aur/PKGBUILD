@@ -24,6 +24,11 @@ _env() {
   export CARGO_TARGET_DIR=target
   # The tarball has no git history; the about page shows this instead.
   export AIR_DESKTOP_COMMIT="v$pkgver"
+  # rustc 1.99.1's LLVM dies with SIGILL compiling p256 and p384 for
+  # target-cpu=native on a Ryzen 9 7945HX (Zen 4). CachyOS's makepkg.conf sets
+  # it. x86-64-v3 and the default are fine.
+  RUSTFLAGS=${RUSTFLAGS//-C target-cpu=native/}
+  export RUSTFLAGS=${RUSTFLAGS//-Ctarget-cpu=native/}
 }
 
 prepare() {

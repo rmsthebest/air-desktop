@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Air Desktop
+GenericName=Messenger
+Comment=Keyboard-first desktop client for the Air messenger
+Exec=air-desktop
+Icon=air-desktop
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=messenger;chat;air;mls;
+StartupNotify=false
+StartupWMClass=air-desktop

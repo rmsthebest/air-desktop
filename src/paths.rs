@@ -3,10 +3,14 @@
 //! `AIR_DESKTOP_CONFIG_DIR` and `AIR_DESKTOP_DATA_DIR` override the
 //! locations, e.g. to run two instances side by side during development.
 
+use std::fs::{File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
+use tracing::warn;
+
+const LOCK_FILE: &str = "air-desktop.lock";
 
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("AIR_DESKTOP_CONFIG_DIR") {
@@ -49,6 +53,32 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Claims `dir` for this process, for as long as the returned file lives (the
+/// OS frees it, also on a crash). Two instances on one directory would race
+/// over its database and each other's downloads, and the core's startup resets
+/// what it takes for interrupted work. Where the file system has no such locks
+/// the app still runs, unprotected (`None`).
+pub fn lock_data_dir(dir: &Path) -> Result<Option<File>, String> {
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK_FILE))
+        .map_err(|err| format!("Couldn't open a file in {}: {err}", dir.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Err(format!(
+            "Air Desktop is already running on {}. Use that window, or set \
+             AIR_DESKTOP_DATA_DIR to another directory.",
+            dir.display()
+        )),
+        Err(TryLockError::Error(err)) => {
+            warn!("no lock on {}: {err}", dir.display());
+            Ok(None)
+        }
+    }
+}
+
 /// Sets every regular file directly inside `dir` to owner read/write (0600).
 pub fn restrict_files(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
@@ -78,6 +108,19 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Another open of the file counts as another instance, so this holds
+    /// within one process too. Freed with the holder.
+    #[test]
+    fn a_data_dir_has_one_holder_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock_data_dir(dir.path()).unwrap();
+        assert!(held.is_some());
+        let refused = lock_data_dir(dir.path()).unwrap_err();
+        assert!(refused.contains("already running"), "{refused}");
+        drop(held);
+        assert!(lock_data_dir(dir.path()).unwrap().is_some());
     }
 
     #[test]

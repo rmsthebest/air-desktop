@@ -40,6 +40,8 @@ pub struct AppRoot {
     /// The core's `db_path` (the data dir), once prepared.
     db_path: String,
     screen: Screen,
+    /// Keeps other instances off the data directory.
+    _data_lock: Option<std::fs::File>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -55,12 +57,16 @@ impl AppRoot {
             data_dir: data_dir.clone().unwrap_or_default(),
             db_path: String::new(),
             screen: Screen::Loading,
+            _data_lock: None,
             _subscriptions: subscriptions,
         };
         match data_dir
             .ok_or_else(|| "No data directory: is $HOME set?".to_string())
-            .and_then(|dir| prepare_data_dir(&dir))
-        {
+            .and_then(|dir| {
+                let db_path = prepare_data_dir(&dir)?;
+                this._data_lock = paths::lock_data_dir(&dir)?;
+                Ok(db_path)
+            }) {
             Ok(db_path) => {
                 this.db_path = db_path.clone();
                 this.load(db_path, None, window, cx)
@@ -218,6 +224,7 @@ impl AppRoot {
             data_dir,
             db_path,
             screen: Screen::Loading,
+            _data_lock: None,
             _subscriptions: Vec::new(),
         };
         this.start(user, None, window, cx);
@@ -331,6 +338,19 @@ mod tests {
             .unwrap()
         });
         root
+    }
+
+    /// A second instance says why it can't start, and opens no account.
+    #[gpui::test]
+    fn a_second_instance_is_refused(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = open(Some(dir.path().to_path_buf()), cx);
+        assert!(first.read_with(cx, |app, _| !matches!(app.screen, Screen::Failed(_))));
+        let second = open(Some(dir.path().to_path_buf()), cx);
+        second.read_with(cx, |app, _| match &app.screen {
+            Screen::Failed(message) => assert!(message.contains("already running"), "{message}"),
+            _ => panic!("the second instance goes on"),
+        });
     }
 
     #[gpui::test]

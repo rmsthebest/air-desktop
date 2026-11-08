@@ -1,0 +1,57 @@
+# Maintainer: FILL_IN_NAME <FILL_IN_EMAIL>
+
+pkgname=air-desktop
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Keyboard-first desktop client for the Air messenger'
+arch=(x86_64)
+# Set with the public repository, as `repository` in Cargo.toml.
+url='https://FILL_IN_REPOSITORY/air-desktop'
+license=(AGPL-3.0-or-later)
+depends=()
+makedepends=(rustup)
+# makepkg's LTO flags reach the C code that Rust crates build.
+options=(!lto)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# From the tagged tarball: makepkg refuses this until then.
+sha256sums=('FILL_IN_FROM_THE_TAGGED_TARBALL')
+
+# As rust-toolchain.toml: `just release-check` compares them.
+_toolchain=1.99.1
+
+_env() {
+  export RUSTUP_TOOLCHAIN=$_toolchain
+  export CARGO_TARGET_DIR=target
+  # The tarball has no git history; the about page shows this instead.
+  export AIR_DESKTOP_COMMIT="v$pkgver"
+}
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  _env
+  rustup toolchain install "$_toolchain" --profile minimal
+  # Air's crates are git dependencies, so this is where the network is used.
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  _env
+  # Never --all-features: `seam` puts the core in test mode, and a binary
+  # built with it refuses to start.
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  _env
+  cargo test --frozen
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/air-desktop -t "$pkgdir/usr/bin"
+  install -Dm644 packaging/air-desktop.desktop -t "$pkgdir/usr/share/applications"
+  install -Dm644 packaging/air-desktop.svg -t "$pkgdir/usr/share/icons/hicolor/scalable/apps"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
+}
